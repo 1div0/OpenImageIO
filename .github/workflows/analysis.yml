@@ -43,18 +43,18 @@ jobs:
           - desc: sonar gcc9/C++14 py39 boost1.76 exr3.1 ocio2.2
             nametag: static-analysis-sonar
             os: ubuntu-latest
-            vfxyear: 2022
-            vfxsuffix: -clang11
-            cxx_std: 14
-            python_ver: 3.9
+            container: aswf/ci-osl:2023-clang15
+            vfxyear: 2023
+            cxx_std: 17
+            python_ver: "3.10"
             simd: "avx2,f16c"
-            fmt_ver: 8.1.1
-            pybind11_ver: v2.9.0
+            fmt_ver: 10.1.1
+            pybind11_ver: v2.10.0
             coverage: 1
             # skip_tests: 1
             sonar: 1
-            setenvs: export SONAR_SCANNER_VERSION=4.7.0.2747
-                            SONAR_SERVER_URL="https://sonarcloud.io"
+            setenvs: export xSONAR_SCANNER_VERSION=4.7.0.2747
+                            xSONAR_SERVER_URL="https://sonarcloud.io"
                             BUILD_WRAPPER_OUT_DIR=bw_output
                             OIIO_CMAKE_BUILD_WRAPPER="build-wrapper-linux-x86-64 --out-dir bw_output"
                             CMAKE_BUILD_TYPE=Debug
@@ -62,11 +62,10 @@ jobs:
                             CODECOV=1
                             CTEST_TEST_TIMEOUT=1200
                             OIIO_CMAKE_FLAGS="-DOIIO_TEX_IMPLEMENT_VARYINGREF=OFF"
-                            OPENCOLORIO_VERSION=v2.2.0
 
     runs-on: ${{ matrix.os }}
     container:
-      image: aswf/ci-osl:${{matrix.vfxyear}}${{matrix.vfxsuffix}}
+      image: ${{ matrix.container }}
     env:
       CXX: ${{matrix.cxx_compiler}}
       CC: ${{matrix.cc_compiler}}
