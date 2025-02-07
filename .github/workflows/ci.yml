@@ -13,6 +13,7 @@ on:
       - '!**.rst'
       - '!**/analysis.yml'
       - '!**/docs.yml'
+      - '!**/scorecard.yml'
       - '!**.properties'
       - '!docs/**'
   pull_request:
@@ -34,6 +35,7 @@ permissions: read-all
 jobs:
 
   aswf-old:
+    if: ${{ ! contains(github.ref, 'windows-only') && ! contains(github.ref, 'macos-only') }}
     name: "(old) ${{matrix.desc}}"
     strategy:
       fail-fast: false
@@ -111,6 +113,7 @@ jobs:
             setenvs: export  CMAKE_VERSION=3.18.2
                              PTEX_VERSION=v2.3.2
                              WEBP_VERSION=v1.1.0
+                             PUGIXML_VERSION=v1.8
             depcmds: sudo rm -rf /usr/local/include/OpenEXR
           - desc: hobbled gcc9.3/C++17 py3.7 exr-3.1 no-sse
             # Use the oldest supported versions of required dependencies, and
@@ -135,6 +138,7 @@ jobs:
                              USE_JPEGTURBO=0
                              USE_OPENCV=0
                              FREETYPE_VERSION=VER-2-10-0
+                             PUGIXML_VERSION=v1.8
             depcmds: sudo rm -rf /usr/local/include/OpenEXR
 
     runs-on: ${{ matrix.runner }}
@@ -239,6 +243,7 @@ jobs:
   # Linux Tests
   #
   linux:
+    if: ${{ ! contains(github.ref, 'windows-only') && ! contains(github.ref, 'macos-only') }}
     name: "${{matrix.desc}}"
     uses: ./.github/workflows/build-steps.yml
     with:
@@ -279,6 +284,7 @@ jobs:
             simd: "avx2,f16c"
             fmt_ver: 10.1.1
             pybind11_ver: v2.10.0
+            setenvs: PUGIXML_VERSION=v1.13
           - desc: VFX2023 icc/C++17 py3.10 exr3.1 ocio2.1 qt5.15
             nametag: linux-vfx2023-icc
             runner: ubuntu-latest
@@ -318,6 +324,7 @@ jobs:
             simd: "avx2,f16c"
             fmt_ver: 10.1.1
             pybind11_ver: v2.12.0
+            setenvs: PUGIXML_VERSION=v1.14
           - desc: VFX2024 clang/C++17 py3.11 exr3.2 ocio2.3
             nametag: linux-vfx2024
             runner: ubuntu-latest
@@ -328,6 +335,7 @@ jobs:
             simd: "avx2,f16c"
             fmt_ver: 10.1.1
             pybind11_ver: v2.12.0
+            setenvs: PUGIXML_VERSION=v1.14
           - desc: VFX2024 sanitizers
             nametag: sanitizer
             runner: ubuntu-latest
@@ -355,7 +363,7 @@ jobs:
             simd: "avx2,f16c"
             skip_tests: 1
             # abi_check: v2.6.2.0
-            abi_check: 7929c81619ea8201065c475761546d51091f6773
+            abi_check: 889cf33b61e84025750bdc2c827608fe6157c834
             setenvs: export OIIO_CMAKE_FLAGS="-DOIIO_BUILD_TOOLS=0 -DOIIO_BUILD_TESTS=0 -DUSE_PYTHON=0"
                             USE_OPENCV=0 USE_FFMPEG=0 USE_PYTHON=0 USE_FREETYPE=0
 
@@ -384,7 +392,7 @@ jobs:
             cc_compiler: gcc-13
             cxx_compiler: g++-13
             cxx_std: 20
-            fmt_ver: 11.1.1
+            fmt_ver: 11.1.2
             opencolorio_ver: v2.4.0
             openexr_ver: v3.3.0
             pybind11_ver: v2.13.5
@@ -395,7 +403,7 @@ jobs:
                             LIBTIFF_VERSION=v4.7.0
                             OPENJPEG_VERSION=v2.5.2
                             PTEX_VERSION=v2.4.3
-                            PUGIXML_VERSION=v1.14
+                            PUGIXML_VERSION=v1.15
                             WEBP_VERSION=v1.5.0
                             FREETYPE_VERSION=VER-2-13-3
                             USE_OPENVDB=0
@@ -490,6 +498,7 @@ jobs:
   # MacOS Tests
   #
   macos:
+    if: ${{ ! contains(github.ref, 'windows-only') && ! contains(github.ref, 'linux-only') }}
     name: "${{matrix.desc}}"
     uses: ./.github/workflows/build-steps.yml
     with:
@@ -552,6 +561,7 @@ jobs:
   # Windows Tests
   #
   windows:
+    if: ${{ ! contains(github.ref, 'linux-only') && ! contains(github.ref, 'macos-only') }}
     name: "${{matrix.desc}}"
     uses: ./.github/workflows/build-steps.yml
     with:
@@ -588,9 +598,11 @@ jobs:
             runner: windows-2019
             vsver: 2019
             generator: "Visual Studio 16 2019"
-            python_ver: 3.7
+            python_ver: "3.9"
+            setenvs: export OPENIMAGEIO_PYTHON_LOAD_DLLS_FROM_PATH=1
           - desc: Windows-2022 VS2022
             runner: windows-2022
             vsver: 2022
             generator: "Visual Studio 17 2022"
             python_ver: "3.9"
+            setenvs: export OPENIMAGEIO_PYTHON_LOAD_DLLS_FROM_PATH=1

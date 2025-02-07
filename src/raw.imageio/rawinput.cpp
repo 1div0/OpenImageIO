@@ -246,13 +246,35 @@ OIIO_PLUGIN_EXPORTS_END
 
 namespace {
 std::string
-libraw_filter_to_str(unsigned int filters, const char* cdesc)
+libraw_bayer_filter_to_str(unsigned int filters, const char* cdesc)
 {
     char result[5] = { 0, 0, 0, 0, 0 };
     for (size_t i = 0; i < 4; i++) {
         size_t index = filters & 3;  // Grab the last 2 bits
         result[i]    = cdesc[index];
         filters >>= 2;
+    }
+    return result;
+}
+
+std::string
+libraw_xtrans_filter_to_str(char (&filters)[6][6])
+{
+    const char mapping[3] = { 'R', 'G', 'B' };
+
+    std::string result;
+    result.resize(41);
+
+    for (size_t y = 0; y < 6; y++) {
+        for (size_t x = 0; x < 6; x++) {
+            char c = filters[y][x];
+            if (c > 2 || c < 0)
+                c = 0;
+
+            result[y * 7 + x] = mapping[(size_t)c];
+        }
+        if (y > 0)
+            result[y * 7 - 1] = ' ';
     }
     return result;
 }
@@ -656,14 +678,44 @@ RawInput::open_raw(bool unpack, const std::string& name,
             m_spec.channelnames.clear();
             m_spec.channelnames.emplace_back("Y");
 
+            uint32_t raw_bps = m_processor->imgdata.rawdata.color.raw_bps;
+
+            float black_level = m_processor->imgdata.rawdata.color.black;
+            if (black_level == 0) {
+                unsigned* cblack = m_processor->imgdata.rawdata.color.cblack;
+                size_t size      = cblack[4] * cblack[5];
+                size_t offset    = 6;
+                if (size == 0) {
+                    size   = 4;
+                    offset = 0;
+                }
+
+                for (size_t i = 0; i < size; i++)
+                    black_level += cblack[offset + i];
+                black_level /= size;
+            }
+
             // Put the details about the filter pattern into the metadata
-            std::string filter(
-                libraw_filter_to_str(m_processor->imgdata.idata.filters,
-                                     m_processor->imgdata.idata.cdesc));
+            std::string filter;
+            const bool is_xtrans
+                = strncmp(m_processor->imgdata.idata.make, "Fujifilm", 8) == 0
+                  && m_processor->imgdata.idata.filters == 9;
+
+            if (is_xtrans) {
+                filter = libraw_xtrans_filter_to_str(
+                    m_processor->imgdata.idata.xtrans);
+            } else {
+                filter = libraw_bayer_filter_to_str(
+                    m_processor->imgdata.idata.filters,
+                    m_processor->imgdata.idata.cdesc);
+            }
+
             if (filter.empty()) {
                 filter = "unknown";
             }
             m_spec.attribute("raw:FilterPattern", filter);
+            m_spec.attribute("raw:BlackLevel", black_level);
+            m_spec.attribute("raw:BitsPerSample", raw_bps);
 
             // Also, any previously set demosaicing options are void, so remove them
             m_spec.erase_attribute("oiio:ColorSpace");
