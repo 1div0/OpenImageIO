@@ -11,7 +11,10 @@
 
 #define HAVE_CONFIG_H /* Sometimes DCMTK seems to need this */
 #include <dcmtk/config/osconfig.h>
+OIIO_PRAGMA_WARNING_PUSH
+OIIO_GCC_PRAGMA(GCC diagnostic ignored "-Wformat-nonliteral")
 #include <dcmtk/dcmdata/dctk.h>
+OIIO_PRAGMA_WARNING_POP
 #include <dcmtk/dcmimage/dicopx.h>
 #include <dcmtk/dcmimage/diregist.h>
 #include <dcmtk/dcmimgle/dcmimage.h>
@@ -157,7 +160,7 @@ DICOMInput::seek_subimage(int subimage, int miplevel)
         m_subimage = 0;
         if (m_img->getStatus() != EIS_Normal) {
             m_img.reset();
-            errorf("Unable to open DICOM file %s", m_filename);
+            errorfmt("Unable to open DICOM file {}", m_filename);
             return false;
         }
         m_framecount = m_img->getFrameCount();
@@ -165,7 +168,7 @@ DICOMInput::seek_subimage(int subimage, int miplevel)
     }
 
     if (subimage >= m_firstframe + m_framecount) {
-        errorf("Unable to seek to subimage %d", subimage);
+        errorfmt("Unable to seek to subimage {}", subimage);
         return false;
     }
 
@@ -174,7 +177,7 @@ DICOMInput::seek_subimage(int subimage, int miplevel)
         m_img->processNextFrames(1);
         if (m_img->getStatus() != EIS_Normal) {
             m_img.reset();
-            errorf("Unable to seek to subimage %d", subimage);
+            errorfmt("Unable to seek to subimage {}", subimage);
             return false;
         }
         ++m_subimage;

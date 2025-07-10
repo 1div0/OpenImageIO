@@ -9,6 +9,7 @@
 
 #include <OpenImageIO/half.h>
 
+#include <OpenImageIO/color.h>
 #include <OpenImageIO/dassert.h>
 #include <OpenImageIO/fmath.h>
 #include <OpenImageIO/imagebuf.h>
@@ -274,6 +275,17 @@ ImageSpec::scanline_bytes(bool native) const noexcept
 
 
 imagesize_t
+ImageSpec::scanline_bytes(TypeDesc type) const noexcept
+{
+    return type == TypeUnknown
+               ? scanline_bytes(true)
+               : clamped_mult64(clamped_mult64(size_t(width), size_t(nchannels)),
+                                type.size());
+}
+
+
+
+imagesize_t
 ImageSpec::tile_pixels() const noexcept
 {
     if (tile_width <= 0 || tile_height <= 0 || tile_depth <= 0)
@@ -296,6 +308,17 @@ ImageSpec::tile_bytes(bool native) const noexcept
 
 
 imagesize_t
+ImageSpec::tile_bytes(TypeDesc type) const noexcept
+{
+    return type == TypeUnknown
+               ? tile_bytes(true)
+               : clamped_mult64(clamped_mult64(tile_pixels(), nchannels),
+                                type.size());
+}
+
+
+
+imagesize_t
 ImageSpec::image_pixels() const noexcept
 {
     if (width < 0 || height < 0 || depth < 0)
@@ -312,6 +335,17 @@ imagesize_t
 ImageSpec::image_bytes(bool native) const noexcept
 {
     return clamped_mult64(image_pixels(), (imagesize_t)pixel_bytes(native));
+}
+
+
+
+imagesize_t
+ImageSpec::image_bytes(TypeDesc datatype) const noexcept
+{
+    if (datatype == TypeUnknown)
+        return image_bytes(false);  // special case: native size
+    return clamped_mult64(image_pixels(),
+                          imagesize_t(nchannels) * datatype.size());
 }
 
 
@@ -1229,26 +1263,21 @@ pvt::check_texture_metadata_sanity(ImageSpec& spec)
 void
 ImageSpec::set_colorspace(string_view colorspace)
 {
-    // If we're not changing color space, don't mess with anything
-    string_view oldspace = get_string_attribute("oiio:ColorSpace");
-    if (oldspace.size() && colorspace.size() && oldspace == colorspace)
-        return;
-
-    // Set or clear the main "oiio:ColorSpace" attribute
-    if (colorspace.empty()) {
-        erase_attribute("oiio:ColorSpace");
-    } else {
-        attribute("oiio:ColorSpace", colorspace);
-    }
-
-    // Clear a bunch of other metadata that might contradict the colorspace,
-    // including some format-specific things that we don't want to propagate
-    // from input to output if we know that color space transformations have
-    // occurred.
-    erase_attribute("Exif:ColorSpace");
-    erase_attribute("tiff:ColorSpace");
-    erase_attribute("tiff:PhotometricInterpretation");
+    ColorConfig::default_colorconfig().set_colorspace(*this, colorspace);
 }
+
+
+
+template<>
+size_t
+pvt::heapsize<ImageSpec>(const ImageSpec& is)
+{
+    size_t size = pvt::heapsize(is.channelformats);
+    size += pvt::heapsize(is.channelnames);
+    size += pvt::heapsize(is.extra_attribs);
+    return size;
+}
+
 
 
 OIIO_NAMESPACE_END

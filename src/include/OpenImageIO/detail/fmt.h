@@ -19,13 +19,14 @@
 #    define FMT_EXCEPTIONS 0
 #endif
 
-// Redefining FMT_THROW to something benign seems to avoid some UB or possibly
-// gcc 11+ compiler bug triggered by the definition of FMT_THROW in fmt 10.1+
-// when FMT_EXCEPTIONS=0, which results in mangling SIMD math. This nugget
-// below works around the problems for hard to understand reasons.
-#if !defined(FMT_THROW) && !FMT_EXCEPTIONS && OIIO_GNUC_VERSION >= 110000
-#    define FMT_THROW(x) \
-        OIIO_ASSERT_MSG(0, "fmt exception: %s", (x).what()), std::terminate()
+#if OIIO_VERSION_LESS(3, 1, 2)
+/* DEPRECATED -- remove at next ABI compatibility boundary */
+OIIO_NAMESPACE_BEGIN
+namespace pvt {
+OIIO_UTIL_API void
+log_fmt_error(const char* message);
+};
+OIIO_NAMESPACE_END
 #endif
 
 // Use the grisu fast floating point formatting for old fmt versions
@@ -48,6 +49,7 @@
 #    define FMT_USE_FLOAT128 0
 #endif
 
+// Suppress certain warnings generated in the fmt headers themselves
 OIIO_PRAGMA_WARNING_PUSH
 #if OIIO_GNUC_VERSION >= 70000
 #    pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
@@ -57,6 +59,9 @@ OIIO_PRAGMA_WARNING_PUSH
 #endif
 #if OIIO_INTEL_LLVM_COMPILER
 #    pragma GCC diagnostic ignored "-Wtautological-constant-compare"
+#endif
+#if OIIO_CLANG_VERSION >= 180000
+#    pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
 #include <OpenImageIO/detail/fmt/format.h>

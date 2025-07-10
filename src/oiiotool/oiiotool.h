@@ -1,5 +1,5 @@
 // Copyright Contributors to the OpenImageIO project.
-// SPDX-License-Identifier: BSD-3-Clause and Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 // https://github.com/AcademySoftwareFoundation/OpenImageIO
 
 
@@ -82,18 +82,20 @@ public:
     bool skip_bad_frames = false;  // Just skip a bad frame, don't exit
     bool nostderr        = false;  // If true, use stdout for errors
     bool noerrexit       = false;  // Don't exit on error
+    bool create_dir      = false;
     std::string dumpdata_C_name;
     std::string full_command_line;
     std::string printinfo_metamatch;
     std::string printinfo_nometamatch;
     std::string printinfo_format;
     std::string missingfile_policy;
-    ImageSpec input_config;  // configuration options for reading
-    ImageSpec first_input_dimensions;
+    ImageSpec input_config;         // configuration options for reading
     std::string input_channel_set;  // Optional input channel set
     ParamValueList uservars;        // User-defined variables (with --set)
     ArgParse ap;                    // Command-line argument parser
     ErrorHandler eh;
+    // If this is a frame iteration child, retain a pointer to the parent
+    Oiiotool* parent_oiiotool = nullptr;
 
     struct ControlRec {
         std::string command;  // control command: "if", "while", etc.
@@ -140,8 +142,8 @@ public:
     ImageRecRef curimg;                    // current image
     std::vector<ImageRecRef> image_stack;  // stack of previous images
     std::map<std::string, ImageRecRef> image_labels;  // labeled images
-    ImageCache* imagecache = nullptr;                 // back ptr to ImageCache
-    ColorConfig colorconfig;                          // OCIO color config
+    std::shared_ptr<ImageCache> imagecache;           // back ptr to ImageCache
+    std::unique_ptr<ColorConfig> m_colorconfig;       // OCIO color config
     Timer total_runtime;
     // total_readtime is the amount of time for direct reads, and does not
     // count time spent inside ImageCache.
@@ -156,11 +158,14 @@ public:
     int frame_number            = 0;
     bool enable_function_timing = true;
     bool input_config_set       = false;
-    bool printed_info           = false;  // printed info at some point
+    bool printed_info           = false;    // printed info at some point
+    bool m_in_parallel_frame_loop = false;  // True when in parallel frame loop
     // Remember the first input dataformats we encountered
     TypeDesc input_dataformat;
     int input_bitspersample = 0;
     std::map<std::string, std::string> input_channelformats;
+    ImageSpec m_first_input_dimensions;
+    mutable spin_mutex m_first_input_dimensions_mutex;
 
     // stat_mutex guards when we are merging another ot's stats into this one
     std::mutex m_stat_mutex;
@@ -257,6 +262,17 @@ public:
             curimg = ImageRecRef();
         }
         return r;
+    }
+
+    void popbottom()
+    {
+        if (image_stack.size()) {
+            // There are images on the full stack -- get rid of the bottom
+            image_stack.erase(image_stack.begin());
+        } else {
+            // Nothing on the stack, so get rid of the current image
+            curimg = ImageRecRef();
+        }
     }
 
     ImageRecRef top() { return curimg; }
@@ -359,6 +375,33 @@ public:
     // Merge stats from another Oiiotool
     void merge_stats(const Oiiotool& ot);
 
+    ColorConfig& colorconfig();
+
+    // Copy the internal 'm_first_input_dimensions` to `dims`.
+    void get_first_input_dimensions(ImageSpec& dims) const
+    {
+        std::lock_guard lock(m_first_input_dimensions_mutex);
+        dims.copy_dimensions(m_first_input_dimensions);
+    }
+
+    bool first_input_dimensions_is_set() const
+    {
+        return m_first_input_dimensions.format.basetype != TypeDesc::UNKNOWN;
+    }
+
+    // If the internal 'm_first_input_dimensions` is not yet set, set it to
+    // the values in `dims`.
+    void set_first_input_dimensions(const ImageSpec& dims)
+    {
+        std::lock_guard lock(m_first_input_dimensions_mutex);
+        if (!first_input_dimensions_is_set())
+            m_first_input_dimensions.copy_dimensions(dims);
+    }
+
+    void begin_parallel_frame_loop(int nthreads);
+    void end_parallel_frame_loop();
+    bool in_parallel_frame_loop() const { return m_in_parallel_frame_loop; }
+
 private:
     CallbackFunction m_pending_callback;
     std::vector<const char*> m_pending_argv;
@@ -423,7 +466,7 @@ private:
 /// and potentially MIPmap levels for each subimage.
 class ImageRec {
 public:
-    ImageRec(const std::string& name, ImageCache* imagecache)
+    ImageRec(const std::string& name, std::shared_ptr<ImageCache> imagecache)
         : m_name(name)
         , m_imagecache(imagecache)
     {
@@ -460,7 +503,7 @@ public:
 
     // Initialize an ImageRec with the given spec.
     ImageRec(const std::string& name, const ImageSpec& spec,
-             ImageCache* imagecache);
+             std::shared_ptr<ImageCache> imagecache);
 
     ImageRec(const ImageRec& copy) = delete;  // Disallow copy ctr
 
@@ -584,15 +627,6 @@ public:
     /// Error reporting for ImageRec: call this with printf-like arguments.
     /// Note however that this is fully typesafe!
     template<typename... Args>
-    OIIO_DEPRECATED("Use errorfmt instead")
-    void errorf(const char* fmt, const Args&... args) const
-    {
-        append_error(Strutil::sprintf(fmt, args...));
-    }
-
-    /// Error reporting for ImageRec: call this with printf-like arguments.
-    /// Note however that this is fully typesafe!
-    template<typename... Args>
     void errorfmt(const char* fmt, const Args&... args) const
     {
         append_error(Strutil::fmt::format(fmt, args...));
@@ -616,7 +650,7 @@ private:
     std::vector<SubimageRec> m_subimages;
     std::time_t m_time;  //< Modification time of the input file
     TypeDesc m_input_dataformat;
-    ImageCache* m_imagecache = nullptr;
+    std::shared_ptr<ImageCache> m_imagecache;
     mutable std::string m_err;
     std::unique_ptr<ImageSpec> m_configspec;
 
@@ -777,13 +811,16 @@ public:
     // stack.
     OiiotoolOp(Oiiotool& ot, string_view opname, cspan<const char*> argv,
                int ninputs, setup_func_t setup_func = nullptr,
-               impl_func_t impl_func = nullptr)
+               impl_func_t impl_func          = nullptr,
+               ParamValueSpan control_options = {})
         : ot(ot)
         , m_nargs((int)argv.size())
         , m_nimages(ninputs + 1)
         , m_setup_func(setup_func)
         , m_impl_func(impl_func)
     {
+        m_control_options.assign(control_options.begin(),
+                                 control_options.end());
         if (Strutil::starts_with(opname, "--"))
             opname.remove_prefix(1);  // canonicalize to one dash
         m_opname = opname.substr(0, opname.find_first_of(':'));  // and no :
@@ -797,6 +834,12 @@ public:
     OiiotoolOp(Oiiotool& ot, string_view opname, cspan<const char*> argv,
                int ninputs, impl_func_t impl_func)
         : OiiotoolOp(ot, opname, argv, ninputs, {}, impl_func)
+    {
+    }
+    OiiotoolOp(Oiiotool& ot, string_view opname, cspan<const char*> argv,
+               int ninputs, impl_func_t impl_func,
+               ParamValueSpan control_options)
+        : OiiotoolOp(ot, opname, argv, ninputs, {}, impl_func, control_options)
     {
     }
     virtual ~OiiotoolOp() {}
@@ -887,10 +930,12 @@ public:
             m_img.resize(nimages());
             for (int m = 0, nmip = ir(0)->miplevels(); m < nmip; ++m) {
                 m_current_miplevel = m;
-                for (int i = 0; i < nimages(); ++i)
-                    m_img[i] = &((*ir(i))(std::min(s, ir(i)->subimages() - 1),
-                                          std::min(m, ir(i)->miplevels(s))));
-
+                for (int i = 0; i < nimages(); ++i) {
+                    // If the subimage doesn't exist, just use the last
+                    int ss   = std::min(s, ir(i)->subimages() - 1);
+                    m_img[i] = &(
+                        (*ir(i))(ss, std::min(m, ir(i)->miplevels(ss))));
+                }
                 if (subimage_is_active(s)) {
                     // Call the impl kernel for this subimage
                     bool ok = impl(m_img);
@@ -1006,7 +1051,35 @@ public:
             }
         }
         all_subimages |= m_options.get_int("allsubimages", ot.allsubimages);
-        return all_subimages ? (nimages() > 1 ? ir(1)->subimages() : 1) : 1;
+
+        // How many subimages are we going to operate on? There are a few
+        // strategies for handling the decision when the input images differ
+        // in the number of subimages. The default is to operate on subimage
+        // list from the first image input.
+        int n = 1;
+        if (all_subimages) {
+            OIIO_DASSERT(nimages() >= 1);
+            std::string subimage_policy = m_control_options["subimage_policy"];
+            if (subimage_policy == "max") {
+                // operate on the maximum number of subimages of the inputs
+                for (int i = 1; i < nimages(); ++i)
+                    n = std::max(n, ir(i)->subimages());
+            } else if (subimage_policy == "min") {
+                // operate on the minimum number of subimages of the inputs
+                if (nimages() > 1)
+                    n = ir(1)->subimages();
+                for (int i = 2; i < nimages(); ++i)
+                    n = std::min(n, ir(i)->subimages());
+            } else if (subimage_policy == "last") {
+                // operate on the subimages of the last input
+                n = ir(nimages() - 1)->subimages();
+            } else /* if (subimage_policy == "first")*/ {  // default
+                // default: operate on the subimages of the first input
+                if (nimages() > 1)
+                    n = ir(1)->subimages();
+            }
+        }
+        return n;
     }
 
     // Is the given subimage in the active set to be operated on by this op?
@@ -1108,6 +1181,7 @@ protected:
     new_output_imagerec_func_t m_new_output_imagerec_func;
     int m_current_subimage;  // for impl(), which subimage are we on?
     int m_current_miplevel;  // for impl(), which miplevel are we on?
+    ParamValueList m_control_options;
 };
 
 

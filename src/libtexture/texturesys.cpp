@@ -28,7 +28,6 @@
 #include <OpenImageIO/thread.h>
 #include <OpenImageIO/typedesc.h>
 #include <OpenImageIO/ustring.h>
-#include <OpenImageIO/varyingref.h>
 
 #include "imagecache_pvt.h"
 #include "texture_pvt.h"
@@ -39,6 +38,9 @@
 OIIO_NAMESPACE_BEGIN
 using namespace pvt;
 using namespace simd;
+using LevelInfo    = ImageCacheFile::LevelInfo;
+using SubimageInfo = ImageCacheFile::SubimageInfo;
+using ImageDims    = ImageCacheFile::ImageDims;
 
 namespace {  // anonymous
 
@@ -48,10 +50,13 @@ namespace {  // anonymous
 // The only easy way to fix this is to make shared_texturesys be an ordinary
 // pointer and just let it leak (who cares? the app is done, and it only
 // contains a few hundred bytes).
-static TextureSystemImpl* shared_texturesys = NULL;
+static std::shared_ptr<TextureSystem> shared_texturesys;
 static spin_mutex shared_texturesys_mutex;
 static bool do_unit_test_texture    = false;
 static float unit_test_texture_blur = 0.0f;
+
+static thread_local tsl::robin_map<int64_t, std::string> txsys_error_messages;
+static std::atomic_int64_t txsys_next_id(0);
 
 static vfloat4 u8scale(1.0f / 255.0f);
 static vfloat4 u16scale(1.0f / 65535.0f);
@@ -79,14 +84,34 @@ static const OIIO_SIMD4_ALIGN vbool4 channel_masks[5] = {
 }  // end anonymous namespace
 
 
-TextureSystem*
-TextureSystem::create(bool shared, ImageCache* imagecache)
+
+void
+TextureSystem::impl_deleter(TextureSystemImpl* todel)
+{
+    delete todel;
+}
+
+
+
+TextureSystem::TextureSystem(std::shared_ptr<ImageCache> imagecache)
+    : m_impl(new TextureSystemImpl(imagecache), &impl_deleter)
+{
+}
+
+
+
+TextureSystem::~TextureSystem() {}
+
+
+
+std::shared_ptr<TextureSystem>
+TextureSystem::create(bool shared, std::shared_ptr<ImageCache> imagecache)
 {
     // Because the shared_texturesys is never deleted (by design)
     // we silence the otherwise useful compiler warning on newer GCC versions
     OIIO_PRAGMA_WARNING_PUSH
 #if OIIO_GNUC_VERSION > 100000
-    OIIO_GCC_ONLY_PRAGMA(GCC diagnostic ignored "-Wmismatched-new-delete")
+    // OIIO_GCC_ONLY_PRAGMA(GCC diagnostic ignored "-Wmismatched-new-delete")
 #endif
     if (shared) {
         // They requested a shared texture system.  If a shared one already
@@ -94,11 +119,8 @@ TextureSystem::create(bool shared, ImageCache* imagecache)
         // as the shared one.
         spin_lock guard(shared_texturesys_mutex);
         if (!shared_texturesys)
-            shared_texturesys = new TextureSystemImpl(ImageCache::create(true));
-#if 0
-        std::cerr << " shared TextureSystem is "
-                  << (void *)shared_texturesys << "\n";
-#endif
+            shared_texturesys = std::make_shared<TextureSystem>(
+                ImageCache::create(true));
         return shared_texturesys;
     }
 
@@ -108,11 +130,8 @@ TextureSystem::create(bool shared, ImageCache* imagecache)
         imagecache = ImageCache::create(false);
         own_ic     = true;
     }
-    TextureSystemImpl* ts  = new TextureSystemImpl(imagecache);
-    ts->m_imagecache_owner = own_ic;
-#if 0
-    std::cerr << "creating new ImageCache " << (void *)ts << "\n";
-#endif
+    auto ts = std::make_shared<TextureSystem>(imagecache);
+    ts->m_impl->m_imagecache_owner = own_ic;
     OIIO_PRAGMA_WARNING_POP
     return ts;
 }
@@ -120,30 +139,384 @@ TextureSystem::create(bool shared, ImageCache* imagecache)
 
 
 void
-TextureSystem::destroy(TextureSystem* x, bool teardown_imagecache)
+TextureSystem::destroy(std::shared_ptr<TextureSystem>& ts,
+                       bool teardown_imagecache)
 {
-    // std::cerr << "Destroying TS " << (void *)x << "\n";
-    if (!x)
+    if (!ts)
         return;
-    TextureSystemImpl* impl = (TextureSystemImpl*)x;
     if (teardown_imagecache) {
+        TextureSystemImpl* impl = ts->m_impl.get();
         if (impl->m_imagecache_owner)
-            ImageCache::destroy(impl->m_imagecache, true);
+            ImageCache::destroy(impl->m_imagecache_sp, true);
         impl->m_imagecache = nullptr;
+        impl->m_imagecache_sp.reset();
     }
 
-    spin_lock guard(shared_texturesys_mutex);
-    if (impl == shared_texturesys) {
-        // This is the shared TS, so don't really delete it.
-    } else {
-        // Not a shared cache, we are the only owner, so truly destroy it.
-        delete x;
-    }
+    ts.reset();
 }
 
 
 
-namespace pvt {  // namespace pvt
+TextureSystem::Perthread*
+TextureSystem::get_perthread_info(Perthread* thread_info)
+{
+    return m_impl->get_perthread_info(
+        (TextureSystemImpl::Perthread*)thread_info);
+}
+
+
+
+TextureSystem::Perthread*
+TextureSystem::create_thread_info()
+{
+    return m_impl->create_thread_info();
+}
+
+
+
+void
+TextureSystem::destroy_thread_info(Perthread* threadinfo)
+{
+    m_impl->destroy_thread_info((TextureSystemImpl::Perthread*)threadinfo);
+}
+
+
+
+bool
+TextureSystem::attribute(string_view name, TypeDesc type, const void* val)
+{
+    return m_impl->attribute(name, type, val);
+}
+
+
+
+TypeDesc
+TextureSystem::getattributetype(string_view name) const
+{
+    return m_impl->getattributetype(name);
+}
+
+
+
+bool
+TextureSystem::getattribute(string_view name, TypeDesc type, void* val) const
+{
+    return m_impl->getattribute(name, type, val);
+}
+
+
+
+TextureSystem::TextureHandle*
+TextureSystem::get_texture_handle(ustring filename, Perthread* thread_info,
+                                  const TextureOpt* options)
+{
+    return m_impl->get_texture_handle(
+        filename, (TextureSystemImpl::Perthread*)thread_info, options);
+}
+
+
+
+bool
+TextureSystem::good(TextureHandle* texture_handle)
+{
+    return m_impl->good(texture_handle);
+}
+
+
+
+ustring
+TextureSystem::filename_from_handle(TextureHandle* handle)
+{
+    return m_impl->filename_from_handle(handle);
+}
+
+
+
+int
+TextureSystem::get_colortransform_id(ustring fromspace, ustring tospace) const
+{
+    return m_impl->get_colortransform_id(fromspace, tospace);
+}
+
+
+int
+TextureSystem::get_colortransform_id(ustringhash fromspace,
+                                     ustringhash tospace) const
+{
+    return m_impl->get_colortransform_id(fromspace, tospace);
+}
+
+
+
+bool
+TextureSystem::texture(ustring filename, TextureOpt& options, float s, float t,
+                       float dsdx, float dtdx, float dsdy, float dtdy,
+                       int nchannels, float* result, float* dresultds,
+                       float* dresultdt)
+{
+    return m_impl->texture(filename, options, s, t, dsdx, dtdx, dsdy, dtdy,
+                           nchannels, result, dresultds, dresultdt);
+}
+
+
+bool
+TextureSystem::texture(TextureHandle* texture_handle, Perthread* thread_info,
+                       TextureOpt& options, float s, float t, float dsdx,
+                       float dtdx, float dsdy, float dtdy, int nchannels,
+                       float* result, float* dresultds, float* dresultdt)
+{
+    return m_impl->texture(texture_handle, thread_info, options, s, t, dsdx,
+                           dtdx, dsdy, dtdy, nchannels, result, dresultds,
+                           dresultdt);
+}
+
+
+bool
+TextureSystem::texture(ustring filename, TextureOptBatch& options,
+                       Tex::RunMask mask, const float* s, const float* t,
+                       const float* dsdx, const float* dtdx, const float* dsdy,
+                       const float* dtdy, int nchannels, float* result,
+                       float* dresultds, float* dresultdt)
+{
+    return m_impl->texture(filename, options, mask, s, t, dsdx, dtdx, dsdy,
+                           dtdy, nchannels, result, dresultds, dresultdt);
+}
+
+
+bool
+TextureSystem::texture(TextureHandle* texture_handle, Perthread* thread_info,
+                       TextureOptBatch& options, Tex::RunMask mask,
+                       const float* s, const float* t, const float* dsdx,
+                       const float* dtdx, const float* dsdy, const float* dtdy,
+                       int nchannels, float* result, float* dresultds,
+                       float* dresultdt)
+{
+    return m_impl->texture(texture_handle, thread_info, options, mask, s, t,
+                           dsdx, dtdx, dsdy, dtdy, nchannels, result, dresultds,
+                           dresultdt);
+}
+
+
+
+std::string
+TextureSystem::resolve_filename(const std::string& filename) const
+{
+    return m_impl->resolve_filename(filename);
+}
+
+
+
+bool
+TextureSystem::get_texture_info(ustring filename, int subimage,
+                                ustring dataname, TypeDesc datatype, void* data)
+{
+    return m_impl->get_texture_info(filename, subimage, dataname, datatype,
+                                    data);
+}
+
+
+bool
+TextureSystem::get_texture_info(TextureHandle* texture_handle,
+                                Perthread* thread_info, int subimage,
+                                ustring dataname, TypeDesc datatype, void* data)
+{
+    return m_impl->get_texture_info(texture_handle, thread_info, subimage,
+                                    dataname, datatype, data);
+}
+
+
+bool
+TextureSystem::get_imagespec(ustring filename, ImageSpec& spec, int subimage)
+{
+    return m_impl->get_imagespec(filename, spec, subimage);
+}
+
+
+bool
+TextureSystem::get_imagespec(TextureHandle* texture_handle,
+                             Perthread* thread_info, ImageSpec& spec,
+                             int subimage)
+{
+    return m_impl->get_imagespec(texture_handle, thread_info, spec, subimage);
+}
+
+
+const ImageSpec*
+TextureSystem::imagespec(ustring filename, int subimage)
+{
+    return m_impl->imagespec(filename, subimage);
+}
+
+
+const ImageSpec*
+TextureSystem::imagespec(TextureHandle* texture_handle, Perthread* thread_info,
+                         int subimage)
+{
+    return m_impl->imagespec(texture_handle, thread_info, subimage);
+}
+
+
+bool
+TextureSystem::get_texels(ustring filename, TextureOpt& options, int miplevel,
+                          int xbegin, int xend, int ybegin, int yend,
+                          int zbegin, int zend, int chbegin, int chend,
+                          TypeDesc format, void* result)
+{
+    return m_impl->get_texels(filename, options, miplevel, xbegin, xend, ybegin,
+                              yend, zbegin, zend, chbegin, chend, format,
+                              result);
+}
+
+
+bool
+TextureSystem::get_texels(TextureHandle* texture_handle, Perthread* thread_info,
+                          TextureOpt& options, int miplevel, int xbegin,
+                          int xend, int ybegin, int yend, int zbegin, int zend,
+                          int chbegin, int chend, TypeDesc format, void* result)
+{
+    return m_impl->get_texels(texture_handle, thread_info, options, miplevel,
+                              xbegin, xend, ybegin, yend, zbegin, zend, chbegin,
+                              chend, format, result);
+}
+
+
+
+bool
+TextureSystem::get_texels(ustring filename, TextureOpt& options, int miplevel,
+                          const ROI& roi, TypeDesc format,
+                          const image_span<std::byte>& result)
+{
+    return m_impl->get_texels(filename, options, miplevel, roi, format, result);
+}
+
+
+bool
+TextureSystem::get_texels(TextureHandle* texture_handle, Perthread* thread_info,
+                          TextureOpt& options, int miplevel, const ROI& roi,
+                          TypeDesc format, const image_span<std::byte>& result)
+{
+    return m_impl->get_texels(texture_handle, thread_info, options, miplevel,
+                              roi, format, result);
+}
+
+
+
+bool
+TextureSystem::is_udim(ustring filename)
+{
+    return m_impl->is_udim(filename);
+}
+
+
+bool
+TextureSystem::is_udim(TextureHandle* udimfile)
+{
+    return m_impl->is_udim(udimfile);
+}
+
+
+
+TextureSystem::TextureHandle*
+TextureSystem::resolve_udim(ustring udimpattern, float s, float t)
+{
+    return m_impl->resolve_udim(udimpattern, s, t);
+}
+
+
+TextureSystem::TextureHandle*
+TextureSystem::resolve_udim(TextureHandle* udimfile, Perthread* thread_info,
+                            float s, float t)
+{
+    return m_impl->resolve_udim(udimfile, thread_info, s, t);
+}
+
+
+
+void
+TextureSystem::inventory_udim(ustring udimpattern,
+                              std::vector<ustring>& filenames, int& nutiles,
+                              int& nvtiles)
+{
+    m_impl->inventory_udim(udimpattern, filenames, nutiles, nvtiles);
+}
+
+
+void
+TextureSystem::inventory_udim(TextureHandle* udimfile, Perthread* thread_info,
+                              std::vector<ustring>& filenames, int& nutiles,
+                              int& nvtiles)
+{
+    m_impl->inventory_udim(udimfile, thread_info, filenames, nutiles, nvtiles);
+}
+
+
+
+void
+TextureSystem::invalidate(ustring filename, bool force)
+{
+    m_impl->invalidate(filename, force);
+}
+
+
+void
+TextureSystem::invalidate_all(bool force)
+{
+    m_impl->invalidate_all(force);
+}
+
+
+
+void
+TextureSystem::close(ustring filename)
+{
+    m_impl->close(filename);
+}
+
+
+void
+TextureSystem::close_all()
+{
+    m_impl->close_all();
+}
+
+
+
+bool
+TextureSystem::has_error() const
+{
+    return m_impl->has_error();
+}
+
+
+std::string
+TextureSystem::geterror(bool clear) const
+{
+    return m_impl->geterror(clear);
+}
+
+
+
+std::string
+TextureSystem::getstats(int level, bool icstats) const
+{
+    return m_impl->getstats(level, icstats);
+}
+
+
+void
+TextureSystem::reset_stats()
+{
+    m_impl->reset_stats();
+}
+
+
+
+std::shared_ptr<ImageCache>
+TextureSystem::imagecache() const
+{
+    return m_impl->m_imagecache_sp;
+}
+
 
 
 EightBitConverter<float> TextureSystemImpl::uchar2float;
@@ -153,7 +526,6 @@ EightBitConverter<float> TextureSystemImpl::uchar2float;
 // Wrap functions wrap 'coord' around 'width', and return true if the
 // result is a valid pixel coordinate, false if black should be used
 // instead.
-
 
 bool
 TextureSystemImpl::wrap_periodic_sharedborder(int& coord, int origin, int width)
@@ -183,6 +555,7 @@ const TextureSystemImpl::wrap_impl TextureSystemImpl::wrap_functions[] = {
 };
 
 
+namespace pvt {
 
 simd::vbool4
 wrap_black_simd(simd::vint4& coord_, const simd::vint4& origin,
@@ -321,10 +694,15 @@ texture_type_name(TexFormat f)
 }
 
 
+}  // namespace pvt
 
-TextureSystemImpl::TextureSystemImpl(ImageCache* imagecache)
+
+
+TextureSystemImpl::TextureSystemImpl(std::shared_ptr<ImageCache> imagecache)
+    : m_id(++txsys_next_id)
 {
-    m_imagecache = (ImageCacheImpl*)imagecache;
+    m_imagecache_sp = std::move(imagecache);
+    m_imagecache    = (ImageCacheImpl*)m_imagecache_sp->m_impl.get();
     init();
 }
 
@@ -344,7 +722,7 @@ TextureSystemImpl::init()
     // Allow environment variable to override default options
     const char* options = getenv("OPENIMAGEIO_TEXTURE_OPTIONS");
     if (options)
-        attribute("options", options);
+        attribute("options", TypeString, &options);
 
     if (do_unit_test_texture)
         unit_test_texture();
@@ -358,7 +736,7 @@ TextureSystemImpl::~TextureSystemImpl()
     // Erase any leftover errors from this thread
     // TODO: can we clear other threads' errors?
     // TODO: potentially unsafe due to the static destruction order fiasco
-    // txsys_error_messages.erase(this);
+    // txsys_error_messages.erase(m_id);
 }
 
 
@@ -646,8 +1024,8 @@ TextureSystemImpl::get_texture_info(TextureHandle* texture_handle,
 
 
 bool
-TextureSystemImpl::get_imagespec(ustring filename, int subimage,
-                                 ImageSpec& spec)
+TextureSystemImpl::get_imagespec(ustring filename, ImageSpec& spec,
+                                 int subimage)
 {
     bool ok = m_imagecache->get_imagespec(filename, spec, subimage);
     if (!ok) {
@@ -662,8 +1040,8 @@ TextureSystemImpl::get_imagespec(ustring filename, int subimage,
 
 bool
 TextureSystemImpl::get_imagespec(TextureHandle* texture_handle,
-                                 Perthread* thread_info, int subimage,
-                                 ImageSpec& spec)
+                                 Perthread* thread_info, ImageSpec& spec,
+                                 int subimage)
 {
     bool ok
         = m_imagecache->get_imagespec((ImageCache::ImageHandle*)texture_handle,
@@ -828,7 +1206,8 @@ TextureSystemImpl::get_texels(TextureHandle* texture_handle_,
                   miplevel, texfile->filename());
         return false;
     }
-    const ImageSpec& spec(texfile->spec(subimage, miplevel));
+    const SubimageInfo& si(texfile->subimageinfo(subimage));
+    const ImageDims& dims(si.leveldims(miplevel));
 
     // FIXME -- this could be WAY more efficient than starting from
     // scratch for each pixel within the rectangle.  Instead, we should
@@ -836,9 +1215,9 @@ TextureSystemImpl::get_texels(TextureHandle* texture_handle_,
     // doing anything more complicated (not to mention bug-prone) until
     // somebody reports this routine as being a bottleneck.
     int nchannels      = chend - chbegin;
-    int actualchannels = OIIO::clamp(spec.nchannels - chbegin, 0, nchannels);
-    int tile_chbegin = 0, tile_chend = spec.nchannels;
-    if (spec.nchannels > m_max_tile_channels) {
+    int actualchannels = OIIO::clamp(dims.nchannels - chbegin, 0, nchannels);
+    int tile_chbegin = 0, tile_chend = dims.nchannels;
+    if (dims.nchannels > m_max_tile_channels) {
         // For files with many channels, narrow the range we cache
         tile_chbegin = chbegin;
         tile_chend   = chbegin + actualchannels;
@@ -852,39 +1231,41 @@ TextureSystemImpl::get_texels(TextureHandle* texture_handle_,
     imagesize_t npixelsread  = 0;
     bool ok                  = true;
     for (int z = zbegin; z < zend; ++z) {
-        if (z < spec.z || z >= (spec.z + std::max(spec.depth, 1))) {
+        if (z < dims.z || z >= (dims.z + std::max(dims.depth, 1))) {
             // nonexistent planes
             memset(result, 0, zplanesize);
             result = (void*)((char*)result + zplanesize);
             continue;
         }
-        tileid.z(z - ((z - spec.z) % std::max(1, spec.tile_depth)));
+        tileid.z(z - ((z - dims.z) % std::max(1, dims.tile_depth)));
         for (int y = ybegin; y < yend; ++y) {
-            if (y < spec.y || y >= (spec.y + spec.height)) {
+            if (y < dims.y || y >= (dims.y + dims.height)) {
                 // nonexistent scanlines
                 memset(result, 0, scanlinesize);
                 result = (void*)((char*)result + scanlinesize);
                 continue;
             }
-            tileid.y(y - ((y - spec.y) % spec.tile_height));
+            tileid.y(y - ((y - dims.y) % dims.tile_height));
             for (int x = xbegin; x < xend; ++x, ++npixelsread) {
-                if (x < spec.x || x >= (spec.x + spec.width)) {
+                if (x < dims.x || x >= (dims.x + dims.width)) {
                     // nonexistent columns
                     memset(result, 0, formatpixelsize);
                     result = (void*)((char*)result + formatpixelsize);
                     continue;
                 }
-                tileid.x(x - ((x - spec.x) % spec.tile_width));
+                tileid.x(x - ((x - dims.x) % dims.tile_width));
                 ok &= find_tile(tileid, thread_info, npixelsread == 0);
                 TileRef& tile(thread_info->tile);
                 const char* data;
                 if (tile
                     && (data = (const char*)tile->data(x, y, z, chbegin))) {
-                    convert_types(texfile->datatype(subimage), data, format,
-                                  result, actualchannels);
+                    convert_pixel_values(texfile->datatype(subimage), data,
+                                         format, result, actualchannels);
                     for (int c = actualchannels; c < nchannels; ++c)
-                        convert_types(TypeDesc::FLOAT, &options.fill, format,
-                                      (char*)result + c * formatchannelsize, 1);
+                        convert_pixel_values(TypeFloat, &options.fill, format,
+                                             (char*)result
+                                                 + c * formatchannelsize,
+                                             1);
                 } else {
                     memset(result, 0, formatpixelsize);
                 }
@@ -900,13 +1281,43 @@ TextureSystemImpl::get_texels(TextureHandle* texture_handle_,
     return ok;
 }
 
-static thread_local tsl::robin_map<const TextureSystemImpl*, std::string>
-    txsys_error_messages;
+
+
+bool
+TextureSystemImpl::get_texels(TextureHandle* texture_handle,
+                              Perthread* thread_info, TextureOpt& options,
+                              int miplevel, const ROI& roi, TypeDesc format,
+                              const image_span<std::byte>& result)
+{
+    // Default implementation (for now): call the old pointer+stride
+    return get_texels(texture_handle, thread_info, options, miplevel,
+                      roi.xbegin, roi.xend, roi.ybegin, roi.yend, roi.zbegin,
+                      roi.zend, roi.chbegin, roi.chend, format, result.data());
+}
+
+
+
+bool
+TextureSystemImpl::get_texels(ustring filename, TextureOpt& options,
+                              int miplevel, const ROI& roi, TypeDesc format,
+                              const image_span<std::byte>& result)
+{
+    PerThreadInfo* thread_info = m_imagecache->get_perthread_info();
+    TextureFile* texfile       = find_texturefile(filename, thread_info);
+    if (!texfile) {
+        error("Texture file \"{}\" not found", filename);
+        return false;
+    }
+    return get_texels((TextureHandle*)texfile, (Perthread*)thread_info, options,
+                      miplevel, roi, format, result);
+}
+
+
 
 bool
 TextureSystemImpl::has_error() const
 {
-    auto iter = txsys_error_messages.find(this);
+    auto iter = txsys_error_messages.find(m_id);
     if (iter == txsys_error_messages.end())
         return false;
     return iter.value().size() > 0;
@@ -918,7 +1329,7 @@ std::string
 TextureSystemImpl::geterror(bool clear) const
 {
     std::string e;
-    auto iter = txsys_error_messages.find(this);
+    auto iter = txsys_error_messages.find(m_id);
     if (iter != txsys_error_messages.end()) {
         e = iter.value();
         if (clear)
@@ -934,7 +1345,7 @@ TextureSystemImpl::append_error(string_view message) const
 {
     if (message.size() && message.back() == '\n')
         message.remove_suffix(1);
-    std::string& err_str = txsys_error_messages[this];
+    std::string& err_str = txsys_error_messages[m_id];
     OIIO_DASSERT(
         err_str.size() < 1024 * 1024 * 16
         && "Accumulated error messages > 16MB. Try checking return codes!");
@@ -1060,68 +1471,6 @@ TextureSystemImpl::fill_gray_channels(const ImageSpec& spec, int nchannels,
 
 
 bool
-TextureSystemImpl::texture(ustring filename, TextureOptions& options,
-                           Runflag* runflags, int beginactive, int endactive,
-                           VaryingRef<float> s, VaryingRef<float> t,
-                           VaryingRef<float> dsdx, VaryingRef<float> dtdx,
-                           VaryingRef<float> dsdy, VaryingRef<float> dtdy,
-                           int nchannels, float* result, float* dresultds,
-                           float* dresultdt)
-{
-#ifdef OIIO_TEX_NO_IMPLEMENT_VARYINGREF
-    return false;
-#else
-    Perthread* thread_info        = get_perthread_info();
-    TextureHandle* texture_handle = get_texture_handle(filename, thread_info);
-    return texture(texture_handle, thread_info, options, runflags, beginactive,
-                   endactive, s, t, dsdx, dtdx, dsdy, dtdy, nchannels, result,
-                   dresultds, dresultdt);
-#endif
-}
-
-
-
-bool
-TextureSystemImpl::texture(TextureHandle* texture_handle,
-                           Perthread* thread_info, TextureOptions& options,
-                           Runflag* runflags, int beginactive, int endactive,
-                           VaryingRef<float> s, VaryingRef<float> t,
-                           VaryingRef<float> dsdx, VaryingRef<float> dtdx,
-                           VaryingRef<float> dsdy, VaryingRef<float> dtdy,
-                           int nchannels, float* result, float* dresultds,
-                           float* dresultdt)
-{
-#ifdef OIIO_TEX_NO_IMPLEMENT_VARYINGREF
-    return false;
-#else
-    if (!texture_handle)
-        return false;
-    bool ok = true;
-    result += beginactive * nchannels;
-    if (dresultds) {
-        dresultds += beginactive * nchannels;
-        dresultdt += beginactive * nchannels;
-    }
-    for (int i = beginactive; i < endactive; ++i) {
-        if (runflags[i]) {
-            TextureOpt opt(options, i);
-            ok &= texture(texture_handle, thread_info, opt, s[i], t[i], dsdx[i],
-                          dtdx[i], dsdy[i], dtdy[i], nchannels, result,
-                          dresultds, dresultdt);
-        }
-        result += nchannels;
-        if (dresultds) {
-            dresultds += nchannels;
-            dresultdt += nchannels;
-        }
-    }
-    return ok;
-#endif
-}
-
-
-
-bool
 TextureSystemImpl::texture(ustring filename, TextureOpt& options, float s,
                            float t, float dsdx, float dtdx, float dsdy,
                            float dtdy, int nchannels, float* result,
@@ -1212,9 +1561,8 @@ TextureSystemImpl::texture(TextureHandle* texture_handle_,
         options.subimagename.clear();
     }
 
-    const ImageCacheFile::SubimageInfo& subinfo(
-        texturefile->subimageinfo(options.subimage));
-    const ImageSpec& spec(texturefile->spec(options.subimage, 0));
+    const SubimageInfo& si(texturefile->subimageinfo(options.subimage));
+    const ImageSpec& spec(si.spec());
 
     int actualchannels = OIIO::clamp(spec.nchannels - options.firstchannel, 0,
                                      nchannels);
@@ -1229,13 +1577,13 @@ TextureSystemImpl::texture(TextureHandle* texture_handle_,
     if (options.twrap == TextureOpt::WrapPeriodic && ispow2(spec.height))
         options.twrap = TextureOpt::WrapPeriodicPow2;
 
-    if (subinfo.is_constant_image && options.swrap != TextureOpt::WrapBlack
+    if (si.is_constant_image && options.swrap != TextureOpt::WrapBlack
         && options.twrap != TextureOpt::WrapBlack
         && options.colortransformid <= 0) {
         // Lookup of constant color texture, non-black wrap -- skip all the
         // hard stuff.
         for (int c = 0; c < actualchannels; ++c)
-            result[c] = subinfo.average_color[c + options.firstchannel];
+            result[c] = si.average_color[c + options.firstchannel];
         for (int c = actualchannels; c < nchannels; ++c)
             result[c] = options.fill;
         if (dresultds) {
@@ -1257,13 +1605,13 @@ TextureSystemImpl::texture(TextureHandle* texture_handle_,
         dtdy *= -1.0f;
     }
 
-    if (!subinfo.full_pixel_range) {  // remap st for overscan or crop
-        s = s * subinfo.sscale + subinfo.soffset;
-        dsdx *= subinfo.sscale;
-        dsdy *= subinfo.sscale;
-        t = t * subinfo.tscale + subinfo.toffset;
-        dtdx *= subinfo.tscale;
-        dtdy *= subinfo.tscale;
+    if (!si.full_pixel_range) {  // remap st for overscan or crop
+        s = s * si.sscale + si.soffset;
+        dsdx *= si.sscale;
+        dsdy *= si.sscale;
+        t = t * si.tscale + si.toffset;
+        dtdx *= si.tscale;
+        dtdy *= si.tscale;
     }
 
     bool ok;
@@ -1416,9 +1764,8 @@ TextureSystemImpl::texture_lookup_nomip(
     OIIO_SIMD4_ALIGN float sval[4] = { s, 0.0f, 0.0f, 0.0f };
     OIIO_SIMD4_ALIGN float tval[4] = { t, 0.0f, 0.0f, 0.0f };
     static OIIO_SIMD4_ALIGN float weight[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
-    ImageCacheFile::SubimageInfo& subinfo(
-        texturefile.subimageinfo(options.subimage));
-    int min_mip_level = subinfo.min_mip_level;
+    SubimageInfo& si(texturefile.subimageinfo(options.subimage));
+    int min_mip_level = si.min_mip_level;
     bool ok = (this->*sampler)(1, sval, tval, min_mip_level, texturefile,
                                thread_info, options, nchannels_result,
                                actualchannels, weight, (vfloat4*)result,
@@ -1559,16 +1906,15 @@ compute_miplevels(TextureSystemImpl::TextureFile& texturefile,
                   float minorlength, float& aspect, int* miplevel,
                   float* levelweight)
 {
-    ImageCacheFile::SubimageInfo& subinfo(
-        texturefile.subimageinfo(options.subimage));
-    int nmiplevels    = subinfo.n_mip_levels;
-    int min_mip_level = subinfo.min_mip_level;
+    SubimageInfo& si(texturefile.subimageinfo(options.subimage));
+    int nmiplevels    = si.n_mip_levels;
+    int min_mip_level = si.min_mip_level;
     for (int m = min_mip_level; m < nmiplevels; ++m) {
         // Compute the filter size (minor axis) in raster space at this
         // MIP level.  We use the smaller of the two texture resolutions,
         // which is better than just using one, but a more principled
         // approach is desired but remains elusive.  FIXME.
-        float filtwidth_ras = minorlength * subinfo.minwh[m];
+        float filtwidth_ras = minorlength * si.minwh[m];
 
         // Once the filter width is smaller than one texel at this level,
         // we've gone too far, so we know that we want to interpolate the
@@ -1605,8 +1951,7 @@ compute_miplevels(TextureSystemImpl::TextureFile& texturefile,
         // ratio that implies a huge nsamples, which is pointless if those
         // samples are too close.  So if minorlength is less than 1/2 texel
         // at the finest resolution, clamp it and recalculate aspect.
-        int r = std::max(subinfo.spec(0).full_width,
-                         subinfo.spec(0).full_height);
+        int r = std::max(si.spec().full_width, si.spec().full_height);
         if (minorlength * r < 0.5f) {
             aspect = OIIO::clamp(majorlength * r * 2.0f, 1.0f,
                                  float(options.anisotropic));
@@ -1980,9 +2325,9 @@ TextureSystemImpl::texture_lookup(TextureFile& texturefile,
             break;
         case TextureOpt::InterpSmartBicubic:
             if (lev == 0
-                || (texturefile.spec(options.subimage, lev).width
+                || (texturefile.subimageinfo(options.subimage).leveldims(lev).width
                     < naturalsres / 2)
-                || (texturefile.spec(options.subimage, lev).height
+                || (texturefile.subimageinfo(options.subimage).leveldims(lev).height
                     < naturaltres / 2)) {
                 ok &= sample_bicubic(nsamples, sval, tval, lev, texturefile,
                                      thread_info, options, nchannels_result,
@@ -2032,36 +2377,36 @@ TextureSystemImpl::texture_lookup(TextureFile& texturefile,
 
 const float*
 TextureSystemImpl::pole_color(TextureFile& texturefile,
-                              PerThreadInfo* /*thread_info*/,
-                              const ImageCacheFile::LevelInfo& levelinfo,
-                              TileRef& tile, int subimage, int /*miplevel*/,
-                              int pole)
+                              PerThreadInfo* /*thread_info*/, TileRef& tile,
+                              int subimage, int miplevel, int pole)
 {
-    if (!levelinfo.onetile)
+    SubimageInfo& si(texturefile.subimageinfo(subimage));
+    LevelInfo& lvl(si.levelinfo(miplevel));
+    const ImageDims& dims(si.leveldims(miplevel));
+    if (!lvl.onetile)
         return NULL;  // Only compute color for one-tile MIP levels
-    const ImageSpec& spec(levelinfo.spec);
-    if (!levelinfo.polecolorcomputed) {
+    if (!lvl.polecolorcomputed) {
         static spin_mutex mutex;  // Protect everybody's polecolor
         spin_lock lock(mutex);
-        if (!levelinfo.polecolorcomputed) {
-            OIIO_DASSERT(levelinfo.polecolor.size() == 0);
-            levelinfo.polecolor.resize(2 * spec.nchannels);
-            OIIO_DASSERT(tile->id().nchannels() == spec.nchannels
+        if (!lvl.polecolorcomputed) {
+            OIIO_DASSERT(!lvl.polecolor);
+            lvl.polecolor.reset(new float[2 * dims.nchannels]);
+            OIIO_DASSERT(tile->id().nchannels() == dims.nchannels
                          && "pole_color doesn't work for channel subsets");
             int pixelsize                = tile->pixelsize();
             TypeDesc::BASETYPE pixeltype = texturefile.pixeltype(subimage);
             // We store north and south poles adjacently in polecolor
-            float* p    = &(levelinfo.polecolor[0]);
-            int width   = spec.width;
+            float* p    = &(lvl.polecolor[0]);
+            int width   = dims.width;
             float scale = 1.0f / width;
-            for (int pole = 0; pole <= 1; ++pole, p += spec.nchannels) {
-                int y = pole * (spec.height - 1);  // 0 or height-1
-                for (int c = 0; c < spec.nchannels; ++c)
+            for (int pole = 0; pole <= 1; ++pole, p += dims.nchannels) {
+                int y = pole * (dims.height - 1);  // 0 or height-1
+                for (int c = 0; c < dims.nchannels; ++c)
                     p[c] = 0.0f;
                 const unsigned char* texel = tile->bytedata()
-                                             + y * spec.tile_width * pixelsize;
+                                             + y * dims.tile_width * pixelsize;
                 for (int i = 0; i < width; ++i, texel += pixelsize)
-                    for (int c = 0; c < spec.nchannels; ++c) {
+                    for (int c = 0; c < dims.nchannels; ++c) {
                         if (pixeltype == TypeDesc::UINT8)
                             p[c] += uchar2float(texel[c]);
                         else if (pixeltype == TypeDesc::UINT16)
@@ -2074,13 +2419,13 @@ TextureSystemImpl::pole_color(TextureFile& texturefile,
                             p[c] += ((const float*)texel)[c];
                         }
                     }
-                for (int c = 0; c < spec.nchannels; ++c)
+                for (int c = 0; c < dims.nchannels; ++c)
                     p[c] *= scale;
             }
-            levelinfo.polecolorcomputed = true;
+            lvl.polecolorcomputed = true;
         }
     }
-    return &(levelinfo.polecolor[pole * spec.nchannels]);
+    return &(lvl.polecolor[pole * dims.nchannels]);
 }
 
 
@@ -2088,10 +2433,8 @@ TextureSystemImpl::pole_color(TextureFile& texturefile,
 void
 TextureSystemImpl::fade_to_pole(float t, float* accum, float& weight,
                                 TextureFile& texturefile,
-                                PerThreadInfo* thread_info,
-                                const ImageCacheFile::LevelInfo& levelinfo,
-                                TextureOpt& options, int miplevel,
-                                int nchannels)
+                                PerThreadInfo* thread_info, TextureOpt& options,
+                                int miplevel, int nchannels)
 {
     // N.B. We want to fade to pole colors right at texture
     // boundaries t==0 and t==height, but at the very top of this
@@ -2101,14 +2444,12 @@ TextureSystemImpl::fade_to_pole(float t, float* accum, float& weight,
     const float* polecolor;
     if (t < 1.0f) {
         pole      = (1.0f - t);
-        polecolor = pole_color(texturefile, thread_info, levelinfo,
-                               thread_info->tile, options.subimage, miplevel,
-                               0);
+        polecolor = pole_color(texturefile, thread_info, thread_info->tile,
+                               options.subimage, miplevel, 0);
     } else {
         pole      = t - floorf(t);
-        polecolor = pole_color(texturefile, thread_info, levelinfo,
-                               thread_info->tile, options.subimage, miplevel,
-                               1);
+        polecolor = pole_color(texturefile, thread_info, thread_info->tile,
+                               options.subimage, miplevel, 1);
     }
     OIIO_DASSERT(polecolor != nullptr);
     pole = OIIO::clamp(pole, 0.0f, 1.0f);
@@ -2129,9 +2470,9 @@ TextureSystemImpl::sample_closest(
     vfloat4* accum_, vfloat4* daccumds_, vfloat4* daccumdt_)
 {
     bool allok = true;
-    const ImageSpec& spec(texturefile.spec(options.subimage, miplevel));
-    const ImageCacheFile::LevelInfo& levelinfo(
-        texturefile.levelinfo(options.subimage, miplevel));
+    const SubimageInfo& si(texturefile.subimageinfo(options.subimage));
+    const LevelInfo& lvl(si.levelinfo(miplevel));
+    const ImageDims& dims(si.leveldims(miplevel));
     TypeDesc::BASETYPE pixeltype = texturefile.pixeltype(options.subimage);
     wrap_impl swrap_func         = wrap_functions[(int)options.swrap];
     wrap_impl twrap_func         = wrap_functions[(int)options.twrap];
@@ -2139,8 +2480,8 @@ TextureSystemImpl::sample_closest(
     accum.clear();
     float nonfill    = 0.0f;
     int firstchannel = options.firstchannel;
-    int tile_chbegin = 0, tile_chend = spec.nchannels;
-    if (spec.nchannels > m_max_tile_channels) {
+    int tile_chbegin = 0, tile_chend = dims.nchannels;
+    if (dims.nchannels > m_max_tile_channels) {
         // For files with many channels, narrow the range we cache
         tile_chbegin = options.firstchannel;
         tile_chend   = options.firstchannel + actualchannels;
@@ -2153,7 +2494,7 @@ TextureSystemImpl::sample_closest(
 
         int stex, ttex;  // Texel coordinates
         float sfrac, tfrac;
-        st_to_texel(s, t, texturefile, spec, stex, ttex, sfrac, tfrac);
+        st_to_texel(s, t, texturefile, dims, stex, ttex, sfrac, tfrac);
 
         if (sfrac > 0.5f)
             ++stex;
@@ -2162,12 +2503,12 @@ TextureSystemImpl::sample_closest(
 
         // Wrap
         bool svalid, tvalid;  // Valid texels?  false means black border
-        svalid = swrap_func(stex, spec.x, spec.width);
-        tvalid = twrap_func(ttex, spec.y, spec.height);
-        if (!levelinfo.full_pixel_range) {
-            svalid &= (stex >= spec.x
-                       && stex < (spec.x + spec.width));  // data window
-            tvalid &= (ttex >= spec.y && ttex < (spec.y + spec.height));
+        svalid = swrap_func(stex, dims.x, dims.width);
+        tvalid = twrap_func(ttex, dims.y, dims.height);
+        if (!lvl.full_pixel_range) {
+            svalid &= (stex >= dims.x
+                       && stex < (dims.x + dims.width));  // data window
+            tvalid &= (ttex >= dims.y && ttex < (dims.y + dims.height));
         }
         if (!(svalid & tvalid)) {
             // All texels we need were out of range and using 'black' wrap.
@@ -2175,8 +2516,8 @@ TextureSystemImpl::sample_closest(
             continue;
         }
 
-        int tile_s = (stex - spec.x) % spec.tile_width;
-        int tile_t = (ttex - spec.y) % spec.tile_height;
+        int tile_s = (stex - dims.x) % dims.tile_width;
+        int tile_t = (ttex - dims.y) % dims.tile_height;
         id.xy(stex - tile_s, ttex - tile_t);
         bool ok = find_tile(id, thread_info, sample == 0);
         if (!ok)
@@ -2188,7 +2529,7 @@ TextureSystemImpl::sample_closest(
         }
         size_t offset = id.nchannels() * tile->pixel_index(tile_s, tile_t)
                         + (firstchannel - id.chbegin());
-        OIIO_DASSERT(offset < spec.nchannels * spec.tile_pixels());
+        OIIO_DASSERT(offset < dims.nchannels * si.get_tile_pixels(miplevel));
         simd::vfloat4 texel_simd;
         if (pixeltype == TypeDesc::UINT8) {
             // special case for 8-bit tiles
@@ -2230,7 +2571,7 @@ TextureSystemImpl::sample_closest(
 inline void
 st_to_texel_simd(const vfloat4& s_, const vfloat4& t_,
                  TextureSystemImpl::TextureFile& texturefile,
-                 const ImageSpec& spec, vint4& i, vint4& j, vfloat4& ifrac,
+                 const ImageDims& dims, vint4& i, vint4& j, vfloat4& ifrac,
                  vfloat4& jfrac)
 {
     vfloat4 s, t;
@@ -2238,13 +2579,13 @@ st_to_texel_simd(const vfloat4& s_, const vfloat4& t_,
     // Note that we have two modes, depending on the m_sample_border.
     if (texturefile.sample_border() == 0) {
         // texel samples are at 0.5/res, 1.5/res, ..., (res-0.5)/res,
-        s = s_ * float(spec.width) + (spec.x - 0.5f);
-        t = t_ * float(spec.height) + (spec.y - 0.5f);
+        s = s_ * float(dims.width) + (dims.x - 0.5f);
+        t = t_ * float(dims.height) + (dims.y - 0.5f);
     } else {
         // first and last rows/columns are *exactly* on the boundary,
         // so samples are at 0, 1/(res-1), ..., 1.
-        s = s_ * float(spec.width - 1) + float(spec.x);
-        t = t_ * float(spec.height - 1) + float(spec.y);
+        s = s_ * float(dims.width - 1) + float(dims.x);
+        t = t_ * float(dims.height - 1) + float(dims.y);
     }
     ifrac = floorfrac(s, &i);
     jfrac = floorfrac(t, &j);
@@ -2264,28 +2605,28 @@ TextureSystemImpl::sample_bilinear(
     int nchannels_result, int actualchannels, const float* weight_,
     vfloat4* accum_, vfloat4* daccumds_, vfloat4* daccumdt_)
 {
-    const ImageSpec& spec(texturefile.spec(options.subimage, miplevel));
-    const ImageCacheFile::LevelInfo& levelinfo(
-        texturefile.levelinfo(options.subimage, miplevel));
+    const SubimageInfo& si(texturefile.subimageinfo(options.subimage));
+    const LevelInfo& lvl(si.levelinfo(miplevel));
+    const ImageDims& dims(si.leveldims(miplevel));
     TypeDesc::BASETYPE pixeltype = texturefile.pixeltype(options.subimage);
     wrap_impl swrap_func         = wrap_functions[(int)options.swrap];
     wrap_impl twrap_func         = wrap_functions[(int)options.twrap];
     wrap_impl_simd wrap_func     = (swrap_func == twrap_func)
                                        ? wrap_functions_simd[(int)options.swrap]
                                        : NULL;
-    simd::vint4 xy(spec.x, spec.y);
-    simd::vint4 widthheight(spec.width, spec.height);
-    simd::vint4 tilewh(spec.tile_width, spec.tile_height);
+    simd::vint4 xy(dims.x, dims.y);
+    simd::vint4 widthheight(dims.width, dims.height);
+    simd::vint4 tilewh(dims.tile_width, dims.tile_height);
     simd::vint4 tilewhmask = tilewh - 1;
     bool use_fill      = (nchannels_result > actualchannels && options.fill);
-    bool tilepow2      = ispow2(spec.tile_width) && ispow2(spec.tile_height);
+    bool tilepow2      = ispow2(dims.tile_width) && ispow2(dims.tile_height);
     size_t channelsize = texturefile.channelsize(options.subimage);
     int firstchannel   = options.firstchannel;
-    int tile_chbegin = 0, tile_chend = spec.nchannels;
+    int tile_chbegin = 0, tile_chend = dims.nchannels;
     // need_pole: do we potentially need to fade to special pole color?
     // If we do, can't restrict channel range or fade_to_pole won't work.
-    bool need_pole = (options.envlayout == LayoutLatLong && levelinfo.onetile);
-    if (spec.nchannels > m_max_tile_channels && !need_pole) {
+    bool need_pole = (options.envlayout == LayoutLatLong && lvl.onetile);
+    if (dims.nchannels > m_max_tile_channels && !need_pole) {
         // For files with many channels, narrow the range we cache
         tile_chbegin = options.firstchannel;
         tile_chend   = options.firstchannel + actualchannels;
@@ -2315,7 +2656,7 @@ TextureSystemImpl::sample_bilinear(
         if (sample4 == 0) {
             s_simd.load(s_ + sample);
             t_simd.load(t_ + sample);
-            st_to_texel_simd(s_simd, t_simd, texturefile, spec, sint_simd,
+            st_to_texel_simd(s_simd, t_simd, texturefile, dims, sint_simd,
                              tint_simd, sfrac_simd, tfrac_simd);
         }
         int sint = sint_simd[sample4], tint = tint_simd[sample4];
@@ -2333,14 +2674,14 @@ TextureSystemImpl::sample_bilinear(
             // Both directions use the same wrap function, call in parallel.
             stvalid = wrap_func(sttex, xy, widthheight);
         } else {
-            stvalid.load(swrap_func(sttex[S0], spec.x, spec.width),
-                         swrap_func(sttex[S1], spec.x, spec.width),
-                         twrap_func(sttex[T0], spec.y, spec.height),
-                         twrap_func(sttex[T1], spec.y, spec.height));
+            stvalid.load(swrap_func(sttex[S0], dims.x, dims.width),
+                         swrap_func(sttex[S1], dims.x, dims.width),
+                         twrap_func(sttex[T0], dims.y, dims.height),
+                         twrap_func(sttex[T1], dims.y, dims.height));
         }
 
         // Account for crop windows
-        if (!levelinfo.full_pixel_range) {
+        if (!lvl.full_pixel_range) {
             stvalid &= (sttex >= xy) & (sttex < (xy + widthheight));
         }
         if (none(stvalid)) {
@@ -2383,26 +2724,26 @@ TextureSystemImpl::sample_bilinear(
             if (pixeltype == TypeDesc::UINT8) {
                 texel_simd[0][0] = uchar2float4(p);
                 texel_simd[0][1] = uchar2float4(p + pixelsize);
-                p += pixelsize * spec.tile_width;
+                p += pixelsize * dims.tile_width;
                 texel_simd[1][0] = uchar2float4(p);
                 texel_simd[1][1] = uchar2float4(p + pixelsize);
             } else if (pixeltype == TypeDesc::UINT16) {
                 texel_simd[0][0] = ushort2float4((uint16_t*)p);
                 texel_simd[0][1] = ushort2float4((uint16_t*)(p + pixelsize));
-                p += pixelsize * spec.tile_width;
+                p += pixelsize * dims.tile_width;
                 texel_simd[1][0] = ushort2float4((uint16_t*)p);
                 texel_simd[1][1] = ushort2float4((uint16_t*)(p + pixelsize));
             } else if (pixeltype == TypeDesc::HALF) {
                 texel_simd[0][0] = vfloat4((half*)p);
                 texel_simd[0][1] = vfloat4((half*)(p + pixelsize));
-                p += pixelsize * spec.tile_width;
+                p += pixelsize * dims.tile_width;
                 texel_simd[1][0] = vfloat4((half*)p);
                 texel_simd[1][1] = vfloat4((half*)(p + pixelsize));
             } else {
                 OIIO_DASSERT(pixeltype == TypeDesc::FLOAT);
                 texel_simd[0][0].load((const float*)p);
                 texel_simd[0][1].load((const float*)(p + pixelsize));
-                p += pixelsize * spec.tile_width;
+                p += pixelsize * dims.tile_width;
                 texel_simd[1][0].load((const float*)p);
                 texel_simd[1][1].load((const float*)(p + pixelsize));
             }
@@ -2440,7 +2781,7 @@ TextureSystemImpl::sample_bilinear(
                     TileRef& tile(thread_info->tile);
                     imagesize_t offset = tile->pixel_offset(tile_s, tile_t);
                     offset += (firstchannel - id.chbegin()) * channelsize;
-                    OIIO_DASSERT(offset < spec.tile_bytes());
+                    OIIO_DASSERT(offset < si.get_tile_bytes(miplevel));
                     if (pixeltype == TypeDesc::UINT8)
                         texel_simd[j][i] = uchar2float4(
                             (const unsigned char*)(tile->bytedata() + offset));
@@ -2463,14 +2804,13 @@ TextureSystemImpl::sample_bilinear(
         // we converge to a single pole color right at the pole.  Fade to
         // the average color over the texel height right next to the pole.
         if (need_pole) {
-            float height = spec.height;
+            float height = dims.height;
             if (texturefile.m_sample_border)
                 height -= 1.0f;
             float tt = t_[sample] * height;
             if (tt < 1.0f || tt > (height - 1.0f))
                 fade_to_pole(tt, (float*)&accum, weight, texturefile,
-                             thread_info, levelinfo, options, miplevel,
-                             actualchannels);
+                             thread_info, options, miplevel, actualchannels);
         }
 
         simd::vfloat4 weight_simd = weight;
@@ -2478,8 +2818,8 @@ TextureSystemImpl::sample_bilinear(
                  * bilerp(texel_simd[0][0], texel_simd[0][1], texel_simd[1][0],
                           texel_simd[1][1], sfrac, tfrac);
         if (daccumds_) {
-            simd::vfloat4 scalex = weight_simd * float(spec.width);
-            simd::vfloat4 scaley = weight_simd * float(spec.height);
+            simd::vfloat4 scalex = weight_simd * float(dims.width);
+            simd::vfloat4 scaley = weight_simd * float(dims.height);
             daccumds += scalex
                         * lerp(texel_simd[0][1] - texel_simd[0][0],
                                texel_simd[1][1] - texel_simd[1][0], tfrac);
@@ -2517,33 +2857,33 @@ TextureSystemImpl::sample_bilinear(
 
 namespace {
 
-    // Evaluate Bspline weights for both value and derivatives (if dw is not
-    // NULL) into w[0..3] and dw[0..3]. This is the canonical version for
-    // reference, but we don't actually call it, instead favoring the much
-    // harder to read SIMD versions below.
-    template<typename T>
-    inline void evalBSplineWeights_and_derivs(T* w, T fraction, T* dw = NULL)
-    {
-        T one_frac = 1.0 - fraction;
-        w[0]       = T(1.0 / 6.0) * one_frac * one_frac * one_frac;
-        w[1]       = T(2.0 / 3.0)
-               - T(0.5) * fraction * fraction * (T(2.0) - fraction);
-        w[2] = T(2.0 / 3.0)
-               - T(0.5) * one_frac * one_frac * (T(2.0) - one_frac);
-        w[3] = T(1.0 / 6.0) * fraction * fraction * fraction;
-        if (dw) {
-            dw[0] = T(-0.5) * one_frac * one_frac;
-            dw[1] = T(0.5) * fraction * (T(3.0) * fraction - T(4.0));
-            dw[2] = T(-0.5) * one_frac * (T(3.0) * one_frac - T(4.0));
-            dw[3] = T(0.5) * fraction * fraction;
-        }
+// Evaluate Bspline weights for both value and derivatives (if dw is not
+// NULL) into w[0..3] and dw[0..3]. This is the canonical version for
+// reference, but we don't actually call it, instead favoring the much
+// harder to read SIMD versions below.
+template<typename T>
+inline void
+evalBSplineWeights_and_derivs(T* w, T fraction, T* dw = NULL)
+{
+    T one_frac = 1.0 - fraction;
+    w[0]       = T(1.0 / 6.0) * one_frac * one_frac * one_frac;
+    w[1] = T(2.0 / 3.0) - T(0.5) * fraction * fraction * (T(2.0) - fraction);
+    w[2] = T(2.0 / 3.0) - T(0.5) * one_frac * one_frac * (T(2.0) - one_frac);
+    w[3] = T(1.0 / 6.0) * fraction * fraction * fraction;
+    if (dw) {
+        dw[0] = T(-0.5) * one_frac * one_frac;
+        dw[1] = T(0.5) * fraction * (T(3.0) * fraction - T(4.0));
+        dw[2] = T(-0.5) * one_frac * (T(3.0) * one_frac - T(4.0));
+        dw[3] = T(0.5) * fraction * fraction;
     }
+}
 
-    // Evaluate the 4 Bspline weights (no derivs), returning them as a vfloat4.
-    // The fraction also comes in as a vfloat4 (assuming the same value in all 4
-    // slots).
-    inline vfloat4 evalBSplineWeights(const vfloat4& fraction)
-    {
+// Evaluate the 4 Bspline weights (no derivs), returning them as a vfloat4.
+// The fraction also comes in as a vfloat4 (assuming the same value in all 4
+// slots).
+inline vfloat4
+evalBSplineWeights(const vfloat4& fraction)
+{
 #if 0
     // Version that's easy to read and understand:
     float one_frac = 1.0f - fraction;
@@ -2554,24 +2894,25 @@ namespace {
     w[3] = 0.0f          + (1.0f / 6.0f) * fraction * fraction * fraction;
     return w;
 #else
-        // Not as clear, but fastest version I've been able to achieve:
-        OIIO_SIMD_FLOAT4_CONST4(A, 0.0f, 2.0f / 3.0f, 2.0f / 3.0f, 0.0f);
-        OIIO_SIMD_FLOAT4_CONST4(B, 1.0f / 6.0f, -0.5f, -0.5f, 1.0f / 6.0f);
-        OIIO_SIMD_FLOAT4_CONST4(om1m1o, 1.0f, -1.0f, -1.0f, 1.0f);
-        OIIO_SIMD_FLOAT4_CONST4(z22z, 0.0f, 2.0f, 2.0f, 0.0f);
-        simd::vfloat4 one_frac = vfloat4::One() - fraction;
-        simd::vfloat4 ofof     = AxBxAyBy(one_frac,
-                                          fraction);  // 1-frac, frac, 1-frac, frac
-        simd::vfloat4 C = (*(vfloat4*)&om1m1o) * ofof + (*(vfloat4*)&z22z);
-        return (*(vfloat4*)&A) + (*(vfloat4*)&B) * ofof * ofof * C;
+    // Not as clear, but fastest version I've been able to achieve:
+    OIIO_SIMD_FLOAT4_CONST4(A, 0.0f, 2.0f / 3.0f, 2.0f / 3.0f, 0.0f);
+    OIIO_SIMD_FLOAT4_CONST4(B, 1.0f / 6.0f, -0.5f, -0.5f, 1.0f / 6.0f);
+    OIIO_SIMD_FLOAT4_CONST4(om1m1o, 1.0f, -1.0f, -1.0f, 1.0f);
+    OIIO_SIMD_FLOAT4_CONST4(z22z, 0.0f, 2.0f, 2.0f, 0.0f);
+    simd::vfloat4 one_frac = vfloat4::One() - fraction;
+    simd::vfloat4 ofof     = AxBxAyBy(one_frac,
+                                      fraction);  // 1-frac, frac, 1-frac, frac
+    simd::vfloat4 C        = (*(vfloat4*)&om1m1o) * ofof + (*(vfloat4*)&z22z);
+    return (*(vfloat4*)&A) + (*(vfloat4*)&B) * ofof * ofof * C;
 #endif
-    }
+}
 
-    // Evaluate Bspline weights for both value and derivatives (if dw is not
-    // NULL), returning the 4 coefficients for each as vfloat4's.
-    inline void evalBSplineWeights_and_derivs(simd::vfloat4* w, float fraction,
-                                              simd::vfloat4* dw = NULL)
-    {
+// Evaluate Bspline weights for both value and derivatives (if dw is not
+// NULL), returning the 4 coefficients for each as vfloat4's.
+inline void
+evalBSplineWeights_and_derivs(simd::vfloat4* w, float fraction,
+                              simd::vfloat4* dw = NULL)
+{
 #if 0
     // Version that's easy to read and understand:
     float one_frac = 1.0f - fraction;
@@ -2586,21 +2927,21 @@ namespace {
         (*dw)[3] =  0.5f * fraction * (1.0f * fraction - 0.0f);
     }
 #else
-        // Not as clear, but fastest version I've been able to achieve:
-        OIIO_SIMD_FLOAT4_CONST4(A, 0.0f, 2.0f / 3.0f, 2.0f / 3.0f, 0.0f);
-        OIIO_SIMD_FLOAT4_CONST4(B, 1.0f / 6.0f, -0.5f, -0.5f, 1.0f / 6.0f);
-        float one_frac = 1.0f - fraction;
-        simd::vfloat4 ofof(one_frac, fraction, one_frac, fraction);
-        simd::vfloat4 C(one_frac, 2.0f - fraction, 2.0f - one_frac, fraction);
-        *w = (*(vfloat4*)&A) + (*(vfloat4*)&B) * ofof * ofof * C;
-        if (dw) {
-            const simd::vfloat4 D(-0.5f, 0.5f, -0.5f, 0.5f);
-            const simd::vfloat4 E(1.0f, 3.0f, 3.0f, 1.0f);
-            const simd::vfloat4 F(0.0f, 4.0f, 4.0f, 0.0f);
-            *dw = D * ofof * (E * ofof - F);
-        }
-#endif
+    // Not as clear, but fastest version I've been able to achieve:
+    OIIO_SIMD_FLOAT4_CONST4(A, 0.0f, 2.0f / 3.0f, 2.0f / 3.0f, 0.0f);
+    OIIO_SIMD_FLOAT4_CONST4(B, 1.0f / 6.0f, -0.5f, -0.5f, 1.0f / 6.0f);
+    float one_frac = 1.0f - fraction;
+    simd::vfloat4 ofof(one_frac, fraction, one_frac, fraction);
+    simd::vfloat4 C(one_frac, 2.0f - fraction, 2.0f - one_frac, fraction);
+    *w = (*(vfloat4*)&A) + (*(vfloat4*)&B) * ofof * ofof * C;
+    if (dw) {
+        const simd::vfloat4 D(-0.5f, 0.5f, -0.5f, 0.5f);
+        const simd::vfloat4 E(1.0f, 3.0f, 3.0f, 1.0f);
+        const simd::vfloat4 F(0.0f, 4.0f, 4.0f, 0.0f);
+        *dw = D * ofof * (E * ofof - F);
     }
+#endif
+}
 
 }  // anonymous namespace
 
@@ -2613,23 +2954,23 @@ TextureSystemImpl::sample_bicubic(
     int nchannels_result, int actualchannels, const float* weight_,
     vfloat4* accum_, vfloat4* daccumds_, vfloat4* daccumdt_)
 {
-    const ImageSpec& spec(texturefile.spec(options.subimage, miplevel));
-    const ImageCacheFile::LevelInfo& levelinfo(
-        texturefile.levelinfo(options.subimage, miplevel));
+    const SubimageInfo& si(texturefile.subimageinfo(options.subimage));
+    const LevelInfo& lvl(si.levelinfo(miplevel));
+    const ImageDims& dims(si.leveldims(miplevel));
     TypeDesc::BASETYPE pixeltype   = texturefile.pixeltype(options.subimage);
     wrap_impl_simd swrap_func_simd = wrap_functions_simd[(int)options.swrap];
     wrap_impl_simd twrap_func_simd = wrap_functions_simd[(int)options.twrap];
 
-    vint4 spec_x_simd(spec.x);
-    vint4 spec_y_simd(spec.y);
-    vint4 spec_width_simd(spec.width);
-    vint4 spec_height_simd(spec.height);
+    vint4 spec_x_simd(dims.x);
+    vint4 spec_y_simd(dims.y);
+    vint4 spec_width_simd(dims.width);
+    vint4 spec_height_simd(dims.height);
     vint4 spec_x_plus_width_simd  = spec_x_simd + spec_width_simd;
     vint4 spec_y_plus_height_simd = spec_y_simd + spec_height_simd;
     bool use_fill      = (nchannels_result > actualchannels && options.fill);
-    bool tilepow2      = ispow2(spec.tile_width) && ispow2(spec.tile_height);
-    int tilewidthmask  = spec.tile_width - 1;  // e.g. 63
-    int tileheightmask = spec.tile_height - 1;
+    bool tilepow2      = ispow2(dims.tile_width) && ispow2(dims.tile_height);
+    int tilewidthmask  = dims.tile_width - 1;  // e.g. 63
+    int tileheightmask = dims.tile_height - 1;
     size_t channelsize = texturefile.channelsize(options.subimage);
     int firstchannel   = options.firstchannel;
     float nonfill      = 0.0f;  // The degree to which we DON'T need fill
@@ -2641,9 +2982,9 @@ TextureSystemImpl::sample_bicubic(
 
     // need_pole: do we potentially need to fade to special pole color?
     // If we do, can't restrict channel range or fade_to_pole won't work.
-    bool need_pole = (options.envlayout == LayoutLatLong && levelinfo.onetile);
-    int tile_chbegin = 0, tile_chend = spec.nchannels;
-    if (spec.nchannels > m_max_tile_channels) {
+    bool need_pole   = (options.envlayout == LayoutLatLong && lvl.onetile);
+    int tile_chbegin = 0, tile_chend = dims.nchannels;
+    if (dims.nchannels > m_max_tile_channels) {
         // For files with many channels, narrow the range we cache
         tile_chbegin = options.firstchannel;
         tile_chend   = options.firstchannel + actualchannels;
@@ -2670,7 +3011,7 @@ TextureSystemImpl::sample_bicubic(
         if (sample4 == 0) {
             s_simd.load(s_ + sample);
             t_simd.load(t_ + sample);
-            st_to_texel_simd(s_simd, t_simd, texturefile, spec, sint_simd,
+            st_to_texel_simd(s_simd, t_simd, texturefile, dims, sint_simd,
                              tint_simd, sfrac_simd, tfrac_simd);
         }
         int sint = sint_simd[sample4], tint = tint_simd[sample4];
@@ -2691,7 +3032,7 @@ TextureSystemImpl::sample_bicubic(
                                               spec_height_simd);
         bool allvalid       = reduce_and(svalid & tvalid);
         bool anyvalid       = reduce_or(svalid | tvalid);
-        if (!levelinfo.full_pixel_range && anyvalid) {
+        if (!lvl.full_pixel_range && anyvalid) {
             // Handle case of crop windows or overscan
             svalid &= (stex >= spec_x_simd) & (stex < spec_x_plus_width_simd);
             tvalid &= (ttex >= spec_y_simd) & (ttex < spec_y_plus_height_simd);
@@ -2705,26 +3046,26 @@ TextureSystemImpl::sample_bicubic(
         }
 
         simd::vfloat4 texel_simd[4][4];
-        // int tile_s = (stex[0] - spec.x) % spec.tile_width;
-        // int tile_t = (ttex[0] - spec.y) % spec.tile_height;
-        int tile_s = (stex[0] - spec.x);
-        int tile_t = (ttex[0] - spec.y);
+        // int tile_s = (stex[0] - dims.x) % dims.tile_width;
+        // int tile_t = (ttex[0] - dims.y) % dims.tile_height;
+        int tile_s = (stex[0] - dims.x);
+        int tile_t = (ttex[0] - dims.y);
         if (tilepow2) {
             tile_s &= tilewidthmask;
             tile_t &= tileheightmask;
         } else {
-            tile_s %= spec.tile_width;
-            tile_t %= spec.tile_height;
+            tile_s %= dims.tile_width;
+            tile_t %= dims.tile_height;
         }
         bool s_onetile = (tile_s <= tilewidthmask - 3);
         bool t_onetile = (tile_t <= tileheightmask - 3);
         if (s_onetile & t_onetile) {
             // If we thought it was one tile, realize that it isn't unless
             // it's ascending.
-            s_onetile &= all(stex
-                             == (simd::shuffle<0>(stex) + (*(vint4*)iota)));
-            t_onetile &= all(ttex
-                             == (simd::shuffle<0>(ttex) + (*(vint4*)iota)));
+            s_onetile &= all(
+                stex == (simd::broadcast_element<0>(stex) + (*(vint4*)iota)));
+            t_onetile &= all(
+                ttex == (simd::broadcast_element<0>(ttex) + (*(vint4*)iota)));
         }
         bool onetile = (s_onetile & t_onetile);
         if (onetile & allvalid) {
@@ -2748,27 +3089,27 @@ TextureSystemImpl::sample_bicubic(
             OIIO_DASSERT(tile->data());
             if (pixeltype == TypeDesc::UINT8) {
                 for (int j = 0, j_offset = 0; j < 4;
-                     ++j, j_offset += pixelsize * spec.tile_width)
+                     ++j, j_offset += pixelsize * dims.tile_width)
                     for (int i = 0, i_offset = j_offset; i < 4;
                          ++i, i_offset += pixelsize)
                         texel_simd[j][i] = uchar2float4(base + i_offset);
             } else if (pixeltype == TypeDesc::UINT16) {
                 for (int j = 0, j_offset = 0; j < 4;
-                     ++j, j_offset += pixelsize * spec.tile_width)
+                     ++j, j_offset += pixelsize * dims.tile_width)
                     for (int i = 0, i_offset = j_offset; i < 4;
                          ++i, i_offset += pixelsize)
                         texel_simd[j][i] = ushort2float4(
                             (const uint16_t*)(base + i_offset));
             } else if (pixeltype == TypeDesc::HALF) {
                 for (int j = 0, j_offset = 0; j < 4;
-                     ++j, j_offset += pixelsize * spec.tile_width)
+                     ++j, j_offset += pixelsize * dims.tile_width)
                     for (int i = 0, i_offset = j_offset; i < 4;
                          ++i, i_offset += pixelsize)
                         texel_simd[j][i] = vfloat4(
                             (const half*)(base + i_offset));
             } else {
                 for (int j = 0, j_offset = 0; j < 4;
-                     ++j, j_offset += pixelsize * spec.tile_width)
+                     ++j, j_offset += pixelsize * dims.tile_width)
                     for (int i = 0, i_offset = j_offset; i < 4;
                          ++i, i_offset += pixelsize)
                         texel_simd[j][i].load((const float*)(base + i_offset));
@@ -2777,8 +3118,8 @@ TextureSystemImpl::sample_bicubic(
             simd::vint4 tile_s, tile_t;  // texel offset WITHIN its tile
             simd::vint4 tile_s_edge,
                 tile_t_edge;  // coordinate of the tile edge
-            tile_s      = (stex - spec_x_simd) % spec.tile_width;
-            tile_t      = (ttex - spec_y_simd) % spec.tile_height;
+            tile_s      = (stex - spec_x_simd) % dims.tile_width;
+            tile_t      = (ttex - spec_y_simd) % dims.tile_height;
             tile_s_edge = stex - tile_s;
             tile_t_edge = ttex - tile_t;
             simd::vint4 column_offset_bytes = tile_s * pixelsize
@@ -2790,7 +3131,7 @@ TextureSystemImpl::sample_bicubic(
                     continue;
                 }
                 imagesize_t row_offset_bytes
-                    = tile_t[j] * imagesize_t(spec.tile_width * pixelsize);
+                    = tile_t[j] * imagesize_t(dims.tile_width * pixelsize);
                 for (int i = 0; i < 4; ++i) {
                     if (!svalid[i]) {
                         texel_simd[j][i].clear();
@@ -2806,7 +3147,7 @@ TextureSystemImpl::sample_bicubic(
                         bool ok = find_tile(id, thread_info, sample == 0);
                         if (!ok)
                             error("{}", m_imagecache->geterror());
-                        DASSERT(thread_info->tile->id() == id);
+                        OIIO_DASSERT(thread_info->tile->id() == id);
                         if (!thread_info->tile->valid())
                             return false;
                     }
@@ -2835,14 +3176,13 @@ TextureSystemImpl::sample_bicubic(
         // we converge to a single pole color right at the pole.  Fade to
         // the average color over the texel height right next to the pole.
         if (need_pole) {
-            float height = spec.height;
+            float height = dims.height;
             if (texturefile.m_sample_border)
                 height -= 1.0f;
             float tt = t_[sample] * height;
             if (tt < 1.0f || tt > (height - 1.0f))
                 fade_to_pole(tt, (float*)&accum, weight, texturefile,
-                             thread_info, levelinfo, options, miplevel,
-                             actualchannels);
+                             thread_info, options, miplevel, actualchannels);
         }
 
         // We use a formulation of cubic B-spline evaluation that reduces to
@@ -2904,18 +3244,20 @@ TextureSystemImpl::sample_bicubic(
         simd::vfloat4 col[4];
         for (int j = 0; j < 4; ++j) {
             simd::vfloat4 lx = lerp(texel_simd[j][0], texel_simd[j][1],
-                                    shuffle<0>(h) /*h0x*/);
+                                    broadcast_element<0>(h) /*h0x*/);
             simd::vfloat4 rx = lerp(texel_simd[j][2], texel_simd[j][3],
-                                    shuffle<1>(h) /*h1x*/);
-            col[j]           = lerp(lx, rx, shuffle<1>(g) /*g1x*/);
+                                    broadcast_element<1>(h) /*h1x*/);
+            col[j]           = lerp(lx, rx, broadcast_element<1>(g) /*g1x*/);
         }
-        simd::vfloat4 ly          = lerp(col[0], col[1], shuffle<2>(h) /*h0y*/);
-        simd::vfloat4 ry          = lerp(col[2], col[3], shuffle<3>(h) /*h1y*/);
+        simd::vfloat4 ly          = lerp(col[0], col[1],
+                                         broadcast_element<2>(h) /*h0y*/);
+        simd::vfloat4 ry          = lerp(col[2], col[3],
+                                         broadcast_element<3>(h) /*h1y*/);
         simd::vfloat4 weight_simd = weight;
-        accum += weight_simd * lerp(ly, ry, shuffle<3>(g) /*g1y*/);
+        accum += weight_simd * lerp(ly, ry, broadcast_element<3>(g) /*g1y*/);
         if (daccumds_) {
-            simd::vfloat4 scalex = weight_simd * float(spec.width);
-            simd::vfloat4 scaley = weight_simd * float(spec.height);
+            simd::vfloat4 scalex = weight_simd * float(dims.width);
+            simd::vfloat4 scaley = weight_simd * float(dims.height);
             daccumds += scalex
                         * (dwx[0]
                                * (wy[0] * texel_simd[0][0]
@@ -3045,7 +3387,7 @@ TextureSystemImpl::visualize_ellipse(const std::string& name, float dsdx,
     static float grey[3]  = { 0.5, 0.5, 0.5 };
     static float red[3]   = { 1, 0, 0 };
     static float green[3] = { 0, 1, 0 };
-    ImageBufAlgo::fill(ib, grey);
+    ImageBufAlgo::fill(ib, cspan<float>(grey));
 
     // scan all the pixels, darken the ellipse interior (no blur considered)
     for (int j = 0; j < h; ++j) {
@@ -3054,15 +3396,15 @@ TextureSystemImpl::visualize_ellipse(const std::string& name, float dsdx,
             float x  = (i - w / 2) / scale;
             float d2 = ABCF[0] * x * x + ABCF[1] * x * y + ABCF[2] * y * y;
             if (d2 < 1.0f)
-                ib.setpixel(i, h - 1 - j, dark);
+                ib.setpixel(i, h - 1 - j, make_span(dark));
         }
     }
 
     // Draw red and green axes for the dx and dy derivatives, respectively
     ImageBufAlgo::render_line(ib, w / 2, h / 2, w / 2 + int(dsdx * scale),
-                              h / 2 - int(dtdx * scale), red);
+                              h / 2 - int(dtdx * scale), make_span(red));
     ImageBufAlgo::render_line(ib, w / 2, h / 2, w / 2 + int(dsdy * scale),
-                              h / 2 - int(dtdy * scale), green);
+                              h / 2 - int(dtdy * scale), make_span(green));
 
     // Draw yellow and blue axes for the ellipse axes, with blur
     ImageBufAlgo::render_line(ib, w / 2, h / 2,
@@ -3158,8 +3500,6 @@ TextureSystemImpl::unit_test_texture()
     }
 }
 
-}  // end namespace pvt
-
 
 
 void
@@ -3178,17 +3518,14 @@ TextureSystem::unit_test_hash()
     Strutil::print("Testing hashing with {} files of {}x{} with {}x{} tiles:",
                    nfiles, res, res, tilesize, tilesize);
 
-    ImageCache* imagecache = ImageCache::create();
+    auto imagecache = ImageCache::create();
 
     // Set up the ImageCacheFiles outside of the timing loop
-    using OIIO::pvt::ImageCacheFile;
-    using OIIO::pvt::ImageCacheFileRef;
-    using OIIO::pvt::ImageCacheImpl;
     std::vector<ImageCacheFileRef> icf;
     for (int f = 0; f < nfiles; ++f) {
         ustring filename = ustring::fmtformat("{:06}.tif", f);
-        icf.push_back(
-            new ImageCacheFile(*(ImageCacheImpl*)imagecache, NULL, filename));
+        icf.push_back(new ImageCacheFile(*(ImageCacheImpl*)imagecache.get(),
+                                         nullptr, filename));
     }
 
     // First, just try to do raw timings of the hash
@@ -3197,7 +3534,7 @@ TextureSystem::unit_test_hash()
     for (int f = 0; f < nfiles; ++f) {
         for (int y = 0; y < res; y += tilesize) {
             for (int x = 0; x < res; x += tilesize, ++i) {
-                OIIO::pvt::TileID id(*icf[f], 0, 0, x, y, 0, 0, 1);
+                TileID id(*icf[f], 0, 0, x, y, 0, 0, 1);
                 size_t h = id.hash();
                 hh += h;
             }
@@ -3215,7 +3552,7 @@ TextureSystem::unit_test_hash()
     for (int f = 0; f < nfiles; ++f) {
         for (int y = 0; y < res; y += tilesize) {
             for (int x = 0; x < res; x += tilesize, ++i) {
-                OIIO::pvt::TileID id(*icf[f], 0, 0, x, y, 0, 0, 1);
+                TileID id(*icf[f], 0, 0, x, y, 0, 0, 1);
                 size_t h = id.hash();
                 ++fourbits[h & 0xf];
                 ++eightbits[h & 0xff];
@@ -3266,10 +3603,7 @@ TextureSystem::unit_test_hash()
             max = sixteenbits[i];
     }
     Strutil::print("16-bit hash buckets range from {} to {}\n", min, max);
-
     Strutil::print("\n");
-
-    ImageCache::destroy(imagecache);
 #endif
 }
 

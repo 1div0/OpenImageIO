@@ -30,16 +30,23 @@ using namespace pvt;
 
 
 // store an error message per thread, for a specific ImageInput
-static thread_local tsl::robin_map<const ImageOutput*, std::string>
-    output_error_messages;
+static thread_local tsl::robin_map<uint64_t, std::string> output_error_messages;
+static std::atomic_int64_t output_next_id(0);
 
 
 class ImageOutput::Impl {
 public:
+    Impl()
+        : m_id(++output_next_id)
+        , m_threads(pvt::oiio_threads)
+    {
+    }
+
     // Unneeded?
     //  // So we can lock this ImageOutput for the thread-safe methods.
     //  std::recursive_mutex m_mutex;
 
+    uint64_t m_id;
     int m_threads = 0;
 
     // The IOProxy object we will use for all I/O operations.
@@ -105,6 +112,28 @@ ImageOutput::write_scanline(int /*y*/, int /*z*/, TypeDesc /*format*/,
 
 
 bool
+ImageOutput::write_scanline(int y, TypeDesc format,
+                            const image_span<const std::byte>& data)
+{
+    if (y < 0 || y >= m_spec.height) {
+        errorfmt("write_scanlines: Invalid scanline index {}", y);
+        return false;
+    }
+    size_t sz = m_spec.scanline_bytes(format);
+    if (sz != data.size_bytes()) {
+        errorfmt(
+            "write_scanline: Buffer size is incorrect ({} bytes vs {} needed)",
+            sz, data.size_bytes());
+        return false;
+    }
+
+    // Default implementation (for now): call the old pointer+stride
+    return write_scanline(y, 0, format, data.data(), data.xstride());
+}
+
+
+
+bool
 ImageOutput::write_scanlines(int ybegin, int yend, int z, TypeDesc format,
                              const void* data, stride_t xstride,
                              stride_t ystride)
@@ -127,12 +156,56 @@ ImageOutput::write_scanlines(int ybegin, int yend, int z, TypeDesc format,
 
 
 bool
+ImageOutput::write_scanlines(int ybegin, int yend, TypeDesc format,
+                             const image_span<const std::byte>& data)
+{
+    if (ybegin < 0 || yend > m_spec.height || ybegin >= yend) {
+        errorfmt("write_scanlines: Invalid scanline range {}-{}", ybegin, yend);
+        return false;
+    }
+    size_t sz = m_spec.scanline_bytes(format) * size_t(yend - ybegin);
+    if (sz != data.size_bytes()) {
+        errorfmt(
+            "write_scanlines: Buffer size is incorrect ({} bytes vs {} needed)",
+            sz, data.size_bytes());
+        return false;
+    }
+
+    // Default implementation (for now): call the old pointer+stride
+    return write_scanlines(ybegin, yend, 0, format, data.data(), data.xstride(),
+                           data.ystride());
+}
+
+
+
+bool
 ImageOutput::write_tile(int /*x*/, int /*y*/, int /*z*/, TypeDesc /*format*/,
                         const void* /*data*/, stride_t /*xstride*/,
                         stride_t /*ystride*/, stride_t /*zstride*/)
 {
     // Default implementation: don't know how to write tiles
     return false;
+}
+
+
+
+bool
+ImageOutput::write_tile(int x, int y, int z, TypeDesc format,
+                        const image_span<const std::byte>& data)
+{
+    size_t sz = format == TypeUnknown
+                    ? m_spec.pixel_bytes(true /*native*/)
+                    : m_spec.tile_pixels() * size_t(m_spec.nchannels)
+                          * format.size();
+    if (sz != data.size_bytes()) {
+        errorfmt("write_tile: Buffer size is incorrect ({} bytes vs {} needed)",
+                 sz, data.size_bytes());
+        return false;
+    }
+
+    // Default implementation (for now): call the old pointer+stride
+    return write_tile(x, y, z, format, data.data(), data.xstride(),
+                      data.ystride(), data.zstride());
 }
 
 
@@ -171,8 +244,13 @@ ImageOutput::write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
                     ok &= write_tile(x, y, z, format, tilestart, xstride,
                                      ystride, zstride);
                 } else {
-                    if (!buf.get())
-                        buf.reset(new char[pixelsize * m_spec.tile_pixels()]);
+                    if (!buf.get()) {
+                        const size_t sz = pixelsize * m_spec.tile_pixels();
+                        buf.reset(new char[sz]);
+                        // Not all pixels will be initialized, so we set them to zero here.
+                        // This will avoid generation of NaN, FPEs and valgrind errors.
+                        memset(buf.get(), 0, sz);
+                    }
                     OIIO::copy_image(m_spec.nchannels, xw, yh, zd, tilestart,
                                      pixelsize, xstride, ystride, zstride,
                                      &buf[0], pixelsize,
@@ -192,11 +270,35 @@ ImageOutput::write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
 
 
 bool
+ImageOutput::write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
+                         int zend, TypeDesc format,
+                         const image_span<const std::byte>& data)
+{
+    // Default implementation (for now): call the old pointer+stride
+    return write_tiles(xbegin, xend, ybegin, yend, zbegin, zend, format,
+                       data.data(), data.xstride(), data.ystride(),
+                       data.zstride());
+}
+
+
+
+bool
 ImageOutput::write_rectangle(int /*xbegin*/, int /*xend*/, int /*ybegin*/,
                              int /*yend*/, int /*zbegin*/, int /*zend*/,
                              TypeDesc /*format*/, const void* /*data*/,
                              stride_t /*xstride*/, stride_t /*ystride*/,
                              stride_t /*zstride*/)
+{
+    return false;
+}
+
+
+
+bool
+ImageOutput::write_rectangle(int /*xbegin*/, int /*xend*/, int /*ybegin*/,
+                             int /*yend*/, int /*zbegin*/, int /*zend*/,
+                             TypeDesc /*format*/,
+                             const image_span<const std::byte>& /*data*/)
 {
     return false;
 }
@@ -226,7 +328,7 @@ bool
 ImageOutput::write_deep_image(const DeepData& deepdata)
 {
     if (m_spec.depth > 1) {
-        errorf("write_deep_image is not supported for volume (3D) images.");
+        errorfmt("write_deep_image is not supported for volume (3D) images.");
         return false;
         // FIXME? - not implementing 3D deep images for now.  The only
         // format that supports deep images at this time is OpenEXR, and
@@ -269,7 +371,7 @@ ImageOutput::append_error(string_view message) const
 {
     if (message.size() && message.back() == '\n')
         message.remove_suffix(1);
-    std::string& err_str = output_error_messages[this];
+    std::string& err_str = output_error_messages[m_impl->m_id];
     OIIO_DASSERT(
         err_str.size() < 1024 * 1024 * 16
         && "Accumulated error messages > 16MB. Try checking return codes!");
@@ -470,12 +572,35 @@ ImageOutput::to_native_rectangle(int xbegin, int xend, int ybegin, int yend,
 
 
 
+cspan<std::byte>
+ImageOutput::to_native(int xbegin, int xend, int ybegin, int yend, int zbegin,
+                       int zend, TypeDesc format,
+                       const image_span<const std::byte>& data,
+                       std::vector<unsigned char>& scratch, unsigned int dither,
+                       int xorigin, int yorigin, int zorigin)
+{
+    // Eventually, we will make a fully safe, span-native implementation of
+    // this function. For now, we will just call the old version for the
+    // heavy lifting.
+    auto ptr = ImageOutput::to_native_rectangle(xbegin, xend, ybegin, yend,
+                                                zbegin, zend, format,
+                                                data.data(), data.xstride(),
+                                                data.ystride(), data.zstride(),
+                                                scratch, dither, xorigin,
+                                                yorigin, zorigin);
+    return cspan<std::byte>(reinterpret_cast<const std::byte*>(ptr),
+                            m_spec.pixel_bytes(true) * data.npixels());
+}
+
+
+
 bool
 ImageOutput::write_image(TypeDesc format, const void* data, stride_t xstride,
                          stride_t ystride, stride_t zstride,
                          ProgressCallback progress_callback,
                          void* progress_callback_data)
 {
+    pvt::LoggedTimer logtime("ImageOutput::write image");
     bool native          = (format == TypeDesc::UNKNOWN);
     stride_t pixel_bytes = native ? (stride_t)m_spec.pixel_bytes(native)
                                   : format.size() * m_spec.nchannels;
@@ -562,10 +687,28 @@ ImageOutput::write_image(TypeDesc format, const void* data, stride_t xstride,
 
 
 bool
+ImageOutput::write_image(TypeDesc format,
+                         const image_span<const std::byte>& data)
+{
+    size_t sz = m_spec.image_bytes(/*native=*/format == TypeUnknown);
+    if (sz != data.size_bytes()) {
+        errorfmt("write_image: Buffer size is incorrect ({} bytes vs {} needed)",
+                 sz, data.size_bytes());
+        return false;
+    }
+
+    // Default implementation (for now): call the old pointer+stride
+    return write_image(format, data.data(), data.xstride(), data.ystride(),
+                       data.zstride());
+}
+
+
+
+bool
 ImageOutput::copy_image(ImageInput* in)
 {
     if (!in) {
-        errorf("copy_image: no input supplied");
+        errorfmt("copy_image: no input supplied");
         return false;
     }
 
@@ -574,9 +717,9 @@ ImageOutput::copy_image(ImageInput* in)
     if (inspec.width != spec().width || inspec.height != spec().height
         || inspec.depth != spec().depth
         || inspec.nchannels != spec().nchannels) {
-        errorf("Could not copy %d x %d x %d channels to %d x %d x %d channels",
-               inspec.width, inspec.height, inspec.nchannels, spec().width,
-               spec().height, spec().nchannels);
+        errorfmt("Could not copy {} x {} x {} channels to {} x {} x {} channels",
+                 inspec.width, inspec.height, inspec.nchannels, spec().width,
+                 spec().height, spec().nchannels);
         return false;
     }
 
@@ -596,7 +739,7 @@ ImageOutput::copy_image(ImageInput* in)
         if (ok)
             ok = write_deep_image(deepdata);
         else
-            errorf("%s", in->geterror());  // copy err from in to out
+            errorfmt("{}", in->geterror());  // copy err from in to out
         return ok;
     }
 
@@ -611,7 +754,7 @@ ImageOutput::copy_image(ImageInput* in)
     if (ok)
         ok = write_image(format, &pixels[0]);
     else
-        errorf("%s", in->geterror());  // copy err from in to out
+        errorfmt("{}", in->geterror());  // copy err from in to out
     return ok;
 }
 
@@ -679,7 +822,7 @@ ImageOutput::copy_tile_to_image_buffer(int x, int y, int z, TypeDesc format,
                                        void* image_buffer, TypeDesc buf_format)
 {
     if (!m_spec.tile_width || !m_spec.tile_height) {
-        errorf("Called write_tile for non-tiled image.");
+        errorfmt("Called write_tile for non-tiled image.");
         return false;
     }
     const ImageSpec& spec(this->spec());
@@ -698,7 +841,7 @@ ImageOutput::copy_tile_to_image_buffer(int x, int y, int z, TypeDesc format,
 bool
 ImageOutput::has_error() const
 {
-    auto iter = output_error_messages.find(this);
+    auto iter = output_error_messages.find(m_impl->m_id);
     if (iter == output_error_messages.end())
         return false;
     return iter.value().size() > 0;
@@ -710,7 +853,7 @@ std::string
 ImageOutput::geterror(bool clear) const
 {
     std::string e;
-    auto iter = output_error_messages.find(this);
+    auto iter = output_error_messages.find(m_impl->m_id);
     if (iter != output_error_messages.end()) {
         e = iter.value();
         if (clear)
@@ -985,24 +1128,6 @@ ImageOutput::check_open(OpenMode mode, const ImageSpec& userspec, ROI range,
                 m_spec.z = 0;
             }
         }
-        if (m_spec.x < range.xbegin || m_spec.x + m_spec.width > range.xend
-            || m_spec.y < range.ybegin || m_spec.y + m_spec.height > range.yend
-            || m_spec.z < range.zbegin
-            || m_spec.z + m_spec.depth > range.zend) {
-            if (m_spec.depth == 1)
-                errorfmt(
-                    "{} requested pixel data window [{}, {}) x [{}, {}) exceeds the allowable range of [{}, {}) x [{}, {})",
-                    format_name(), m_spec.x, m_spec.x + m_spec.width, m_spec.y,
-                    m_spec.y + m_spec.height, range.xbegin, range.xend,
-                    range.ybegin, range.yend);
-            else
-                errorfmt(
-                    "{} requested pixel data window [{}, {}) x [{}, {}) x [{}, {}) exceeds the allowable range of [{}, {}) x [{}, {}) x [{}, {})\n{} vs {}\n",
-                    format_name(), m_spec.x, m_spec.x + m_spec.width, m_spec.y,
-                    m_spec.y + m_spec.height, m_spec.z, m_spec.z + m_spec.depth,
-                    range.xbegin, range.xend, range.ybegin, range.yend,
-                    range.zbegin, range.zend);
-        }
     }
 
     if (m_spec.extra_attribs.contains("ioproxy") && !supports("ioproxy")) {
@@ -1011,6 +1136,51 @@ ImageOutput::check_open(OpenMode mode, const ImageSpec& userspec, ROI range,
     }
 
     return true;  // all is ok
+}
+
+
+
+template<>
+inline size_t
+pvt::heapsize<ImageOutput::Impl>(const ImageOutput::Impl& impl)
+{
+    return impl.m_io_local ? sizeof(Filesystem::IOProxy) : 0;
+}
+
+
+
+size_t
+ImageOutput::heapsize() const
+{
+    size_t size = pvt::heapsize(m_impl);
+    size += pvt::heapsize(m_spec);
+    return size;
+}
+
+
+
+size_t
+ImageOutput::footprint() const
+{
+    return sizeof(ImageOutput) + heapsize();
+}
+
+
+
+template<>
+size_t
+pvt::heapsize<ImageOutput>(const ImageOutput& output)
+{
+    return output.heapsize();
+}
+
+
+
+template<>
+size_t
+pvt::footprint<ImageOutput>(const ImageOutput& output)
+{
+    return output.footprint();
 }
 
 

@@ -1235,7 +1235,7 @@ ImageBufAlgo::color_map(ImageBuf& dst, const ImageBuf& src, int srcchannel,
         dst.errorfmt("invalid source channel selected");
         return false;
     }
-    if (nknots < 2 || knots.size() < (nknots * channels)) {
+    if (nknots < 2 || std::ssize(knots) < (nknots * channels)) {
         dst.errorfmt("not enough knot values supplied");
         return false;
     }
@@ -1733,7 +1733,7 @@ over_impl_rgbafloat(ImageBuf& R, const ImageBuf& A, const ImageBuf& B, ROI roi,
                 for (int x = 0; x < w; ++x, r += 4, a += 4, b += 4) {
                     vfloat4 a_simd(a);
                     vfloat4 b_simd(b);
-                    vfloat4 alpha           = shuffle<3>(a_simd);
+                    vfloat4 alpha           = broadcast_element<3>(a_simd);
                     vfloat4 one_minus_alpha = one - clamp(alpha, zero, one);
                     vfloat4 result          = a_simd + one_minus_alpha * b_simd;
                     result.store(r);

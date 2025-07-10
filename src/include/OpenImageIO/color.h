@@ -90,7 +90,8 @@ public:
     bool has_error() const;
 
     /// DEPRECATED(2.4), old name for has_error().
-    bool error() const;
+    OIIO_DEPRECATED("Use has_error()")
+    bool error() const { return has_error(); }
 
     /// This routine will return the error string (and by default, clear any
     /// error flags).  If no error has occurred since the last time
@@ -142,6 +143,19 @@ public:
 
     /// Retrieve the full list of known look names, as a vector of strings.
     std::vector<std::string> getLookNames() const;
+
+    /// Get the number of NamedTransforms defined in this configuration
+    int getNumNamedTransforms() const;
+
+    /// Query the name of the specified NamedTransform.
+    const char* getNamedTransformNameByIndex(int index) const;
+
+    /// Retrieve the full list of known NamedTransforms, as a vector of strings
+    std::vector<std::string> getNamedTransformNames() const;
+
+    /// Retrieve the full list of aliases for the named NamedTransform.
+    std::vector<std::string>
+    getNamedTransformAliases(string_view named_transform) const;
 
     /// Is the color space known to be linear? This is very conservative, and
     /// will return false if it's not sure.
@@ -222,7 +236,15 @@ public:
 
     /// Query the name of the default view for the specified display. If the
     /// display is empty or not specified, the default display will be used.
+    /// This version does not consider the input color space.
     const char* getDefaultViewName(string_view display = "") const;
+
+    /// Query the name of the default view for the specified display, given
+    /// the input color space. If `display` is "default" or an empty string,
+    /// the default display will be used. The input color space is used to
+    /// determine the most appropriate default view for the given display.
+    const char* getDefaultViewName(string_view display,
+                                   string_view inputColorSpace) const;
 
     /// Returns the colorspace attribute of the (display, view) pair. (Note
     /// that this may be either a color space or a display color space.)
@@ -268,16 +290,26 @@ public:
                            ustring context_key   = ustring(),
                            ustring context_value = ustring()) const;
 
-    // OIIO_DEPRECATED("prefer the kind that takes an `inverse` parameter (2.5)")
+    OIIO_DEPRECATED("prefer the kind that takes an `inverse` parameter (2.5)")
     ColorProcessorHandle
     createDisplayTransform(string_view display, string_view view,
                            string_view inputColorSpace, string_view looks,
                            string_view context_key,
-                           string_view context_value = "") const;
-    // OIIO_DEPRECATED("prefer the kind that takes an `inverse` parameter (2.5)")
+                           string_view context_value = "") const
+    {
+        return createDisplayTransform(ustring(display), ustring(view),
+                                      ustring(inputColorSpace), ustring(looks),
+                                      false, ustring(context_key),
+                                      ustring(context_value));
+    }
+    OIIO_DEPRECATED("prefer the kind that takes an `inverse` parameter (2.5)")
     ColorProcessorHandle createDisplayTransform(
         ustring display, ustring view, ustring inputColorSpace, ustring looks,
-        ustring context_key, ustring context_value = ustring()) const;
+        ustring context_key, ustring context_value = ustring()) const
+    {
+        return createDisplayTransform(display, view, inputColorSpace, looks,
+                                      false, context_key, context_value);
+    }
 
     /// Construct a processor to perform color transforms determined by an
     /// OpenColorIO FileTransform. It is possible that this will return an
@@ -294,6 +326,25 @@ public:
     ColorProcessorHandle createFileTransform(ustring name,
                                              bool inverse = false) const;
 
+    /// Construct a processor to perform color transforms determined by an
+    /// OpenColorIO NamedTransform. It is possible that this will return an
+    /// empty handle if the NamedTransform doesn't exist or is not allowed.
+    ///
+    /// The handle is actually a shared_ptr, so when you're done with a
+    /// ColorProcess, just discard it. ColorProcessor(s) remain valid even
+    /// if the ColorConfig that created them no longer exists.
+    ///
+    /// Created ColorProcessors are cached, so asking for the same color
+    /// space transformation multiple times shouldn't be very expensive.
+    ColorProcessorHandle
+    createNamedTransform(string_view name, bool inverse = false,
+                         string_view context_key   = "",
+                         string_view context_value = "") const;
+    ColorProcessorHandle
+    createNamedTransform(ustring name, bool inverse = false,
+                         ustring context_key   = ustring(),
+                         ustring context_value = ustring()) const;
+
     /// Construct a processor to perform color transforms specified by a
     /// 4x4 matrix.
     ///
@@ -308,8 +359,24 @@ public:
     /// Given a filepath, ask OCIO what color space it thinks the file
     /// should be, based on how the name matches file naming rules in the
     /// OCIO config.  (This is mostly a wrapper around OCIO's
-    /// ColorConfig::getColorSpaceFromSFilepath.)
+    /// ColorConfig::getColorSpaceFromFilepath.)
     string_view getColorSpaceFromFilepath(string_view str) const;
+
+    /// Given a filepath, ask OCIO what color space it thinks the file
+    /// should be, based on how the name matches file naming rules in the
+    /// OCIO config. If no match is found, return `default_cs` instead of
+    /// the OCIO config's default color space. If `cs_name_match` is
+    /// true, additionally attempt to match the color space name in the
+    /// filename, if the OCIO config heuristics fail to find a match.
+    string_view getColorSpaceFromFilepath(string_view str,
+                                          string_view default_cs,
+                                          bool cs_name_match = false) const;
+
+    /// Given a filepath, returns whether the result of
+    /// getColorSpaceFromFilepath() is the failover condition, due
+    /// to the OCIO config's file rules not otherwise finding a match
+    /// for the filepath.
+    bool filepathOnlyMatchesDefaultRule(string_view str) const;
 
     /// Given a string (like a filename), look for the longest, right-most
     /// colorspace substring that appears. Returns "" if no such color space
@@ -327,6 +394,23 @@ public:
 
     /// Return a filename or other identifier for the config we're using.
     std::string configname() const;
+
+    /// Set the spec's metadata to presume that color space is `name` (or to
+    /// assume nothing about the color space if `name` is empty). The core
+    /// operation is to set the "oiio:ColorSpace" attribute, but it also removes
+    /// or alters several other attributes that may hint color space in ways that
+    /// might be contradictory or no longer true.
+    ///
+    /// @version 3.0
+    void set_colorspace(ImageSpec& spec, string_view name) const;
+
+    /// Set the spec's metadata to reflect Rec709 color primaries and the given
+    /// gamma. The core operation is to set the "oiio:ColorSpace" attribute, but
+    /// it also removes or alters several other attributes that may hint color
+    /// space in ways that might be contradictory or no longer true.
+    ///
+    /// @version 3.0
+    void set_colorspace_rec709_gamma(ImageSpec& spec, float gamma) const;
 
     /// Return if OpenImageIO was built with OCIO support
     static bool supportsOpenColorIO();

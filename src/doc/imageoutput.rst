@@ -246,26 +246,20 @@ individual plugin.
 
 .. tabs::
 
-   .. code-tab:: c++
+   .. tab:: C++
+      .. literalinclude:: ../../testsuite/docs-examples-cpp/src/docs-examples-imageoutput.cpp
+          :language: c++
+          :start-after: BEGIN-imageoutput-tiles
+          :end-before: END-imageoutput-tiles
+          :dedent: 4
 
-      unsigned char tile[tilesize*tilesize*channels];
-      int z = 0;   // Always zero for 2D images
-      for (int y = 0;  y < yres;  y += tilesize) {
-          for (int x = 0;  x < xres;  x += tilesize) {
-              ... generate data in tile[] ..
-              out->write_tile (x, y, z, TypeDesc::UINT8, tile);
-          }
-      }
-      out->close ();
+   .. tab:: Python
 
-   .. code-tab:: py
-
-      z = 0  # Always zero for 2D images
-      for y in range(0, yres, tilesize) :
-          for x in range(0, xres, tilesize) :
-              # ... generate data in tile[][][] ..
-              out.write_tile (x, y, z, tile)
-      out.close ()
+      .. literalinclude:: ../../testsuite/docs-examples-python/src/docs-examples-imageoutput.py
+          :language: py
+          :start-after: BEGIN-imageoutput-tiles
+          :end-before: END-imageoutput-tiles
+          :dedent: 8
 
 The first three arguments to ``write_tile()`` specify which tile is being
 written by the pixel coordinates of any pixel contained in the tile: *x*
@@ -888,12 +882,12 @@ color space:
    .. code-tab:: c++
 
       ImageSpec spec (width, length, channels, format);
-      spec.attribute ("oiio:ColorSpace", "scene_linear");
+      spec.set_colorspace("scene_linear");
 
    .. code-tab:: py
 
       spec = ImageSpec(width, length, channels, format)
-      spec.attribute ("oiio:ColorSpace", "scene_linear")
+      spec.set_colorspace("scene_linear")
 
 If a particular ``ImageOutput`` implementation is required (by the rules of
 the file format it writes) to have pixels in a fixed color space,
@@ -1455,7 +1449,7 @@ without alteration while modifying the image description metadata:
   
       // Create the output file and copy the image
       auto out = ImageOutput::create ("output.jpg");
-      out->open (output, out_spec);
+      out->open ("output.jpg", out_spec);
       out->copy_image (in);
   
       // Clean up
@@ -1473,7 +1467,7 @@ without alteration while modifying the image description metadata:
   
       # Create the output file and copy the image
       out = ImageOutput.create ("output.jpg")
-      out.open (output, out_spec)
+      out.open ("output.jpg", out_spec)
       out.copy_image (inp)
   
       # Clean up
@@ -1647,7 +1641,7 @@ user's home directory is :file:`/home/tom`), and if not found there, will
 then check the directory :file:`/shared/plugins`.
 
 The first search path it will check is that stored in the environment
-variable ``OIIO_LIBRARY_PATH``.  It will check each directory in turn, in
+variable ``OPENIMAGEIO_PLUGIN_PATH``.  It will check each directory in turn, in
 the order that they are listed in the variable.  If no adequate plugin is
 found in any of the directories listed in this environment variable, then it
 will check the custom searchpath passed as the optional second argument to

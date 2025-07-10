@@ -28,32 +28,41 @@
 #include <string>
 #include <vector>
 
-#include <OpenImageIO/span.h>
-#include <OpenImageIO/export.h>
 #include <OpenImageIO/oiioversion.h>
+#include <OpenImageIO/export.h>
+#include <OpenImageIO/span.h>
+#include <OpenImageIO/image_span.h>
 #include <OpenImageIO/paramlist.h>
 #include <OpenImageIO/platform.h>
 #include <OpenImageIO/strutil.h>
 #include <OpenImageIO/thread.h>
 #include <OpenImageIO/typedesc.h>
+#include <OpenImageIO/memory.h>
 
 OIIO_NAMESPACE_BEGIN
 
 class DeepData;
 class ImageBuf;
+class Timer;
 
+#ifndef OIIO_STRIDE_T_DEFINED
+#    define OIIO_STRIDE_T_DEFINED
+/// Type we use to express how many pixels (or bytes) constitute an image,
+/// tile, or scanline.
+using imagesize_t = uint64_t;
 
 /// Type we use for stride lengths between pixels, scanlines, or image
 /// planes.
 using stride_t = int64_t;
 
-/// Type we use to express how many pixels (or bytes) constitute an image,
-/// tile, or scanline.
-using imagesize_t = uint64_t;
-
 /// Special value to indicate a stride length that should be
 /// auto-computed.
-const stride_t AutoStride = std::numeric_limits<stride_t>::min();
+inline constexpr stride_t AutoStride = std::numeric_limits<stride_t>::min();
+#endif
+
+// Signal that this version of ImageBuf has constructors from spans
+#define OIIO_IMAGEINPUT_IMAGE_SPAN_SUPPORT 1
+#define OIIO_IMAGEOUTPUT_IMAGE_SPAN_SUPPORT 1
 
 
 
@@ -64,11 +73,6 @@ const stride_t AutoStride = std::numeric_limits<stride_t>::min();
 /// bool, which if 'true' will STOP the read or write.
 typedef bool (*ProgressCallback)(void *opaque_data, float portion_done);
 
-
-
-// Deprecated typedefs. Just use ParamValue and ParamValueList directly.
-typedef ParamValue ImageIOParameter;
-typedef ParamValueList ImageIOParameterList;
 
 
 // Forward declaration of IOProxy
@@ -393,6 +397,13 @@ public:
     /// overflow where it's not representable in an `imagesize_t`.
     imagesize_t scanline_bytes (bool native=false) const noexcept;
 
+    /// Returns the number of bytes comprising each scanline, if all channels
+    /// were of the given type. If `type` is `TypeUnknown`, then it returns
+    /// the bytes a scanline using each channel's native type. This will
+    /// return `std::numeric_limits<imagesize_t>::max()` in the event of an
+    /// overflow where it's not representable in an `imagesize_t`.
+    imagesize_t scanline_bytes(TypeDesc type) const noexcept;
+
     /// Return the number of pixels comprising a tile (or 0 if it is not a
     /// tiled image).  This will return
     /// `std::numeric_limits<imagesize_t>::max()` in the event of an
@@ -406,6 +417,13 @@ public:
     /// in the "native" data format of the file (these may differ in the
     /// case of per-channel formats).
     imagesize_t tile_bytes (bool native=false) const noexcept;
+
+    /// Returns the number of bytes comprising each tile, if all channels
+    /// were of the given type. If `type` is `TypeUnknown`, then it returns
+    /// the bytes a scanline using each channel's native type. This will
+    /// return `std::numeric_limits<imagesize_t>::max()` in the event of an
+    /// overflow where it's not representable in an `imagesize_t`.
+    imagesize_t tile_bytes(TypeDesc type) const noexcept;
 
     /// Return the number of pixels for an entire image.  This will
     /// return `std::numeric_limits<imagesize_t>::max()` in the event of
@@ -422,6 +440,12 @@ public:
     /// a pixel in the "native" data format of the file (these may differ in
     /// the case of per-channel formats).
     imagesize_t image_bytes (bool native=false) const noexcept;
+
+    /// Returns the number of bytes comprising an entire image of these
+    /// dimensions, if the values were all of type `datatype`. For the
+    /// special case of `datatype == `TypeUnknown`, compute the size of
+    /// the image in the "native" data types for all channels.
+    imagesize_t image_bytes(TypeDesc datatype) const noexcept;
 
     /// Verify that on this platform, a `size_t` is big enough to hold the
     /// number of bytes (and pixels) in a scanline, a tile, and the
@@ -670,8 +694,19 @@ public:
     decode_compression_metadata(string_view defaultcomp = "",
                                 int defaultqual = -1) const;
 
-    /// Helper function to verify that the given pixel range exactly covers
-    /// a set of tiles.  Also returns false if the spec indicates that the
+    /// Helper function to verify that the given pixel range exactly covers a
+    /// set of 2D tiles.  Also returns false if the spec indicates that the
+    /// image isn't tiled at all.
+    bool valid_tile_range (int xbegin, int xend, int ybegin, int yend) noexcept {
+        return (tile_width &&
+                ((xbegin-x) % tile_width)  == 0 &&
+                ((ybegin-y) % tile_height) == 0 &&
+                (((xend-x) % tile_width)  == 0 || (xend-x) == width) &&
+                (((yend-y) % tile_height) == 0 || (yend-y) == height));
+    }
+
+    /// Helper function to verify that the given pixel range exactly covers a
+    /// set of 3D tiles.  Also returns false if the spec indicates that the
     /// image isn't tiled at all.
     bool valid_tile_range (int xbegin, int xend, int ybegin, int yend,
                            int zbegin, int zend) noexcept {
@@ -952,18 +987,7 @@ public:
                       ioproxy, plugin_searchpath);
     }
 
-    // DEPRECATED(2.2): back compatible version
-    static unique_ptr create (const std::string& filename, bool do_open,
-                              const ImageSpec *config,
-                              string_view plugin_searchpath);
-    // DEPRECATED(2.1) This method should no longer be used, it is redundant.
-    static unique_ptr create (const std::string& filename,
-                              const std::string& plugin_searchpath);
-
     /// @}
-
-    // DEPRECATED(2.1)
-    static void destroy (ImageInput *x);
 
 protected:
     ImageInput ();
@@ -1002,6 +1026,17 @@ public:
     /// - `"thumbnail"` :
     ///       Does this format reader support retrieving a reduced
     ///       resolution copy of the image via the `thumbnail()` method?
+    ///
+    ///  - `"multiimage"` :
+    ///       Does this format support multiple subimages within a file?
+    ///       (Note: this doesn't necessarily mean that the particular
+    ///       file this ImageInput is reading has multiple subimages.)
+    ///
+    ///  - `"mipmap"` :
+    ///       Does this format support multiple resolutions for an
+    ///       image/subimage? (Note: this doesn't necessarily mean that the
+    ///       particular file this ImageInput is reading is MIP-mapped.)
+    ///       This query was added in OpenImageIO 3.1.
     ///
     ///  - `"noimage"` :
     ///        Does this format allow 0x0 sized images, i.e. an image file
@@ -1107,6 +1142,10 @@ public:
     /// `seek_subimage()`. It is thus not thread-safe, since the spec may
     /// change if another thread calls `seek_subimage`, or any of the
     /// `read_*()` functions that take explicit subimage/miplevel.
+    ///
+    /// This method should be considered deprecated, and we advise
+    /// always using the thread-safe `spec(subimage, miplevel)` method
+    /// instead.
     virtual const ImageSpec &spec (void) const { return m_spec; }
 
     /// Return a full copy of the ImageSpec of the designated subimage and
@@ -1115,7 +1154,9 @@ public:
     /// ImageSpec if there is lots of named metadata to allocate and copy.
     /// See also the less expensive `spec_dimensions()`. Errors (such as
     /// having requested a nonexistent subimage) are indicated by returning
-    /// an ImageSpec with `format==TypeUnknown`.
+    /// an ImageSpec with `format==TypeUnknown`, but does not call
+    /// errorfmt() to set an error message merely for being an out-of-range
+    /// subimage or miplevel.
     virtual ImageSpec spec (int subimage, int miplevel=0);
 
     /// Return a copy of the ImageSpec of the designated subimage and
@@ -1125,7 +1166,9 @@ public:
     /// a relatively inexpensive operation if you don't need that
     /// information. It is guaranteed to be thread-safe. Errors (such as
     /// having requested a nonexistent subimage) are indicated by returning
-    /// an ImageSpec with `format==TypeUnknown`.
+    /// an ImageSpec with `format==TypeUnknown`, but does not call
+    /// errorfmt() to set an error message merely for being an out-of-range
+    /// subimage or miplevel.
     virtual ImageSpec spec_dimensions (int subimage, int miplevel=0);
 
     /// Retrieve a reduced-resolution ("thumbnail") version of the given
@@ -1169,11 +1212,15 @@ public:
     /// Seek to the given subimage and MIP-map level within the open image
     /// file.  The first subimage of the file has index 0, the highest-
     /// resolution MIP level has index 0.  The new subimage's vital
-    /// statistics=may be retrieved by `this->spec()`.  The reader is
+    /// statistics may be retrieved by `this->spec()`.  The reader is
     /// expected to give the appearance of random access to subimages and
     /// MIP levels -- in other words, if it can't randomly seek to the given
     /// subimage/level, it should transparently close, reopen, and
     /// sequentially read through prior subimages and levels.
+    ///
+    /// Inability to seek to an out-of-range subimage or miplevel is indicated
+    /// by returning false, but it does not call errorfmt() to set an error
+    /// message unless it's the result of a damaged file.
     ///
     /// @returns
     ///         `true` upon success, or `false` upon failure. A failure may
@@ -1185,24 +1232,367 @@ public:
         return subimage == current_subimage() && miplevel == current_miplevel();
     }
 
+#if OIIO_DISABLE_DEPRECATED < OIIO_MAKE_VERSION(2,0,0) && !defined(OIIO_DOXYGEN)
     // Old version for backwards-compatibility: pass reference to newspec.
     // Some day this will be deprecated.
+    OIIO_DEPRECATED("Prefer the version that doesn't take an ImageSpec argument (2.0)")
     bool seek_subimage (int subimage, int miplevel, ImageSpec &newspec) {
         bool ok = seek_subimage (subimage, miplevel);
         if (ok)
             newspec = spec();
         return ok;
     }
+#endif
 
-    // DEPRECATED(2.1)
+#if OIIO_DISABLE_DEPRECATED < OIIO_MAKE_VERSION(2,1,0) && !defined(OIIO_DOXYGEN)
     // Seek to the given subimage -- backwards-compatible call that
     // doesn't worry about MIP-map levels at all.
+    OIIO_DEPRECATED("Prefer the version that takes a mipmap argument (2.1)")
     bool seek_subimage (int subimage, ImageSpec &newspec) {
-        return seek_subimage (subimage, 0 /* miplevel */, newspec);
+        bool ok = seek_subimage (subimage, 0 /* miplevel */);
+        if (ok)
+            newspec = spec(subimage);
+        return ok;
+    }
+#endif
+
+    // clang-format on
+
+    /// @name Reading pixels ("safe" methods with bounded spans)
+    ///
+    /// Common features of all the `read` methods:
+    ///
+    /// * There is a base case that takes a `image_span<byte>` describing
+    ///   untyped memory layout and a `TypeDesc` describing the data type
+    ///   that the values should be converted to (or TypeUnknown to keep
+    ///   the data in its "native" file types with no conversion).
+    ///
+    /// * The type-aware versions that accept an `image_span<T>` (for
+    ///   potentially non-contiguous data) or `span<T>` (for contiguous data)
+    ///   and understand to convert the data into the given `T` type.
+    ///
+    /// * The image_span (in either case) includes the memory bounds and
+    ///   stride lengths (in bytes) between channels, pixels, scanlines, and
+    ///   volumetric slices.
+    ///
+    /// * Any *range* parameters (such as `ybegin` and `yend`) describe a
+    ///   "half open interval", meaning that `begin` is the first item and
+    ///   `end` is *one past the last item*. That means that the number of
+    ///   items is `end - begin`.
+    ///
+    /// * For ordinary 2D (non-volumetric) images, any `z` or `zbegin`
+    ///   coordinates should be 0 and any `zend` should be 1, indicating
+    ///   that only a single image "plane" exists.
+    ///
+    /// * Some read methods take a channel range [chbegin,chend) to allow
+    ///   reading of a contiguous subset of channels (chbegin=0,
+    ///   chend=spec.nchannels reads all channels).
+    ///
+    /// * ImageInput readers are expected to give the appearance of random
+    ///   access -- in other words, if it can't randomly seek to the given
+    ///   scanline or tile, it should transparently close, reopen, and
+    ///   sequentially read through prior scanlines.
+    ///
+    /// * All read functions return `true` for success, `false` for failure
+    ///   (after which a call to `geterror()` may retrieve a specific error
+    ///   message).
+    ///
+
+    /// Read the entire image of `spec.width x spec.height x spec.depth`
+    /// pixels into a buffer with the given strides and in the desired
+    /// data format.
+    ///
+    /// Depending on the spec, this will read either all tiles or all
+    /// scanlines. Assume that data points to a layout in row-major order.
+    ///
+    /// This version of read_image, because it passes explicit subimage and
+    /// miplevel, does not require a separate call to seek_subimage, and is
+    /// guaranteed to be thread-safe against other concurrent calls to any
+    /// of the read_* methods that take an explicit subimage/miplevel (but
+    /// not against any other ImageInput methods).
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of read_image that takes raw pointers.
+    ///
+    /// @param  subimage    The subimage to read from (starting with 0).
+    /// @param  miplevel    The MIP level to read (0 is the highest
+    ///                     resolution level).
+    /// @param  chbegin/chend
+    ///                     The channel range to read. If chend is -1, it
+    ///                     will automatically be set to spec.nchannels.
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that you want the native data format
+    ///                     with no type conversion.
+    /// @param  data        An `image_span<byte>` describing the memory
+    ///                     extent of the data buffer and including the sizes
+    ///                     and byte strides for each dimension (channel, x,
+    ///                     y, and z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    virtual bool read_image(int subimage, int miplevel, int chbegin, int chend,
+                            TypeDesc format, const image_span<std::byte>& data);
+
+    /// A version of `read_image()` taking an `image_span<T>`, where the type
+    /// of the underlying data is `T`.  This is a convenience wrapper around
+    /// the `read_image()` that takes an `image_span<std::byte>`.
+    template<typename T>
+    bool read_image(int subimage, int miplevel, int chbegin, int chend,
+                    const image_span<T>& data)
+    {
+        static_assert(!std::is_const_v<T>,
+                      "read_image() does not accept image_span<const T>");
+        return read_image(subimage, miplevel, chbegin, chend,
+                          TypeDescFromC<T>::value(),
+                          as_image_span_writable_bytes(data));
     }
 
+    /// A version of `read_image()` taking a `span<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `read_image()` that takes an `image_span<T>`.
+    template<typename T>
+    bool read_image(int subimage, int miplevel, int chbegin, int chend,
+                    span<T> data)
+    {
+        static_assert(!std::is_const_v<T>,
+                      "read_image() does not accept span<const T>");
+        ImageSpec spec = spec_dimensions(subimage, miplevel);
+        if (chend < 0 || chend > spec.nchannels)
+            chend = spec.nchannels;
+        auto ispan = image_span<T>(data.data(), chend - chbegin, spec.width,
+                                   spec.height, spec.depth);
+        OIIO_DASSERT(data.size_bytes() == ispan.size_bytes()
+                     && ispan.is_contiguous());
+        return read_image(subimage, miplevel, chbegin, chend, ispan);
+    }
+
+    /// Read multiple scanlines that include pixels (*,y) for all ybegin <= y
+    /// < yend in the specified subimage and mip level, into `data`, using the
+    /// strides given and converting to the requested data `format`
+    /// (TypeUnknown indicates no conversion, just copy native data types).
+    /// Only channels [chbegin,chend) will be read/copied (chbegin=0,
+    /// chend=nchannels reads all channels, and chend=-1 also means the same
+    /// thing).
+    ///
+    /// This method, does not require a separate call to seek_subimage, and is
+    /// guaranteed to be thread-safe against other concurrent calls to any of
+    /// the read_* methods that take an explicit subimage/miplevel (but not
+    /// against any other non-thread-safe ImageInput methods).
+    ///
+    /// @param  subimage    The subimage to read from (starting with 0).
+    /// @param  miplevel    The MIP level to read (0 is the highest
+    ///                     resolution level).
+    /// @param  ybegin/yend The y range of the scanlines to read.
+    /// @param  chbegin/chend
+    ///                     The channel range to read. If chend is -1, it
+    ///                     will automatically be set to spec.nchannels.
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that you want the native data format
+    ///                     with no type conversion.
+    /// @param  data        An `image_span<byte>` describing the memory
+    ///                     extent of the data buffer and including the sizes
+    ///                     and byte strides for each dimension (channel, x,
+    ///                     y, and z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of read_scanlines that takes raw pointers.
+    ///
+    virtual bool read_scanlines(int subimage, int miplevel, int ybegin,
+                                int yend, int chbegin, int chend,
+                                TypeDesc format,
+                                const image_span<std::byte>& data);
+
+    /// A version of `read_scanlines()` taking an `image_span<T>`, where the
+    /// type of the underlying data is `T`.  This is a convenience wrapper
+    /// around the `read_scanlines()` that takes an `image_span<std::byte>`.
+    template<typename T>
+    bool read_scanlines(int subimage, int miplevel, int ybegin, int yend,
+                        int chbegin, int chend, const image_span<T>& data)
+    {
+        static_assert(!std::is_const_v<T>,
+                      "read_scanlines() does not accept span<const T>");
+        // reduce to type + image_span<byte>
+        return read_scanlines(subimage, miplevel, ybegin, yend, chbegin, chend,
+                              TypeDescFromC<T>::value(),
+                              as_image_span_writable_bytes(data));
+    }
+
+    /// A version of `read_scanlines()` taking a `span<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `read_scanlines()` that takes an `image_span<T>`.
+    template<typename T>
+    bool read_scanlines(int subimage, int miplevel, int ybegin, int yend,
+                        int chbegin, int chend, span<T> data)
+    {
+        static_assert(!std::is_const_v<T>,
+                      "read_scanlines() does not accept span<const T>");
+        // reduce to type + image_span<byte>
+        ImageSpec spec = spec_dimensions(subimage, miplevel);
+        if (chend < 0 || chend > spec.nchannels)
+            chend = spec.nchannels;
+        auto ispan = image_span<T>(data.data(), chend - chbegin, spec.width,
+                                   spec.height, 1);
+        return read_scanlines(subimage, miplevel, ybegin, yend, chbegin, chend,
+                              ispan);
+    }
+
+    /// Read the block of multiple tiles that include all pixels in
+    ///
+    ///     [xbegin,xend) X [ybegin,yend) X [zbegin,zend)
+    ///
+    /// The begin/end pairs must correctly delineate tile boundaries, with
+    /// the exception that it may also be the end of the image data if the
+    /// image resolution is not a whole multiple of the tile size.
+    ///
+    /// This version of read_tiles, because it passes explicit subimage and
+    /// miplevel, does not require a separate call to seek_subimage, and is
+    /// guaranteed to be thread-safe against other concurrent calls to any
+    /// of the read_* methods that take an explicit subimage/miplevel (but
+    /// not against any other ImageInput methods).
+    ///
+    /// @param  subimage    The subimage to read from (starting with 0).
+    /// @param  miplevel    The MIP level to read (0 is the highest
+    ///                     resolution level).
+    /// @param  xbegin/xend The x range of the pixels covered by the group
+    ///                     of tiles being read.
+    /// @param  ybegin/yend The y range of the pixels covered by the tiles.
+    /// @param  zbegin/zend The z range of the pixels covered by the tiles
+    ///                     (for a 2D image, zbegin=0 and zend=1).
+    /// @param  chbegin/chend
+    ///                     The channel range to read.
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that you want the native data format
+    ///                     with no type conversion.
+    /// @param  data        An `image_span<byte>` describing the memory
+    ///                     extent of the data buffer and including the sizes
+    ///                     and byte strides for each dimension (channel, x,
+    ///                     y, and z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of read_tiles that takes raw pointers.
+    ///
+    /// @note The call will fail if the image is not tiled, or if the pixel
+    /// ranges do not fall along tile (or image) boundaries, or if it is not
+    /// a valid tile range.
+    virtual bool read_tiles(int subimage, int miplevel, int xbegin, int xend,
+                            int ybegin, int yend, int zbegin, int zend,
+                            int chbegin, int chend, TypeDesc format,
+                            const image_span<std::byte>& data);
+
+    /// A version of `read_tiles()` taking an `image_span<T>`, where the type
+    /// of the underlying data is `T`.  This is a convenience wrapper around
+    /// the `read_tiles()` that takes an `image_span<const std::byte>`.
+    template<typename T>
+    bool read_tiles(int subimage, int miplevel, int xbegin, int xend,
+                    int ybegin, int yend, int zbegin, int zend, int chbegin,
+                    int chend, const image_span<T>& data)
+    {
+        return read_tiles(subimage, miplevel, xbegin, xend, ybegin, yend,
+                          zbegin, zend, chbegin, chend,
+                          TypeDescFromC<T>::value(),
+                          as_image_span_writable_bytes(data));
+    }
+
+    /// A version of `read_tiles()` taking a `cspan<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `read_tiles()` that takes an `image_span<const T>`.
+    template<typename T>
+    bool read_tiles(int subimage, int miplevel, int xbegin, int xend,
+                    int ybegin, int yend, int zbegin, int zend, int chbegin,
+                    int chend, span<T> data)
+    {
+        static_assert(!std::is_const_v<T>,
+                      "read_tiles() does not accept span<const T>");
+        // reduce to type + image_span<byte>
+        ImageSpec spec = spec_dimensions(subimage, miplevel);
+        if (chend < 0 || chend > spec.nchannels)
+            chend = spec.nchannels;
+        auto ispan = image_span<T>(data.data(), chend - chbegin, xend - xbegin,
+                                   yend - ybegin, zend - zbegin);
+        OIIO_DASSERT(data.size_bytes() >= ispan.size_bytes()
+                     && ispan.is_contiguous());
+        return read_tiles(subimage, miplevel, xbegin, xend, ybegin, yend,
+                          zbegin, zend, chbegin, chend, ispan);
+    }
+
+    // clang-format off
+
+    /// Read deep scanlines containing pixels (*,y,z), for all y in the
+    /// range [ybegin,yend) into `deepdata`. This will fail if it is not a
+    /// deep file.
+    ///
+    /// @param  subimage    The subimage to read from (starting with 0).
+    /// @param  miplevel    The MIP level to read (0 is the highest
+    ///                     resolution level).
+    /// @param  chbegin/chend
+    ///                     The channel range to read.
+    /// @param  ybegin/yend The y range of the scanlines being passed.
+    /// @param  z           The z coordinate of the scanline.
+    /// @param  deepdata    A `DeepData` object into which the data for
+    ///                     these scanlines will be placed.
+    /// @returns            `true` upon success, or `false` upon failure.
+    virtual bool read_native_deep_scanlines (int subimage, int miplevel,
+                                             int ybegin, int yend, int z,
+                                             int chbegin, int chend,
+                                             DeepData &deepdata);
+
+    /// Read into `deepdata` the block of native deep data tiles that
+    /// include all pixels and channels specified by pixel range.
+    ///
+    /// @param  subimage    The subimage to read from (starting with 0).
+    /// @param  miplevel    The MIP level to read (0 is the highest
+    ///                     resolution level).
+    /// @param  xbegin/xend The x range of the pixels covered by the group
+    ///                     of tiles being read.
+    /// @param  ybegin/yend The y range of the pixels covered by the tiles.
+    /// @param  zbegin/zend The z range of the pixels covered by the tiles
+    ///                     (for a 2D image, zbegin=0 and zend=1).
+    /// @param  chbegin/chend
+    ///                     The channel range to read.
+    /// @param  deepdata    A `DeepData` object into which the data for
+    ///                     these tiles will be placed.
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    /// @note The call will fail if the image is not tiled, or if the pixel
+    /// ranges do not fall along tile (or image) boundaries, or if it is not
+    /// a valid tile range.
+    virtual bool read_native_deep_tiles (int subimage, int miplevel,
+                                         int xbegin, int xend,
+                                         int ybegin, int yend,
+                                         int zbegin, int zend,
+                                         int chbegin, int chend,
+                                         DeepData &deepdata);
+
+    /// Read the entire deep data image of spec.width x spec.height x
+    /// spec.depth pixels, all channels, into `deepdata`.
+    ///
+    /// @param  subimage    The subimage to read from (starting with 0).
+    /// @param  miplevel    The MIP level to read (0 is the highest
+    ///                     resolution level).
+    /// @param  deepdata    A `DeepData` object into which the data for
+    ///                     the image will be placed.
+    /// @returns            `true` upon success, or `false` upon failure.
+    virtual bool read_native_deep_image (int subimage, int miplevel,
+                                         DeepData &deepdata);
+
+    /// @}
+
     /// @{
-    /// @name Reading pixels
+    /// @name Reading pixels (unsafe methods with pointers and strides)
+    ///
+    /// These methods are the "unsafe" versions of the `read` methods, which
+    /// take raw pointers and strides.  They are provided for backwards
+    /// compatibility with older code, but the preferred interface is to use
+    /// the `read` methods that take `image_span<T>` or `span<T>` arguments,
+    /// which are bounds-safe and type-aware.
+    ///
+    /// These pointer-based versions are considered "soft-deprecated" in
+    /// OpenImageIO 3.1, will be marked/warned as deprecated in 3.2, and will
+    /// be removed in 4.0.
     ///
     /// Common features of all the `read` methods:
     ///
@@ -1301,34 +1691,13 @@ public:
     /// @returns            `true` upon success, or `false` upon failure.
     ///
     /// @note This call was changed for OpenImageIO 2.0 to include the
-    ///     explicit subimage and miplevel parameters. The previous
-    ///     versions, which lacked subimage and miplevel parameters (thus
-    ///     were dependent on a prior call to `seek_subimage`) are
-    ///     considered deprecated.
+    ///     explicit subimage and miplevel parameters.
     virtual bool read_scanlines (int subimage, int miplevel,
                                  int ybegin, int yend, int z,
                                  int chbegin, int chend,
                                  TypeDesc format, void *data,
                                  stride_t xstride=AutoStride,
                                  stride_t ystride=AutoStride);
-
-#ifndef OIIO_DOXYGEN
-    // DEPRECATED versions of read_scanlines (pre-1.9 OIIO). These will
-    // eventually be removed. Try to replace these calls with ones to the
-    // new variety of read_scanlines that takes an explicit subimage and
-    // miplevel. These old versions are NOT THREAD-SAFE.
-    OIIO_DEPRECATED("replace with version that takes subimage & miplevel parameters (2.0)")
-    bool read_scanlines (int ybegin, int yend, int z,
-                         TypeDesc format, void *data,
-                         stride_t xstride=AutoStride,
-                         stride_t ystride=AutoStride);
-    OIIO_DEPRECATED("replace with version that takes subimage & miplevel parameters (2.0)")
-    bool read_scanlines (int ybegin, int yend, int z,
-                         int chbegin, int chend,
-                         TypeDesc format, void *data,
-                         stride_t xstride=AutoStride,
-                         stride_t ystride=AutoStride);
-#endif
 
     /// Read the tile whose upper-left origin is (x,y,z) into `data[]`,
     /// converting if necessary from the native data format of the file into
@@ -1419,23 +1788,6 @@ public:
                              stride_t xstride=AutoStride, stride_t ystride=AutoStride,
                              stride_t zstride=AutoStride);
 
-#ifndef OIIO_DOXYGEN
-    // DEPRECATED versions of read_tiles (pre-1.9 OIIO). These will
-    // eventually be removed. Try to replace these calls with ones to the
-    // new variety of read_tiles that takes an explicit subimage and
-    // miplevel. These old versions are NOT THREAD-SAFE.
-    OIIO_DEPRECATED("replace with version that takes subimage & miplevel parameters (2.0)")
-    bool read_tiles (int xbegin, int xend, int ybegin, int yend,
-                     int zbegin, int zend, TypeDesc format, void *data,
-                     stride_t xstride=AutoStride, stride_t ystride=AutoStride,
-                     stride_t zstride=AutoStride);
-    OIIO_DEPRECATED("replace with version that takes subimage & miplevel parameters (2.0)")
-    bool read_tiles (int xbegin, int xend, int ybegin, int yend,
-                     int zbegin, int zend, int chbegin, int chend,
-                     TypeDesc format, void *data, stride_t xstride=AutoStride,
-                     stride_t ystride=AutoStride, stride_t zstride=AutoStride);
-#endif
-
     /// Read the entire image of `spec.width x spec.height x spec.depth`
     /// pixels into a buffer with the given strides and in the desired
     /// data format.
@@ -1462,7 +1814,7 @@ public:
     ///                     resolution level).
     /// @param  chbegin/chend
     ///                     The channel range to read. If chend is -1, it
-    ///                     will be set to spec.nchannels.
+    ///                     will automatically be set to spec.nchannels.
     /// @param  format      A TypeDesc describing the type of `data`.
     /// @param  data        Pointer to the pixel data.
     /// @param  xstride/ystride/zstride
@@ -1480,91 +1832,6 @@ public:
                              ProgressCallback progress_callback=NULL,
                              void *progress_callback_data=NULL);
 
-#ifndef OIIO_DOXYGEN
-    // DEPRECATED versions of read_image (pre-1.9 OIIO). These will
-    // eventually be removed. Try to replace these calls with ones to the
-    // new variety of read_image that takes an explicit subimage and
-    // miplevel. These old versions are NOT THREAD-SAFE.
-    OIIO_DEPRECATED("replace with version that takes subimage & miplevel parameters (2.0)")
-    virtual bool read_image (TypeDesc format, void *data,
-                             stride_t xstride=AutoStride,
-                             stride_t ystride=AutoStride,
-                             stride_t zstride=AutoStride,
-                             ProgressCallback progress_callback=NULL,
-                             void *progress_callback_data=NULL);
-    OIIO_DEPRECATED("replace with version that takes subimage & miplevel parameters (2.0)")
-    virtual bool read_image (int chbegin, int chend,
-                             TypeDesc format, void *data,
-                             stride_t xstride=AutoStride,
-                             stride_t ystride=AutoStride,
-                             stride_t zstride=AutoStride,
-                             ProgressCallback progress_callback=NULL,
-                             void *progress_callback_data=NULL);
-    OIIO_DEPRECATED("replace with version that takes subimage & miplevel parameters (2.0)")
-    bool read_image (float *data) {
-        return read_image (current_subimage(), current_miplevel(),
-                           0, -1, TypeFloat, data);
-    }
-#endif
-
-    /// Read deep scanlines containing pixels (*,y,z), for all y in the
-    /// range [ybegin,yend) into `deepdata`. This will fail if it is not a
-    /// deep file.
-    ///
-    /// @param  subimage    The subimage to read from (starting with 0).
-    /// @param  miplevel    The MIP level to read (0 is the highest
-    ///                     resolution level).
-    /// @param  chbegin/chend
-    ///                     The channel range to read.
-    /// @param  ybegin/yend The y range of the scanlines being passed.
-    /// @param  z           The z coordinate of the scanline.
-    /// @param  deepdata    A `DeepData` object into which the data for
-    ///                     these scanlines will be placed.
-    /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool read_native_deep_scanlines (int subimage, int miplevel,
-                                             int ybegin, int yend, int z,
-                                             int chbegin, int chend,
-                                             DeepData &deepdata);
-
-    /// Read into `deepdata` the block of native deep data tiles that
-    /// include all pixels and channels specified by pixel range.
-    ///
-    /// @param  subimage    The subimage to read from (starting with 0).
-    /// @param  miplevel    The MIP level to read (0 is the highest
-    ///                     resolution level).
-    /// @param  xbegin/xend The x range of the pixels covered by the group
-    ///                     of tiles being read.
-    /// @param  ybegin/yend The y range of the pixels covered by the tiles.
-    /// @param  zbegin/zend The z range of the pixels covered by the tiles
-    ///                     (for a 2D image, zbegin=0 and zend=1).
-    /// @param  chbegin/chend
-    ///                     The channel range to read.
-    /// @param  deepdata    A `DeepData` object into which the data for
-    ///                     these tiles will be placed.
-    /// @returns            `true` upon success, or `false` upon failure.
-    ///
-    /// @note The call will fail if the image is not tiled, or if the pixel
-    /// ranges do not fall along tile (or image) boundaries, or if it is not
-    /// a valid tile range.
-    virtual bool read_native_deep_tiles (int subimage, int miplevel,
-                                         int xbegin, int xend,
-                                         int ybegin, int yend,
-                                         int zbegin, int zend,
-                                         int chbegin, int chend,
-                                         DeepData &deepdata);
-
-    /// Read the entire deep data image of spec.width x spec.height x
-    /// spec.depth pixels, all channels, into `deepdata`.
-    ///
-    /// @param  subimage    The subimage to read from (starting with 0).
-    /// @param  miplevel    The MIP level to read (0 is the highest
-    ///                     resolution level).
-    /// @param  deepdata    A `DeepData` object into which the data for
-    ///                     the image will be placed.
-    /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool read_native_deep_image (int subimage, int miplevel,
-                                         DeepData &deepdata);
-
     /// @}
 
     /// @{
@@ -1574,44 +1841,123 @@ public:
     ///     code (except for read_native_deep_* varieties). These are the
     ///     methods that are overloaded by the ImageInput subclasses that
     ///     implement the individual file format readers.
-    //
-    // The read_native_* methods always read the "native" data types
-    // (including per-channel data types) and assume that `data` points to
-    // contiguous memory (no non-default strides). In contrast, the
-    // read_scanline/scanlines/tile/tiles handle data type translation and
-    // arbitrary strides.
-    //
-    // The read_native_* methods take an explicit subimage and miplevel, and
-    // thus do not require a prior call to seek_subimage (and therefore no
-    // saved state). They are all required to be thread-safe when called
-    // concurrently with any other read_native_* call or with the varieties
-    // of read_tiles() that also takes an explicit subimage and miplevel
-    // parameter.
-    //
-    // As far as format-reading ImageInput subclasses are concerned, the
-    // only truly required overloads are read_native_scanline (always) and
-    // read_native_tile (only for formats that support tiles). The other
-    // varieties are special cases, for example if the particular format is
-    // able to efficiently read multiple scanlines or tiles at once, and if
-    // the subclass does not provide overloads, the base class
-    // implementation will be used instead, which is implemented by reducing
-    // the operation to multiple calls to read_scanline or read_tile.
+    ///
+    /// The read_native_* methods always read the "native" data types
+    /// (including per-channel data types) and assume that `data` points to
+    /// contiguous memory (no non-default strides). In contrast, the
+    /// read_scanline/scanlines/tile/tiles handle data type translation and
+    /// arbitrary strides.
+    ///
+    /// The read_native_* methods take an explicit subimage and miplevel, and
+    /// thus do not require a prior call to seek_subimage (and therefore no
+    /// saved state). They are all required to be thread-safe when called
+    /// concurrently with any other read_native_* call or with the varieties
+    /// of read_tiles() that also takes an explicit subimage and miplevel
+    /// parameter.
+    ///
+    /// As far as format-reading ImageInput subclasses are concerned, the
+    /// only truly required overloads are read_native_scanline (always) and
+    /// read_native_tile (only for formats that support tiles). The other
+    /// varieties are special cases, for example if the particular format is
+    /// able to efficiently read multiple scanlines or tiles at once, and if
+    /// the subclass does not provide overloads, the base class
+    /// implementation will be used instead, which is implemented by reducing
+    /// the operation to multiple calls to read_scanline or read_tile.
+    ///
+    /// Note for ImageInput implementors:
+    ///
+    /// The preferred ImageInput implementation strategy (and, eventually,
+    /// required) is to fully implement the span-based, all-channel verison of
+    /// read_native_scanlines and/or read_native_tiles and/or
+    /// read_native_volumetric_tiles (whichever of these are supported by the
+    /// image file format), and to make a trivial implementation of the old
+    /// pointer-based varieties that simply call the span ones (with an
+    /// inferred length).
+    ///
+    /// The channel-subset versions may also, optionally, be implemented. If
+    /// omitted, they will fall back to a default implementation that calls
+    /// the all-channel versions to read into a temporary buffer, then copies
+    /// the requested channels to the user's buffer. It is only worth custom
+    /// implementations of the channel-subset versions for formats where there
+    /// is a significant performance advantage due to the underlying library
+    /// providing that as a feature (as OpenEXR does, for example, but most
+    /// format reading APIs do not).
+    ///
+    /// For the time being, old ImageInput format readers that do not yet
+    /// implement the span-based readers, but provide full featured
+    /// implementations of the pointer-based varieties, will continue to work.
+    /// This is because the default base-class implementation of the
+    /// span-based read_native methods will, if not overloaded, simply call
+    /// the pointer-based versions.
+    ///
+    /// To reiterate: A format-reader is expected to provide EITHER (a)
+    /// span-based calls with full implementations and pointer-based calls
+    /// that simply call the span-based ones, OR (b) pointer-based full
+    /// implementations only and rely on the base class span-based calls to
+    /// call them by default.
 
+    /// Read a range of scanlines (all channels) of native data into
+    /// contiguous memory defined by the span `data`.
+    virtual bool read_native_scanlines(int subimage, int miplevel, int ybegin,
+                                       int yend, span<std::byte> data);
+
+    /// Read a range of scanlines (with potentially a subset of channels) of
+    /// native data into contiguous memory defined by the span `data`.
+    virtual bool read_native_scanlines(int subimage, int miplevel, int ybegin,
+                                       int yend, int chbegin, int chend,
+                                       span<std::byte> data);
+
+    /// Read a range of tiles (all channels) of native data into contiguous
+    /// memory defined by the span `data`.
+    virtual bool read_native_tiles(int subimage, int miplevel,
+                                   int xbegin, int xend, int ybegin, int yend,
+                                   span<std::byte> data);
+
+    /// Read a range of tiles (with potentially a subset of channels) of
+    /// native data into contiguous memory defined by the span `data`.
+    virtual bool read_native_tiles(int subimage, int miplevel,
+                                   int xbegin, int xend, int ybegin, int yend,
+                                   int chbegin, int chend,
+                                   span<std::byte> data);
+
+    /// Read a range of 3D volumetric tiles (all channels) of native data into
+    /// contiguous memory. This is only functional for volumetric formats.
+    virtual bool read_native_volumetric_tiles(int subimage, int miplevel,
+                                   int xbegin, int xend, int ybegin, int yend,
+                                   int zbegin, int zend, span<std::byte> data);
+
+    /// Read a range of 3D volumetric tiles (with potentially a subset of
+    /// channels) of native data into contiguous memory. This is only
+    /// functional for volumetric formats.
+    virtual bool read_native_volumetric_tiles(int subimage, int miplevel,
+                                int xbegin, int xend, int ybegin, int yend,
+                                int zbegin, int zend, int chbegin, int chend,
+                                span<std::byte> data);
+
+    /// OLD pointer-based version: this will eventually be deprecated.
+    ///
     /// Read a single scanline (all channels) of native data into contiguous
     /// memory.
     virtual bool read_native_scanline (int subimage, int miplevel,
                                        int y, int z, void *data) = 0;
+
+    /// OLD pointer-based version: this will eventually be deprecated.
+    ///
     /// Read a range of scanlines (all channels) of native data into
     /// contiguous memory.
     virtual bool read_native_scanlines (int subimage, int miplevel,
                                         int ybegin, int yend, int z,
                                         void *data);
+    /// OLD pointer-based version: this will eventually be deprecated.
+    ///
     /// Read a range of scanlines (with optionally a subset of channels) of
     /// native data into contiguous memory.
     virtual bool read_native_scanlines (int subimage, int miplevel,
                                         int ybegin, int yend, int z,
                                         int chbegin, int chend, void *data);
 
+    /// OLD pointer-based version: this will eventually be deprecated.
+    ///
     /// Read a single tile (all channels) of native data into contiguous
     /// memory. The base class read_native_tile fails. A format reader that
     /// supports tiles MUST overload this virtual method that reads a single
@@ -1619,6 +1965,8 @@ public:
     virtual bool read_native_tile (int subimage, int miplevel,
                                    int x, int y, int z, void *data);
 
+    /// OLD pointer-based version: this will eventually be deprecated.
+    ///
     /// Read multiple tiles (all channels) of native data into contiguous
     /// memory. A format reader that supports reading multiple tiles at once
     /// (in a way that's more efficient than reading the tiles one at a
@@ -1630,6 +1978,8 @@ public:
                                     int xbegin, int xend, int ybegin, int yend,
                                     int zbegin, int zend, void *data);
 
+    /// OLD pointer-based version: this will eventually be deprecated.
+    ///
     /// Read multiple tiles (potentially a subset of channels) of native
     /// data into contiguous memory. A format reader that supports reading
     /// multiple tiles at once, and can handle a channel subset while doing
@@ -1642,6 +1992,7 @@ public:
                                     int xbegin, int xend, int ybegin, int yend,
                                     int zbegin, int zend,
                                     int chbegin, int chend, void *data);
+
     /// @}
 
 
@@ -1676,12 +2027,22 @@ public:
     std::string geterror(bool clear = true) const;
 
     /// Error reporting for the plugin implementation: call this with
+    /// std::format-like arguments. It is not necessary to have the error
+    /// message contain a trailing newline.
+    template<typename... Args>
+    void errorfmt(const char* fmt, const Args&... args) const {
+        append_error(Strutil::fmt::format (fmt, args...));
+    }
+
+#if OIIO_DISABLE_DEPRECATED < OIIO_MAKE_VERSION(2, 6, 3) && \
+    !defined(OIIO_INTERNAL) && !defined(OIIO_DOXYGEN)
+    /// Error reporting for the plugin implementation: call this with
     /// Strutil::format-like arguments. It is not necessary to have the
     /// error message contain a trailing newline.
     /// Use with caution! Some day this will change to be fmt-like rather
     /// than printf-like.
     template<typename... Args>
-    OIIO_FORMAT_DEPRECATED
+    OIIO_DEPRECATED("use errorfmt instead, with std::format-like arguments (3.0)")
     void error(const char* fmt, const Args&... args) const {
         append_error(Strutil::format (fmt, args...));
     }
@@ -1690,26 +2051,20 @@ public:
     /// printf-like arguments. It is not necessary to have the error message
     /// contain a trailing newline.
     template<typename... Args>
+    OIIO_DEPRECATED("use errorfmt instead, with std::format-like arguments (3.0)")
     void errorf(const char* fmt, const Args&... args) const {
         append_error(Strutil::sprintf (fmt, args...));
-    }
-
-    /// Error reporting for the plugin implementation: call this with
-    /// std::format-like arguments. It is not necessary to have the error
-    /// message contain a trailing newline.
-    template<typename... Args>
-    void errorfmt(const char* fmt, const Args&... args) const {
-        append_error(Strutil::fmt::format (fmt, args...));
     }
 
     // Error reporting for the plugin implementation: call this with
     // std::format-like arguments. It is not necessary to have the
     // error message contain a trailing newline.
     template<typename... Args>
-    OIIO_DEPRECATED("use `errorfmt` instead")
+    OIIO_DEPRECATED("use `errorfmt` instead (2.3)")
     void fmterror(const char* fmt, const Args&... args) const {
         append_error(Strutil::fmt::format (fmt, args...));
     }
+#endif
 
     /// Set the threading policy for this ImageInput, controlling the
     /// maximum amount of parallelizing thread "fan-out" that might occur
@@ -1748,6 +2103,16 @@ public:
     /// Call signature of a function that creates and returns an
     /// `ImageInput*`.
     typedef ImageInput* (*Creator)();
+
+    /// Memory tracking method.
+    /// Return the total heap memory allocated by `ImageInput`.
+    /// Overridable version of heapsize defined in memory.h.
+    virtual size_t heapsize() const;
+
+    /// Memory tracking method.
+    /// Return the total memory footprint of `ImageInput`.
+    /// Overridable version of footprint defined in memory.h.
+    virtual size_t footprint() const;
 
 protected:
     ImageSpec m_spec;  // format spec of the current open subimage/MIPlevel
@@ -1798,6 +2163,16 @@ protected:
     /// Helper: retrieve the current position of the proxy, akin to ftell.
     int64_t iotell() const;
 
+    /// @}
+
+    /// @{
+    /// @name Helper methods for ImageInput implementations.
+    ///
+    /// This set of utility functions are not meant to be called by user code.
+    /// They are protected methods of ImageInput, and are used internally by
+    /// the ImageInput format-reading implementations.
+    ///
+
     /// Helper: convenience boilerplate for several checks and operations that
     /// every implementation of ImageInput::open() will need to do. Failure is
     /// presumed to indicate a file that is corrupt (or perhaps maliciously
@@ -1807,11 +2182,12 @@ protected:
     ///     The ImageSpec that we are validating.
     ///
     /// @param range
-    ///     An ROI that describes the allowable pixel coordinates and channel
-    ///     indices as half-open intervals.  For example, the default value
-    ///     `{0, 65535, 0, 65535, 0, 1, 0, 4}` means that pixel coordinates
-    ///     must be non-negative and the width and height be representable by
-    ///     a uint16 value, up to 4 channels are allowed, and volumes are not
+    ///     An ROI that describes the allowable resolution and channel count:
+    ///     the width, height, depth, and channel count of the ROI are the
+    ///     maximum allowed for the file type. For example, the default value
+    ///     `{0, 65535, 0, 65535, 0, 1, 0, 4}` means that pixel data width
+    ///     and height must be non-negative and representable by uint16
+    ///     values, up to 4 channels are allowed, and volumes are not
     ///     permitted (z coordinate may only be 0). File formats that can
     ///     handle larger resolutions, or volumes, or >4 channels must
     ///     override these limits!
@@ -1845,6 +2221,16 @@ protected:
         // Reserved for future use
     };
 
+    /// Helper method: Validate that a `[chbegin, chend)` X `[xbegin, xend)` X
+    /// `[ybegin, yend)` X `[zbegin, zend)` slab of native channel data types
+    /// (according to the ImageSpec) can fit into the amount of contiguous
+    /// memory held by the span. If it can, return true. If it can't, call
+    /// `this->errorfmt()` with an appropriate error message and return false.
+    /// Unspecified channel range indicates all channels.
+    bool valid_raw_span_size(cspan<std::byte> buf, const ImageSpec& spec,
+                             int xbegin, int xend, int ybegin, int yend,
+                             int zbegin = 0, int zend = 1,
+                             int chbegin = 0, int chend = -1);
     /// @}
 
 private:
@@ -1856,10 +2242,9 @@ private:
     std::unique_ptr<Impl, decltype(&impl_deleter)> m_impl;
 
     void append_error(string_view message) const; // add to error message
-    // Deprecated:
-    OIIO_DEPRECATED("Deprecated")
-    static unique_ptr create (const std::string& filename, bool do_open,
-                              const std::string& plugin_searchpath);
+
+    /// declare friend heapsize and footprint definitions
+    template <typename T> friend size_t pvt::heapsize(const T&);
 };
 
 
@@ -1918,14 +2303,19 @@ public:
                       Strutil::utf16_to_utf8(plugin_searchpath));
     }
 
-    // DEPRECATED(2.2)
-    static unique_ptr create (const std::string &filename,
-                              const std::string &plugin_searchpath);
-
     /// @}
 
-    // @deprecated
-    static void destroy (ImageOutput *x);
+#if OIIO_DISABLE_DEPRECATED < OIIO_MAKE_VERSION(2,2,0) \
+    && !defined(OIIO_DOXYGEN) && !defined(OIIO_INTERNAL)
+    OIIO_DEPRECATED("Obsolete version (2.2)")
+    static unique_ptr create (const std::string &filename,
+                              const std::string &plugin_searchpath) {
+        return create(filename, nullptr, plugin_searchpath);
+    }
+
+    OIIO_DEPRECATED("destroy is no longer needed")
+    static void destroy (ImageOutput *x) { delete x; }
+#endif
 
 protected:
     ImageOutput ();
@@ -2147,8 +2537,429 @@ public:
     virtual bool close () = 0;
     /// @}
 
+    // clang-format on
+
     /// @{
-    /// @name Writing pixels
+    /// @name Writing pixels ("safe" methods with bounded spans)
+    ///
+    /// Common features of all the `write` methods:
+    ///
+    /// * There is a base case that takes a `image_span<byte>` describing
+    ///   untyped memory layout and a `TypeDesc` describing the data type
+    ///   that the values should be converted from (or TypeUnknown to
+    ///   indicate that the data is already in its "native" file types with
+    ///   no conversion needed).
+    ///
+    /// * The type-aware versions that accept an `image_span<T>` (for
+    ///   potentially non-contiguous data) or `span<T>` (for contiguous data)
+    ///   and understand to convert the data from the given `T` type.
+    ///
+    /// * The image_span (in either case) includes the memory bounds and
+    ///   stride lengths (in bytes) between channels, pixels, scanlines, and
+    ///   volumetric slices.
+    ///
+    /// * Any *range* parameters (such as `ybegin` and `yend`) describe a
+    ///   "half open interval", meaning that `begin` is the first item and
+    ///   `end` is *one past the last item*. That means that the number of
+    ///   items is `end - begin`.
+    ///
+    /// * For ordinary 2D (non-volumetric) images, any `z` or `zbegin`
+    ///   coordinates should be 0 and any `zend` should be 1, indicating
+    ///   that only a single image "plane" exists.
+    ///
+    /// * Scanlines or tiles must be written in successive increasing
+    ///   coordinate order, unless the particular output file driver allows
+    ///   random access (indicated by `supports("random_access")`).
+    ///
+    /// * All write functions return `true` for success, `false` for failure
+    ///   (after which a call to `geterror()` may retrieve a specific error
+    ///   message).
+    ///
+
+    /// Given an explicit data type and an `image_span` of untyped bytes,
+    /// write the entire image of `spec.width x spec.height x spec.depth`
+    /// pixels from the buffer.
+    ///
+    /// Depending on the spec, this will write either all tiles or all
+    /// scanlines. Assume that data points to a layout in row-major order.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of write_image that takes raw pointers.
+    ///
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that the data is already in the native
+    ///                     format and needs no type conversion.
+    /// @param  data        An `image_span<const byte>` describing the memory
+    ///                     extent of the data buffer and including the sizes
+    ///                     and byte strides for each dimension (channel, x,
+    ///                     y, and z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    virtual bool write_image(TypeDesc format,
+                             const image_span<const std::byte>& data);
+
+    /// A version of `write_image()` taking an `image_span<T>`, where the type
+    /// of the underlying data is `T`.  This is a convenience wrapper around
+    /// the `write_image()` that takes an `image_span<const std::byte>`.
+    template<typename T> bool write_image(const image_span<T>& data)
+    {
+        return write_image(TypeDescFromC<T>::value(),
+                           as_image_span_bytes(data));
+    }
+
+    /// A version of `write_image()` taking a `cspan<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `write_image()` that takes an `image_span<const T>`.
+    template<typename T> bool write_image(span<T> data)
+    {
+        auto ispan = image_span<const T>(data.data(), m_spec.nchannels,
+                                         m_spec.width, m_spec.height,
+                                         m_spec.depth);
+        OIIO_DASSERT(data.size_bytes() == ispan.size_bytes()
+                     && ispan.is_contiguous());
+        return write_image(ispan);
+    }
+
+    /// Write one scanline that include pixels (*,y) from `data`, which is an
+    /// `image_span` of un-typed bytes incorporating its bounded dimensions
+    /// and strides. The data type is given explicity by the `format`
+    /// argument, and will be automatically converted to the type being stored
+    /// in the file.
+    ///
+    /// The image_span must have a width equal to a full scanline width,
+    /// and its height and depth must be 1.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of write_scanline that takes raw pointers.
+    ///
+    /// @param  y           The y coordinate of the scanline.
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that the data is already in the native
+    ///                     format and needs no type conversion.
+    /// @param  data        An `image_span<byte>` describing the buffer and
+    ///                     including its sizes and byte strides for each
+    ///                     dimension (channel, x, y, z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    virtual bool write_scanline(int y, TypeDesc format,
+                                const image_span<const std::byte>& data);
+
+    /// A version of `write_scanline()` taking an `image_span<T>`, where the
+    /// type of the underlying data is `T`.  This is a convenience wrapper
+    /// around the `write_scanline()` that takes an `image_span<const
+    /// std::byte>`.
+    template<typename T> bool write_scanline(int y, const image_span<T>& data)
+    {
+        // reduce to type + image_span<byte>
+        return write_scanline(y, TypeDescFromC<T>::value(),
+                              as_image_span_bytes(data));
+    }
+
+    /// A version of `write_scanline()` taking a `cspan<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `write_scanline()` that takes an `image_span<const T>`.
+    template<typename T> bool write_scanline(int y, span<T> data)
+    {
+        // reduce to type + image_span<byte>
+        return write_scanline(y, image_span<T>(data.data(), m_spec.nchannels,
+                                               m_spec.width, 1, 1));
+    }
+
+    /// Write multiple scanlines that include pixels (*,y) for all `ybegin
+    /// <= y < yend`, from `data`, which is an `image_span` of un-typed bytes
+    /// incorporating its bounded dimensions and strides. The data type is
+    /// given explicity by the `format` argument, and will be automatically
+    /// converted to the type being stored in the file. You can write a single
+    /// scanline by passing `yend == ybegin + 1`, but passing multiple
+    /// scanlines in each call often has performance advantages for many file
+    /// formats.
+    ///
+    /// The image_span must have a width equal to a full scanline width,
+    /// and its height must be yend - ybegin.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of write_scanlines that takes raw pointers.
+    ///
+    /// @param  ybegin/yend The y range of the scanlines being passed.
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that the data is already in the native
+    ///                     format and needs no type conversion.
+    /// @param  data        An `image_span<byte>` describing the buffer and
+    ///                     including its sizes and byte strides for each
+    ///                     dimension (channel, x, y, z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    virtual bool write_scanlines(int ybegin, int yend, TypeDesc format,
+                                 const image_span<const std::byte>& data);
+
+    /// A version of `write_scanlines()` taking an `image_span<T>`, where the
+    /// type of the underlying data is `T`.  This is a convenience wrapper
+    /// around the `write_scanlines()` that takes an `image_span<const
+    /// std::byte>`.
+    template<typename T>
+    bool write_scanlines(int ybegin, int yend, const image_span<T>& data)
+    {
+        // image_span<T>: reduces to type + byte_buffer
+        return write_scanlines(ybegin, yend, TypeDescFromC<T>::value(),
+                               data.as_image_span_bytes());
+    }
+
+    /// A version of `write_scanlines()` taking a `cspan<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `write_scanlines()` that takes an `image_span<const T>`.
+    template<typename T>
+    bool write_scanlines(int ybegin, int yend, span<T> data)
+    {
+        auto ispan = image_span<T>(data.data(), m_spec.nchannels, m_spec.width,
+                                   yend - ybegin, 1);
+        OIIO_DASSERT(data.size_bytes() == ispan.size_bytes()
+                     && ispan.is_contiguous());
+        return write_scanlines(ybegin, yend, ispan);
+    }
+
+
+    /// Write a single tile of pixels whose upper left pixel coordinate is (x,
+    /// y, z) from a buffer described by `data`, which is an `image_span` of
+    /// un-typed bytes incorporating its bounded dimensions and strides. The
+    /// data type is given explicity by the `format` argument, and will be
+    /// automatically converted to the type being stored in the file. The
+    /// (x,y,z) coordinates must be the pixel coordinates of the first (upper
+    /// left corner) pixel of a tile.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of write_tile that takes raw pointers.
+    ///
+    /// @param  x/y/z       The x range of the pixels being passed.
+    /// @param  ybegin/yend The y range of the pixels being passed.
+    /// @param  zbegin/zend The z range of the pixels being passed
+    ///                     (for a 2D image, zbegin=0 and zend=1).
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that the data is already in the native
+    ///                     format and needs no type conversion.
+    /// @param  data        An `image_span<byte>` describing the buffer and
+    ///                     including its sizes and byte strides for each
+    ///                     dimension (channel, x, y, z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of write_tile that takes raw pointers.
+    ///
+    virtual bool write_tile(int x, int y, int z, TypeDesc format,
+                            const image_span<const std::byte>& data);
+
+    /// A version of `write_tile()` taking an `image_span<T>`, where the type
+    /// of the underlying data is `T`.  This is a convenience wrapper around
+    /// the `write_tile()` that takes an `image_span<const std::byte>`.
+    template<typename T>
+    bool write_tile(int x, int y, int z, const image_span<T>& data)
+    {
+        return write_tile(x, y, z, TypeDescFromC<T>::value(),
+                          as_image_span_bytes(data));
+    }
+
+    /// A version of `write_tile()` taking a `cspan<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `write_tile()` that takes an `image_span<const T>`.
+    template<typename T> bool write_tile(int x, int y, int z, span<T> data)
+    {
+        auto ispan = image_span<T>(data.data(), m_spec.nchannels,
+                                   m_spec.tile_width, m_spec.tile_height,
+                                   m_spec.tile_depth);
+        OIIO_DASSERT(data.size_bytes() == ispan.size_bytes()
+                     && ispan.is_contiguous());
+        return write_tile(x, y, z, ispan);
+    }
+
+    /// Write a rectangular region of tiles of pixels given by the range
+    ///
+    ///     [xbegin,xend) X [ybegin,yend) X [zbegin,zend)
+    ///
+    /// contained in `data`, which is an `image_span` of un-typed bytes
+    /// incorporating its bounded dimensions and strides. The data type is
+    /// given explicity by the `format` argument, and will be automatically
+    /// converted to the type being stored in the file. The begin/end
+    /// coordinates must be at tile or image boundaries.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of write_tiles that takes raw pointers.
+    ///
+    /// @param  xbegin/xend The x range of the pixels being passed.
+    /// @param  ybegin/yend The y range of the pixels being passed.
+    /// @param  zbegin/zend The z range of the pixels being passed
+    ///                     (for a 2D image, zbegin=0 and zend=1).
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that the data is already in the native
+    ///                     format and needs no type conversion.
+    /// @param  data        An `image_span<byte>` describing the buffer and
+    ///                     including its sizes and byte strides for each
+    ///                     dimension (channel, x, y, z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    virtual bool write_tiles(int xbegin, int xend, int ybegin, int yend,
+                             int zbegin, int zend, TypeDesc format,
+                             const image_span<const std::byte>& data);
+
+    /// A version of `write_tiles()` taking an `image_span<T>`, where the type
+    /// of the underlying data is `T`.  This is a convenience wrapper around
+    /// the `write_tiles()` that takes an `image_span<const std::byte>`.
+    template<typename T>
+    bool write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
+                     int zend, const image_span<T>& data)
+    {
+        return write_tiles(xbegin, xend, ybegin, yend, zbegin, zend,
+                           TypeDescFromC<T>::value(),
+                           as_image_span_bytes(data));
+    }
+
+    /// A version of `write_tiles()` taking a `cspan<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `write_tiles()` that takes an `image_span<const T>`.
+    template<typename T>
+    bool write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
+                     int zend, span<T> data)
+    {
+        auto ispan = image_span<T>(data.data(), m_spec.nchannels, xend - xbegin,
+                                   yend - ybegin, zend - zbegin);
+        OIIO_DASSERT(data.size_bytes() == ispan.size_bytes()
+                     && ispan.is_contiguous());
+        return write_tiles(xbegin, xend, ybegin, yend, zbegin, zend, ispan);
+    }
+
+    /// Write a rectangle of pixels given by the range
+    ///
+    ///     [xbegin,xend) X [ybegin,yend) X [zbegin,zend)
+    ///
+    /// from a buffer described by `data`, which is an `image_span`
+    /// incorporating its bounded dimensions, strides, and data type.
+    ///
+    /// The begin/end coordinates do not need to be tile boundaries, but the
+    /// call is only supported for format plugins that return true for
+    /// `supports("rectangles")`.
+    ///
+    /// Added in OIIO 3.1, this is the "safe" preferred alternative to
+    /// the version of write_rectangle that takes raw pointers.
+    ///
+    /// @param  xbegin/xend The x range of the pixels being passed.
+    /// @param  ybegin/yend The y range of the pixels being passed.
+    /// @param  format      A TypeDesc describing the type of the pixel data
+    ///                     that `data`'s memory contains. Use `TypeUnknown`
+    ///                     to indicate that the data is already in the native
+    ///                     format and needs no type conversion.
+    /// @param  data        An `image_span<byte>` describing the buffer and
+    ///                     including its sizes and byte strides for each
+    ///                     dimension (channel, x, y, z).
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    virtual bool write_rectangle(int xbegin, int xend, int ybegin, int yend,
+                                 int zbegin, int zend, TypeDesc format,
+                                 const image_span<const std::byte>& data);
+
+    /// A version of `write_rectangle()` taking an `image_span<T>`, where the
+    /// type of the underlying data is `T`.  This is a convenience wrapper
+    /// around the `write_rectangle()` that takes an `image_span<const
+    /// std::byte>`.
+    template<typename T>
+    bool write_rectangle(int xbegin, int xend, int ybegin, int yend, int zbegin,
+                         int zend, const image_span<T>& data)
+    {
+        return write_rectangle(xbegin, xend, ybegin, yend, zbegin, zend,
+                               TypeDescFromC<T>::value(),
+                               as_image_span_bytes(data));
+    }
+
+    /// A version of `write_rectangle()` taking a `cspan<T>`, which assumes
+    /// contiguous strides in all dimensions. This is a convenience wrapper
+    /// around the `write_rectangle()` that takes an `image_span<const T>`.
+    template<typename T>
+    bool write_rectangle(int xbegin, int xend, int ybegin, int yend, int zbegin,
+                         int zend, span<T> data)
+    {
+        auto ispan = image_span<const T>(data.data(), m_spec.nchannels,
+                                         xend - xbegin, yend - ybegin,
+                                         zend - zbegin);
+        OIIO_DASSERT(data.size_bytes() == ispan.size_bytes()
+                     && ispan.is_contiguous());
+        return write_rectangle(xbegin, xend, ybegin, yend, zbegin, zend, ispan);
+    }
+
+    // clang-format off
+
+    /// Write deep scanlines containing pixels (*,y,z), for all y in the
+    /// range [ybegin,yend), to a deep file. This will fail if it is not a
+    /// deep file.
+    ///
+    /// @param  ybegin/yend The y range of the scanlines being passed.
+    /// @param  z           The z coordinate of the scanline.
+    /// @param  deepdata    A `DeepData` object with the data for these
+    ///                     scanlines.
+    /// @returns            `true` upon success, or `false` upon failure.
+    virtual bool write_deep_scanlines (int ybegin, int yend, int z,
+                                       const DeepData &deepdata);
+
+    /// Write the block of deep tiles that include all pixels in
+    /// the range
+    ///
+    ///     [xbegin,xend) X [ybegin,yend) X [zbegin,zend)
+    ///
+    /// The begin/end pairs must correctly delineate tile boundaries, with
+    /// the exception that it may also be the end of the image data if the
+    /// image resolution is not a whole multiple of the tile size.
+    ///
+    /// @param  xbegin/xend The x range of the pixels covered by the group
+    ///                     of tiles passed.
+    /// @param  ybegin/yend The y range of the pixels covered by the tiles.
+    /// @param  zbegin/zend The z range of the pixels covered by the tiles
+    ///                     (for a 2D image, zbegin=0 and zend=1).
+    /// @param  deepdata    A `DeepData` object with the data for the tiles.
+    /// @returns            `true` upon success, or `false` upon failure.
+    ///
+    /// @note The call will fail if the image is not tiled, or if the pixel
+    /// ranges do not fall along tile (or image) boundaries, or if it is not
+    /// a valid tile range.
+    virtual bool write_deep_tiles (int xbegin, int xend, int ybegin, int yend,
+                                   int zbegin, int zend,
+                                   const DeepData &deepdata);
+
+    /// Write the entire deep image described by `deepdata`. Depending on
+    /// the spec, this will write either all tiles or all scanlines.
+    ///
+    /// @param  deepdata    A `DeepData` object with the data for the image.
+    /// @returns            `true` upon success, or `false` upon failure.
+    virtual bool write_deep_image (const DeepData &deepdata);
+
+    /// Specify a reduced-resolution ("thumbnail") version of the image.
+    /// Note that many image formats may require the thumbnail to be
+    /// specified prior to writing the pixels.
+    ///
+    /// @param thumb
+    ///         A reference to an `ImageBuf` containing the thumbnail image.
+    /// @returns
+    ///         `true` upon success, `false` if it was not possible to write
+    ///         the thumbnail, or if this file format (or writer) does not
+    ///         support thumbnails.
+    ///
+    /// @note This method was added to OpenImageIO 2.3.
+    virtual bool set_thumbnail(const ImageBuf& thumb) { return false; }
+
+    /// @}
+
+    /// @{
+    /// @name Writing pixels (unsafe methods with pointers and strides)
+    ///
+    /// These methods are the "unsafe" versions of the `write` methods, which
+    /// take raw pointers and strides.  They are provided for backwards
+    /// compatibility with older code, but the preferred interface is to use
+    /// the `write` methods that take `image_span<const T>` or `cspan<T>`
+    /// arguments, which are bounds-safe and type-aware.
+    ///
+    /// These pointer-based versions are considered "soft-deprecated" in
+    /// OpenImageIO 3.1, will be marked/warned as deprecated in 3.2, and will
+    /// be removed in 4.0.
     ///
     /// Common features of all the `write` methods:
     ///
@@ -2352,63 +3163,6 @@ public:
                               ProgressCallback progress_callback=nullptr,
                               void *progress_callback_data=nullptr);
 
-    /// Write deep scanlines containing pixels (*,y,z), for all y in the
-    /// range [ybegin,yend), to a deep file. This will fail if it is not a
-    /// deep file.
-    ///
-    /// @param  ybegin/yend The y range of the scanlines being passed.
-    /// @param  z           The z coordinate of the scanline.
-    /// @param  deepdata    A `DeepData` object with the data for these
-    ///                     scanlines.
-    /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool write_deep_scanlines (int ybegin, int yend, int z,
-                                       const DeepData &deepdata);
-
-    /// Write the block of deep tiles that include all pixels in
-    /// the range
-    ///
-    ///     [xbegin,xend) X [ybegin,yend) X [zbegin,zend)
-    ///
-    /// The begin/end pairs must correctly delineate tile boundaries, with
-    /// the exception that it may also be the end of the image data if the
-    /// image resolution is not a whole multiple of the tile size.
-    ///
-    /// @param  xbegin/xend The x range of the pixels covered by the group
-    ///                     of tiles passed.
-    /// @param  ybegin/yend The y range of the pixels covered by the tiles.
-    /// @param  zbegin/zend The z range of the pixels covered by the tiles
-    ///                     (for a 2D image, zbegin=0 and zend=1).
-    /// @param  deepdata    A `DeepData` object with the data for the tiles.
-    /// @returns            `true` upon success, or `false` upon failure.
-    ///
-    /// @note The call will fail if the image is not tiled, or if the pixel
-    /// ranges do not fall along tile (or image) boundaries, or if it is not
-    /// a valid tile range.
-    virtual bool write_deep_tiles (int xbegin, int xend, int ybegin, int yend,
-                                   int zbegin, int zend,
-                                   const DeepData &deepdata);
-
-    /// Write the entire deep image described by `deepdata`. Depending on
-    /// the spec, this will write either all tiles or all scanlines.
-    ///
-    /// @param  deepdata    A `DeepData` object with the data for the image.
-    /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool write_deep_image (const DeepData &deepdata);
-
-    /// Specify a reduced-resolution ("thumbnail") version of the image.
-    /// Note that many image formats may require the thumbnail to be
-    /// specified prior to writing the pixels.
-    ///
-    /// @param thumb
-    ///         A reference to an `ImageBuf` containing the thumbnail image.
-    /// @returns
-    ///         `true` upon success, `false` if it was not possible to write
-    ///         the thumbnail, or if this file format (or writer) does not
-    ///         support thumbnails.
-    ///
-    /// @note This method was added to OpenImageIO 2.3.
-    virtual bool set_thumbnail(const ImageBuf& thumb) { return false; }
-
     /// @}
 
     /// Read the pixels of the current subimage of `in`, and write it as the
@@ -2471,12 +3225,22 @@ public:
     std::string geterror(bool clear = true) const;
 
     /// Error reporting for the plugin implementation: call this with
+    /// std::format-like arguments. It is not necessary to have the error
+    /// message contain a trailing newline.
+    template<typename... Args>
+    void errorfmt(const char* fmt, const Args&... args) const {
+        append_error(Strutil::fmt::format (fmt, args...));
+    }
+
+#if OIIO_DISABLE_DEPRECATED < OIIO_MAKE_VERSION(2, 6, 3) && \
+    !defined(OIIO_INTERNAL) && !defined(OIIO_DOXYGEN)
+    /// Error reporting for the plugin implementation: call this with
     /// `Strutil::format`-like arguments. It is not necessary to have the
     /// error message contain a trailing newline.
     /// Use with caution! Some day this will change to be fmt-like rather
     /// than printf-like.
     template<typename... Args>
-    OIIO_FORMAT_DEPRECATED
+    OIIO_DEPRECATED("use errorfmt instead, with std::format-like arguments (3.0)")
     void error(const char* fmt, const Args&... args) const {
         append_error(Strutil::format (fmt, args...));
     }
@@ -2485,26 +3249,20 @@ public:
     /// printf-like arguments. It is not necessary to have the error message
     /// contain a trailing newline.
     template<typename... Args>
+    OIIO_DEPRECATED("use errorfmt instead, with std::format-like arguments (3.0)")
     void errorf(const char* fmt, const Args&... args) const {
         append_error(Strutil::sprintf (fmt, args...));
-    }
-
-    /// Error reporting for the plugin implementation: call this with
-    /// std::format-like arguments. It is not necessary to have the error
-    /// message contain a trailing newline.
-    template<typename... Args>
-    void errorfmt(const char* fmt, const Args&... args) const {
-        append_error(Strutil::fmt::format (fmt, args...));
     }
 
     // Error reporting for the plugin implementation: call this with
     // std::format-like arguments. It is not necessary to have the error
     // message contain a trailing newline.
     template<typename... Args>
-    OIIO_DEPRECATED("use `errorfmt` instead")
+    OIIO_DEPRECATED("use `errorfmt` instead (2.3)")
     void fmterror(const char* fmt, const Args&... args) const {
         append_error(Strutil::fmt::format (fmt, args...));
     }
+#endif
 
     /// Set the threading policy for this ImageOutput, controlling the
     /// maximum amount of parallelizing thread "fan-out" that might occur
@@ -2532,6 +3290,16 @@ public:
     /// Call signature of a function that creates and returns an
     /// `ImageOutput*`.
     typedef ImageOutput* (*Creator)();
+
+    /// Memory tracking method.
+    /// Return the total heap memory allocated by `ImageOutput`.
+    /// Overridable version of heapsize defined in memory.h.
+    virtual size_t heapsize() const;
+
+    /// Memory tracking method.
+    /// Return the total memory footprint of `ImageOutput`.
+    /// Overridable version of footprint defined in memory.h.
+    virtual size_t footprint() const;
 
 protected:
     /// @{
@@ -2663,6 +3431,46 @@ protected:
                                      unsigned int dither=0,
                                      int xorigin=0, int yorigin=0, int zorigin=0);
 
+    // clang-format on
+
+    /// Helper routine used by write_* implementations: convert data (in
+    /// the given format and strides) to the "native" format of the file
+    /// (described by the 'spec' member variable), in contiguous order. This
+    /// requires a scratch space to be passed in so that there are no memory
+    /// leaks.  Returns a span referring to the native data, which may be the
+    /// original data if it was already in native format and contiguous, or
+    /// it may point to the scratch space if it needed to make a copy or do
+    /// conversions. For float->uint8 conversions only, if dither is
+    /// nonzero, random dither will be added to reduce quantization banding
+    /// artifacts; in this case, the specific nonzero dither value is used
+    /// as a seed for the hash function that produces the per-pixel dither
+    /// amounts, and the optional [xyz]origin parameters help it to align
+    /// the pixels to the right position in the dither pattern.
+    template<typename T>
+    cspan<std::byte> to_native(int xbegin, int xend, int ybegin, int yend,
+                               int zbegin, int zend, const image_span<T>& data,
+                               std::vector<unsigned char>& scratch,
+                               unsigned int dither = 0, int xorigin = 0,
+                               int yorigin = 0, int zorigin = 0)
+    {
+        auto ispan = image_span<T>(data.data(), m_spec.nchannels, xend - xbegin,
+                                   yend - ybegin, zend - zbegin);
+        OIIO_DASSERT(data.size_bytes() == ispan.size_bytes()
+                     && ispan.is_contiguous());
+        return to_native(xbegin, xend, ybegin, yend, zbegin, zend, ispan,
+                         scratch, dither, xorigin, yorigin, zorigin);
+    }
+
+    /// This version of the to_native helper takes an explicit data type
+    /// `format` and an image_span of generic (std::byte) data.
+    cspan<std::byte> to_native(int xbegin, int xend, int ybegin, int yend,
+                               int zbegin, int zend, TypeDesc format,
+                               const image_span<const std::byte>& data,
+                               std::vector<unsigned char>& scratch,
+                               unsigned int dither = 0, int xorigin = 0,
+                               int yorigin = 0, int zorigin = 0);
+    // clang-format off
+
     /// Helper function to copy a rectangle of data into the right spot in
     /// an image-sized buffer. In addition to copying to the right place,
     /// this handles data format conversion and dither (if the spec's
@@ -2755,7 +3563,25 @@ private:
     std::unique_ptr<Impl, decltype(&impl_deleter)> m_impl;
 
     void append_error(string_view message) const; // add to m_errmessage
+
+    /// declare friend heapsize and footprint definitions
+    template <typename T> friend size_t pvt::heapsize(const T&);
 };
+
+
+
+/// Memory tracking. Specializes the base memory tracking functions from memory.h.
+
+// heapsize specialization for `ImageSpec`
+template <> OIIO_API size_t pvt::heapsize<ImageSpec>(const ImageSpec&);
+
+// heapsize and footprint specializations for `ImageInput`
+template <> OIIO_API size_t pvt::heapsize<ImageInput>(const ImageInput&);
+template <> OIIO_API size_t pvt::footprint<ImageInput>(const ImageInput&);
+
+// heapsize and footprint specializations for `ImageOutput`
+template <> OIIO_API size_t pvt::heapsize<ImageOutput>(const ImageOutput&);
+template <> OIIO_API size_t pvt::footprint<ImageOutput>(const ImageOutput&);
 
 
 
@@ -2918,6 +3744,21 @@ OIIO_API std::string geterror(bool clear = true);
 ///    When nonzero, use the new "OpenEXR core C library" when available,
 ///    for OpenEXR >= 3.1. This is experimental, and currently defaults to 0.
 ///
+/// - `int jpeg:com_attributes`
+///
+///    When nonzero, try to parse JPEG comment blocks as key-value attributes,
+///    and only set ImageDescription if the parsing fails. Otherwise, always
+///    set ImageDescription to the first comment block. Default is 1.
+///
+/// - `int png:linear_premult` (0)
+///
+///    If nonzero, will convert perform any necessary premultiplication by
+///    alpha steps needed of the PNG reader/writer in a linear color space.
+///    If zero (the default), any needed premultiplication will happen
+///    directly on the values, even if they are sRGB or gamma-corrected.
+///    For more information, please see OpenImageIO's documentation on the
+///    built-in PNG format support.
+///
 /// - `int limits:channels` (1024)
 ///
 ///    When nonzero, the maximum number of color channels in an image. Image
@@ -2990,6 +3831,17 @@ OIIO_API std::string geterror(bool clear = true);
 ///   If nonzero, an `ImageBuf` that references a file but is not given an
 ///   ImageCache will read the image through the default ImageCache.
 ///
+/// - `imageinput:strict` (int: 0)
+///
+///   If zero (the default), ImageInput readers will try to be very tolerant
+///   of minor flaws or invalidity in image files being read, if possible just
+///   skipping something erroneous it encounters in the hopes that the rest of
+///   the file's data will be usable. If nonzero, anything clearly invalid in
+///   the file will be understood to be a corrupt file with unreliable data at
+///   best, and possibly malicious construction, and so will not attempt to
+///   further decode anything in the file. This may be a better choice to
+///   enable globally in an environment where security is a higher priority
+///   than being tolerant of partially broken image files.
 OIIO_API bool attribute(string_view name, TypeDesc type, const void* val);
 
 /// Shortcut attribute() for setting a single integer.
@@ -3055,6 +3907,21 @@ inline bool attribute (string_view name, string_view val) {
 ///   full paths), and all the directories that OpenImageIO will search for
 ///   fonts.  (Added in OpenImageIO 2.5)
 ///
+/// - `string font_family_list`
+///
+///   A semicolon-separated list of all the font family names that
+///   OpenImageIO can find.  (Added in OpenImageIO 3.0)
+///
+/// - `string font_style_list:family`
+///
+///   A semicolon-separated list of all the font style names that
+///   belong to the given font family.  (Added in OpenImageIO 3.0)
+///
+/// - `string font_filename:family:style`
+///
+///   The font file (with full path) that defines the given font
+///   family and style.  (Added in OpenImageIO 3.0)
+///
 /// - `string filter_list`
 ///
 ///   A semicolon-separated list of all built-in 2D filters. (Added in
@@ -3080,12 +3947,6 @@ inline bool attribute (string_view name, string_view val) {
 ///   Returns the version (such as "2.2.0") of OpenColorIO that is used by
 ///   OpenImageiO, or "0.0.0" if no OpenColorIO support has been enabled.
 ///   (Added in OpenImageIO 2.4.6)
-///
-/// - `int opencv_version`
-///
-///   Returns the encoded version (such as 40701 for 4.7.1) of the OpenCV that
-///   is used by OpenImageIO, or 0 if no OpenCV support has been enabled.
-///   (Added in OpenImageIO 2.5.2)
 ///
 /// - `string hw:simd`
 /// - `string build:simd` (read-only)
@@ -3113,7 +3974,7 @@ inline bool attribute (string_view name, string_view val) {
 ///   List of library dependencieis (where known) and versions, separatd by
 ///   semicolons. (Added in OpenImageIO 2.5.8.)
 ///
-/// - `float resident_memory_used_MB`
+/// - `int resident_memory_used_MB`
 ///
 ///   This read-only attribute can be used for debugging purposes to report
 ///   the approximate process memory used (resident) by the application, in
@@ -3185,6 +4046,33 @@ inline string_view get_string_attribute (string_view name,
 }
 
 
+/// Set the metadata of the `spec` to presume that color space is `name` (or
+/// to assume nothing about the color space if `name` is empty). The core
+/// operation is to set the "oiio:ColorSpace" attribute, but it also removes
+/// or alters several other attributes that may hint color space in ways that
+/// might be contradictory or no longer true. This uses the current default
+/// color config to adjudicate color space name equivalencies.
+///
+/// @version 3.0
+OIIO_API void set_colorspace(ImageSpec& spec, string_view name);
+
+/// Set the metadata of the `spec` to reflect Rec709 color primaries and the
+/// given gamma. The core operation is to set the "oiio:ColorSpace" attribute,
+/// but it also removes or alters several other attributes that may hint color
+/// space in ways that might be contradictory or no longer true. This uses the
+/// current default color config to adjudicate color space name equivalencies.
+///
+/// @version 3.0
+OIIO_API void set_colorspace_rec709_gamma(ImageSpec& spec, float gamma);
+
+
+/// Are the two named color spaces equivalent, based on the default color
+/// config in effect?
+///
+/// @version 3.0
+OIIO_API bool equivalent_colorspace(string_view a, string_view b);
+
+
 /// Register the input and output 'create' routines and list of file
 /// extensions for a particular format.
 OIIO_API void declare_imageio_format (const std::string &format_name,
@@ -3230,10 +4118,23 @@ get_extension_map()
 OIIO_API bool convert_pixel_values (TypeDesc src_type, const void *src,
                                     TypeDesc dst_type, void *dst, int n = 1);
 
-/// DEPRECATED(2.1): old name
-inline bool convert_types (TypeDesc src_type, const void *src,
-                           TypeDesc dst_type, void *dst, int n = 1) {
-    return convert_pixel_values (src_type, src, dst_type, dst, n);
+/// Helper function: copy values from spans `src` to `dst`, converting between
+/// types as appropriate. Return true if ok, false if it didn't know how to do
+/// the conversion.
+///
+/// The conversion is of normalized (pixel-like) values -- for example 'UINT8'
+/// 255 will convert to float 1.0 and vice versa, not float 255.0. If you want
+/// a straight C-like data cast conversion (e.g., uint8 255 -> float 255.0),
+/// then you should prefer the un-normalized convert_type() utility function
+/// found in typedesc.h.
+template<typename SrcType, typename DstType>
+bool
+convert_pixel_values(cspan<SrcType> src, span<DstType> dst)
+{
+    OIIO_DASSERT(dst.size() >= src.size());
+    return convert_pixel_values(TypeDescFromC_v<SrcType>, src.data(),
+                                TypeDescFromC_v<DstType>, dst.data(),
+                                std::min(dst.size(), src.size()));
 }
 
 
@@ -3253,18 +4154,50 @@ OIIO_API bool convert_image (int nchannels, int width, int height, int depth,
                              void *dst, TypeDesc dst_type,
                              stride_t dst_xstride, stride_t dst_ystride,
                              stride_t dst_zstride);
-/// DEPRECATED(2.0) -- the alpha_channel, z_channel were never used
-inline bool convert_image(int nchannels, int width, int height, int depth,
-            const void *src, TypeDesc src_type,
-            stride_t src_xstride, stride_t src_ystride, stride_t src_zstride,
-            void *dst, TypeDesc dst_type,
-            stride_t dst_xstride, stride_t dst_ystride, stride_t dst_zstride,
-            int /*alpha_channel*/, int /*z_channel*/ = -1)
+
+/// Helper routine for data conversion: Convert an image described by
+/// image_span `src` into image_span `dst`, which must be the same dimensions
+/// but possibly differing data type and strides.  Clever use of this function
+/// can not only exchange data among different formats (e.g., half to 8-bit
+/// unsigned), but also can copy selective channels, copy subimages, etc.
+/// Return true if ok, false if it didn't know how to do the conversion.
+template<typename SrcType, typename DstType>
+bool
+convert_image(const image_span<SrcType>& src, const image_span<DstType>& dst)
 {
-    return convert_image(nchannels, width, height, depth, src, src_type,
-                         src_xstride, src_ystride, src_zstride, dst, dst_type,
-                         dst_xstride, dst_ystride, dst_zstride);
+    // For now, just implement by wrapping the pointer-based version.
+    OIIO_DASSERT(src.nchannels() == dst.nchannels()
+                 && src.width() == dst.width() && src.height() == dst.height()
+                 && src.depth() == dst.depth());
+    return convert_image(src.nchannels(), src.width(), src.height(),
+                         src.depth(), src.data(), TypeDescFromC_v<SrcType>,
+                         src.xstride(), src.ystride(), src.zstride(),
+                         dst.data(), TypeDescFromC_v<DstType>, dst.xstride(),
+                         dst.ystride(), dst.zstride());
 }
+
+
+/// Helper routine for data conversion: Convert an image described by
+/// image_span `src` into image_span `dst`, which must be the same dimensions
+/// but possibly differing data type and strides. The data types are passed as
+/// `TypeDesc`, and the spans are untyped bytes that provide the dimensions
+/// and memory layout.
+inline bool
+convert_image(const image_span<const std::byte>& src, TypeDesc src_type,
+              const image_span<std::byte>& dst, TypeDesc dst_type)
+{
+    // For now, just implement by wrapping the pointer-based version.
+    OIIO_DASSERT(src.nchannels() == dst.nchannels()
+                 && src.width() == dst.width() && src.height() == dst.height()
+                 && src.depth() == dst.depth());
+    OIIO_DASSERT(src_type.size() == src.chansize()
+                 && dst_type.size() == dst.chansize());
+    return convert_image(src.nchannels(), src.width(), src.height(),
+                         src.depth(), src.data(), src_type, src.xstride(),
+                         src.ystride(), src.zstride(), dst.data(), dst_type,
+                         dst.xstride(), dst.ystride(), dst.zstride());
+}
+
 
 
 /// A version of convert_image that will break up big jobs into multiple
@@ -3277,19 +4210,49 @@ OIIO_API bool parallel_convert_image (
                void *dst, TypeDesc dst_type,
                stride_t dst_xstride, stride_t dst_ystride,
                stride_t dst_zstride, int nthreads=0);
-/// DEPRECATED(2.0) -- the alpha_channel, z_channel were never used
-inline bool parallel_convert_image(
-            int nchannels, int width, int height, int depth,
-            const void *src, TypeDesc src_type,
-            stride_t src_xstride, stride_t src_ystride, stride_t src_zstride,
-            void *dst, TypeDesc dst_type,
-            stride_t dst_xstride, stride_t dst_ystride, stride_t dst_zstride,
-            int /*alpha_channel*/, int /*z_channel*/, int nthreads=0)
+
+/// A version of convert_image that will break up big jobs into multiple
+/// threads. The data types are taken from the spans.
+template<typename SrcType, typename DstType>
+bool
+parallel_convert_image(const image_span<SrcType>& src,
+                       const image_span<DstType>& dst, int nthreads = 0)
 {
-    return parallel_convert_image (nchannels, width, height, depth,
-           src, src_type, src_xstride, src_ystride, src_zstride,
-           dst, dst_type, dst_xstride, dst_ystride, dst_zstride, nthreads);
+    // For now, just implement by wrapping the pointer-based version.
+    OIIO_DASSERT(src.nchannels() == dst.nchannels()
+                 && src.width() == dst.width() && src.height() == dst.height()
+                 && src.depth() == dst.depth());
+    return parallel_convert_image(src.nchannels(), src.width(), src.height(),
+                                  src.depth(), src.data(),
+                                  TypeDescFromC_v<SrcType>, src.xstride(),
+                                  src.ystride(), src.zstride(), dst.data(),
+                                  TypeDescFromC_v<SrcType>, dst.xstride(),
+                                  dst.ystride(), dst.zstride(), nthreads);
 }
+
+/// A version of convert_image that will break up big jobs into multiple
+/// threads. The data types are passed as `TypeDesc`, and the spans are
+/// untyped bytes that provide the dimensions and memory layout.
+inline bool
+parallel_convert_image(const image_span<const std::byte>& src,
+                       TypeDesc src_type, const image_span<std::byte>& dst,
+                       TypeDesc dst_type, int nthreads = 0)
+{
+    // For now, just implement by wrapping the pointer-based version.
+    OIIO_DASSERT(src.nchannels() == dst.nchannels()
+                 && src.width() == dst.width() && src.height() == dst.height()
+                 && src.depth() == dst.depth());
+    OIIO_DASSERT(src_type.size() == src.chansize()
+                 && dst_type.size() == dst.chansize());
+    return parallel_convert_image(src.nchannels(), src.width(), src.height(),
+                                  src.depth(), src.data(),
+                                  src_type, src.xstride(),
+                                  src.ystride(), src.zstride(), dst.data(),
+                                  dst_type, dst.xstride(),
+                                  dst.ystride(), dst.zstride(), nthreads);
+}
+
+
 
 /// Add random [-ditheramplitude,ditheramplitude] dither to the color channels
 /// of the image.  Dither will not be added to the alpha or z channel.  The
@@ -3324,12 +4287,49 @@ OIIO_API void premult (int nchannels, int width, int height, int depth,
 /// AutoStride for any of the stride values, and they will be
 /// auto-computed assuming contiguous data.  Return true if ok, false if
 /// it didn't know how to do the conversion.
+///
+/// Note: when possible, the image_span based copy_image should be preferred.
+/// This one will eventually be deprecated.
 OIIO_API bool copy_image (int nchannels, int width, int height, int depth,
                           const void *src, stride_t pixelsize,
                           stride_t src_xstride, stride_t src_ystride,
                           stride_t src_zstride,
                           void *dst, stride_t dst_xstride,
                           stride_t dst_ystride, stride_t dst_zstride);
+
+/// Helper routine for data conversion: Copy the contents of the `src` image
+/// span to `dst` that has exactly the same dimensions but may have different
+/// strides. Return true if ok, false if it couldn't do it. (Reserved for
+/// future use; currently is always succeeds)
+template<typename D, size_t Drank, typename S, size_t Srank>
+bool copy_image(const image_span<D, Drank>& dst,
+                const image_span<S, Srank>& src)
+{
+    // Arbitrary types are handled by just converting to generic byte
+    // image_spans.
+    return copy_image(as_image_span_writable_bytes(dst),
+                      as_image_span_bytes(src));
+}
+
+/// copy_image base case: generic span of bytes.
+OIIO_API bool
+copy_image(const image_span<std::byte> &dst,
+           const image_span<const std::byte>& src);
+
+
+
+/// Helper: manufacture a span given an image pointer, format, size, and
+/// strides. Use with caution! This is making a lot of assumptions that the
+/// data pointer really does point to memory that's ok to access according to
+/// the sizes and strides you give.
+OIIO_API span<std::byte>
+span_from_buffer(void* data, TypeDesc format, int nchannels, int width,
+                 int height, int depth, stride_t xstride = AutoStride, stride_t ystride = AutoStride,
+                 stride_t zstride = AutoStride);
+OIIO_API cspan<std::byte>
+cspan_from_buffer(const void* data, TypeDesc format, int nchannels, int width,
+                 int height, int depth, stride_t xstride = AutoStride, stride_t ystride = AutoStride,
+                 stride_t zstride = AutoStride);
 
 
 // All the wrap_foo functions implement a wrap mode, wherein coord is
@@ -3361,18 +4361,58 @@ void debugfmt (const char* fmt, Args&&... args)
     Strutil::debug(fmt, std::forward<Args>(args)...);
 }
 
+namespace pvt {
+// For internal use - use errorfmt() below for a nicer interface.
+OIIO_API void append_error(string_view message);
+}
+
+/// error logging (mostly for OIIO internals) with `std::format` conventions.
+template<typename... Args>
+inline void errorfmt(const char* fmt, Args&&... args)
+{
+    pvt::append_error(string_view(Strutil::fmt::format(fmt, args...)));
+}
+
+/// Internal function to log time recorded by an OIIO::timer(). It will only
+/// trigger a read of the time if the "log_times" attribute is set or the
+/// OPENIMAGEIO_LOG_TIMES env variable is set.
+OIIO_API void log_time(string_view key, const Timer& timer, int count = 1);
+
+// to force correct linkage on some systems
+OIIO_API void _ImageIO_force_link ();
+
+
+//////////////////////////////////////////////////////////////////////////
+// DEPRECATED things
+//
+// These are all hidden from ocumentation and internal use, and should trigger
+// deprecation warnings if used externally. They will most likely be removed
+// entirely before the final release of OIIO 3.0.
+//
+#if !defined(OIIO_INTERNAL) && !defined(OIIO_DOXYGEN)
+
+#if OIIO_DISABLE_DEPRECATED < OIIO_MAKE_VERSION(2, 1, 0)
+// DEPRECATED(2.1): old name
+OIIO_DEPRECATED("use convert_pixel_values instead (2.1)")
+inline bool convert_types (TypeDesc src_type, const void *src,
+                           TypeDesc dst_type, void *dst, int n = 1) {
+    return convert_pixel_values (src_type, src, dst_type, dst, n);
+}
+#endif
+
+#if OIIO_DISABLE_DEPRECATED < OIIO_MAKE_VERSION(2, 6, 3)
 // (Unfortunate old synonym)
 template<typename... Args>
 OIIO_DEPRECATED("use `debugfmt` instead")
-void fmtdebug (const char* fmt, const Args&... args)
+inline void fmtdebug (const char* fmt, const Args&... args)
 {
     debug (Strutil::fmt::format(fmt, args...));
 }
 
 /// debug output with printf conventions.
 template<typename... Args>
-OIIO_FORMAT_DEPRECATED
-void debugf (const char* fmt, const Args&... args)
+OIIO_DEPRECATED("use `debugfmt` instead, with std::format-like arguments (3.0)")
+inline void debugf (const char* fmt, const Args&... args)
 {
     debug (Strutil::sprintf(fmt, args...));
 }
@@ -3380,15 +4420,16 @@ void debugf (const char* fmt, const Args&... args)
 /// debug output with the same conventions as Strutil::format. Beware, this
 /// will change one day!
 template<typename T1, typename... Args>
-OIIO_FORMAT_DEPRECATED
-void debug (const char* fmt, const T1& v1, const Args&... args)
+OIIO_DEPRECATED("use `debugfmt` instead, with std::format-like arguments (3.0)")
+inline void debug (const char* fmt, const T1& v1, const Args&... args)
 {
     debug (Strutil::format(fmt, v1, args...));
 }
+#endif
 
-
-// to force correct linkage on some systems
-OIIO_API void _ImageIO_force_link ();
+#endif
+//
+//////////////////////////////////////////////////////////////////////////
 
 OIIO_NAMESPACE_END
 

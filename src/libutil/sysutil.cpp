@@ -34,9 +34,11 @@
 
 #ifdef __APPLE__
 #    include <TargetConditionals.h>
+#    include <crt_externs.h>
 #    include <mach-o/dyld.h>
 #    include <mach/mach_init.h>
 #    include <mach/task.h>
+#    include <spawn.h>
 #    include <sys/ioctl.h>
 #    include <sys/sysctl.h>
 #    include <unistd.h>
@@ -296,15 +298,6 @@ Sysutil::getenv(string_view name, string_view defaultval)
 
 
 
-string_view
-Sysutil::getenv(string_view name)
-{
-    const char* env = ::getenv(std::string(name).c_str());
-    return string_view(env ? env : "");
-}
-
-
-
 void
 Sysutil::usleep(unsigned long useconds)
 {
@@ -532,70 +525,55 @@ Term::ansi_bgcolor(int r, int g, int b)
     return ret;
 }
 
-
-
 bool
-#ifdef _WIN32
-Sysutil::put_in_background(int, char*[])
-#else
-Sysutil::put_in_background(int argc, char* argv[])
-#endif
+Sysutil::put_in_background()
 {
-    // You would think that this would be sufficient:
-    //   pid_t pid = fork ();
-    //   if (pid < 0)       // Some kind of error, we were unable to background
-    //      return false;
-    //   if (pid == 0)
-    //       return true;   // This is the child process, so continue with life
-    //   // Otherwise, this is the parent process, so terminate
-    //   exit (0);
-    // But it's not.  On OS X, it's not safe to fork() if your app is linked
-    // against certain libraries or frameworks.  So the only thing that I
-    // think is safe is to exec a new process.
-    // Another solution is this:
-    //    daemon (1, 1);
-    // But it suffers from the same problem on OS X, and seems to just be
-    // a wrapper for fork.
-
 #if defined(__linux__) || defined(__GLIBC__)
     // Simplest case:
     // daemon returns 0 if successful, thus return true if successful
     return daemon(1, 1) == 0;
-#endif
 
-#if defined(__APPLE__) && TARGET_OS_OSX
-    std::string newcmd = std::string(argv[0]) + " -F";
-    for (int i = 1; i < argc; ++i) {
-        newcmd += " \"";
-        newcmd += argv[i];
-        newcmd += "\"";
+#elif defined(__APPLE__) && TARGET_OS_OSX
+    // On macOS, check if the parent process is launchd (PID 1).
+    // If getppid() == 1, the current process is already detached from the shell
+    // and running in the background. Returning early prevents spawning
+    // another background process, avoiding infinite recursion.
+    if (getppid() == 1) {
+        return true;
     }
-    newcmd += " &";
-    if (system(newcmd.c_str()) != -1)
+    pid_t pid;
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    char** argv    = *_NSGetArgv();
+    char** environ = *_NSGetEnviron();
+    int status     = posix_spawn(&pid, argv[0], nullptr, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    if (status == 0)
         exit(0);
-    return true;
-#endif
 
-#ifdef _WIN32
     return true;
-#endif
 
+#elif defined(_WIN32)
+    return true;
+
+#else
     // Otherwise, we don't know what to do
     return false;
+#endif
+}
+
+
+bool
+Sysutil::put_in_background(int argc, char* argv[])
+{
+    return put_in_background();
 }
 
 
 
 unsigned int
 Sysutil::hardware_concurrency()
-{
-    return std::thread::hardware_concurrency();
-}
-
-
-
-unsigned int
-Sysutil::physical_concurrency()
 {
     return std::thread::hardware_concurrency();
 }

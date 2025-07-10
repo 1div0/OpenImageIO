@@ -27,7 +27,7 @@ public:
     const char* format_name(void) const override { return "ico"; }
     int supports(string_view feature) const override
     {
-        return feature == "ioproxy";
+        return (feature == "ioproxy" || feature == "multiimage");
     }
     bool open(const std::string& name, ImageSpec& newspec) override;
     bool open(const std::string& name, ImageSpec& newspec,
@@ -138,7 +138,7 @@ ICOInput::open(const std::string& name, ImageSpec& newspec,
         swap_endian(&m_ico.count);
     }
     if (m_ico.reserved != 0 || m_ico.type != 1) {
-        errorf("File failed ICO header check");
+        errorfmt("File failed ICO header check");
         return false;
     }
 
@@ -190,6 +190,19 @@ ICOInput::seek_subimage(int subimage, int miplevel)
         swap_endian(&subimg.numColours);
     }
 
+    // some sanity checking
+    if (subimg.bpp != 1 && subimg.bpp != 4 && subimg.bpp != 8
+        && subimg.bpp != 16 && subimg.bpp != 24 && subimg.bpp != 32) {
+        errorfmt("Unsupported image color depth, probably corrupt file");
+        return false;
+    }
+    if (subimg.reserved != 0) {
+        errorfmt(
+            "Probably corrupt file (clue: header 'reserved' value should always be 0)",
+            subimg.reserved);
+        return false;
+    }
+
     ioseek(subimg.ofs, SEEK_SET);
 
     // test for a PNG icon
@@ -199,7 +212,7 @@ ICOInput::seek_subimage(int subimage, int miplevel)
     if (temp[1] == 'P' && temp[2] == 'N' && temp[3] == 'G') {
         // standard PNG initialization
         if (png_sig_cmp((png_bytep)temp, 0, 7)) {
-            errorf("Subimage failed PNG signature check");
+            errorfmt("Subimage failed PNG signature check");
             return false;
         }
 
@@ -207,7 +220,7 @@ ICOInput::seek_subimage(int subimage, int miplevel)
 
         std::string s = PNG_pvt::create_read_struct(m_png, m_info, this);
         if (s.length()) {
-            errorf("%s", s);
+            errorfmt("{}", s);
             return false;
         }
 
@@ -255,7 +268,7 @@ ICOInput::seek_subimage(int subimage, int miplevel)
         && m_bpp != 8
         /*&& m_bpp != 16*/
         && m_bpp != 24 && m_bpp != 32) {
-        errorf("Unsupported image color depth, probably corrupt file");
+        errorfmt("Unsupported image color depth, probably corrupt file");
         return false;
     }
     m_offset        = subimg.ofs;
@@ -291,7 +304,7 @@ ICOInput::readimg()
         //std::cerr << "[ico] PNG buffer size = " << m_buf.size () << "\n";
 
         if (s.length()) {
-            errorf("%s", s);
+            errorfmt("{}", s);
             return false;
         }
 

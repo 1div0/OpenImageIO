@@ -63,8 +63,10 @@ private:
         if (!ioread(buf, sizeof(T), nitems))
             return false;
         if (littleendian()
-            && (is_same<T, uint16_t>::value || is_same<T, int16_t>::value
-                || is_same<T, uint32_t>::value || is_same<T, int32_t>::value)) {
+            && (std::is_same<T, uint16_t>::value
+                || std::is_same<T, int16_t>::value
+                || std::is_same<T, uint32_t>::value
+                || std::is_same<T, int32_t>::value)) {
             swap_endian(buf, nitems);
         }
         return true;
@@ -276,7 +278,7 @@ RLAInput::seek_subimage(int subimage, int miplevel)
                             ? get_channel_typedesc(m_rla.AuxChannelType,
                                                    m_rla.NumOfAuxBits)
                             : TypeUnknown;
-    TypeDesc maxtype  = ImageBufAlgo::type_merge(col_type, mat_type, aux_type);
+    TypeDesc maxtype  = TypeDesc::basetype_merge(col_type, mat_type, aux_type);
     if (maxtype == TypeUnknown) {
         errorfmt("Failed channel bytes sanity check");
         return false;  // failed sanity check
@@ -400,13 +402,7 @@ RLAInput::seek_subimage(int subimage, int miplevel)
         // decisions based on known gamma values. For example, you want
         // 2.2, not 2.19998.
         gamma = roundf(100.0 * gamma) / 100.0f;
-        if (gamma == 1.f)
-            m_spec.attribute("oiio:ColorSpace", "Linear");
-        else {
-            m_spec.attribute("oiio:ColorSpace",
-                             Strutil::fmt::format("Gamma{:.2g}", gamma));
-            m_spec.attribute("oiio:Gamma", gamma);
-        }
+        set_colorspace_rec709_gamma(m_spec, gamma);
     }
 
     float aspect = Strutil::stof(m_rla.AspectRatio);
@@ -608,7 +604,15 @@ RLAInput::decode_channel_group(int first_channel, short num_channels,
     // OIIO conventions.
     if (num_bits == 8 || num_bits == 16 || num_bits == 32) {
         // ok -- no rescaling needed
-    } else if (num_bits == 10) {
+    }
+    int bytes_per_chan = ceil2(std::max(int(num_bits), 8)) / 8;
+    if (size_t(offset + (m_spec.width - 1) * pixelsize
+               + num_channels * bytes_per_chan)
+        > m_buf.size()) {
+        errorfmt("Probably corrupt file (buffer overrun avoided)");
+        return false;  // Probably corrupt? Would have overrun
+    }
+    if (num_bits == 10) {
         // fast, common case -- use templated hard-code
         for (int x = 0; x < m_spec.width; ++x) {
             uint16_t* b = (uint16_t*)(&m_buf[offset + x * pixelsize]);

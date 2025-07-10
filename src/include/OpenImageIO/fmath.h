@@ -79,19 +79,6 @@ OIIO_NAMESPACE_BEGIN
 #endif
 
 
-// Helper template to let us tell if two types are the same.
-// C++11 defines this, keep in OIIO namespace for back compat.
-// DEPRECATED(2.0) -- clients should switch OIIO::is_same -> std::is_same.
-using std::is_same;
-
-
-// For back compatibility: expose these in the OIIO namespace.
-// DEPRECATED(2.0) -- clients should switch OIIO:: -> std:: for these.
-using std::isfinite;
-using std::isinf;
-using std::isnan;
-
-
 // Define math constants just in case they aren't included (Windows is a
 // little finicky about this, only defining these if _USE_MATH_DEFINES is
 // defined before <cmath> is included, which is hard to control).
@@ -194,11 +181,6 @@ floor2(int x) noexcept
     // That's the power of two <= the original x
     return x & ~(x >> 1);
 }
-
-
-// Old names -- DEPRECATED(2.1)
-inline OIIO_HOSTDEVICE int pow2roundup(int x) { return ceil2(x); }
-inline OIIO_HOSTDEVICE int pow2rounddown(int x) { return floor2(x); }
 
 
 
@@ -686,9 +668,13 @@ sincos (double x, double* sine, double* cosine)
 }
 
 
-inline OIIO_HOSTDEVICE float sign (float x)
+
+/// Return -1 if x<0, 0 if x==0, 1 if x>0. For floating point types, this is
+/// not friendly to NaN inputs!
+template<typename T>
+inline OIIO_HOSTDEVICE T sign(T x)
 {
-    return x < 0.0f ? -1.0f : (x==0.0f ? 0.0f : 1.0f);
+    return x < T(0) ? T(-1) : (x == T(0) ? T(0) : T(1));
 }
 
 
@@ -771,7 +757,7 @@ scaled_conversion(const S& src, F scale, F min, F max)
 template<typename S, typename D>
 void convert_type (const S *src, D *dst, size_t n, D _min, D _max)
 {
-    if (std::is_same<S,D>::value) {
+    if constexpr (std::is_same<S,D>::value) {
         // They must be the same type.  Just memcpy.
         memcpy (dst, src, n*sizeof(D));
         return;
@@ -982,6 +968,25 @@ inline void convert_type (const S *src, D *dst, size_t n)
 
 
 
+/// Copy (type convert) consecutive values from the cspan `src` holding data
+/// of type S into the span `dst` holding the same number of elements of data
+/// of type D.
+///
+/// The conversion is not a simple cast, but correctly remaps the 0.0->1.0
+/// range from and to the full positive range of integral types. It's just a
+/// straight copy if both types are identical. Optional arguments `min` and
+/// `max` can give nonstandard quantizations.
+template<typename S, typename D>
+void convert_type (cspan<S> src, span<D> dst,
+                   D min = std::numeric_limits<D>::min(),
+                   D max = std::numeric_limits<D>::min())
+{
+    OIIO_DASSERT(src.size() == dst.size());
+    convert_type(src.data(), dst.data(), std::min(src.size(), dst.size()),
+                 min, max);
+}
+
+
 
 /// Convert a single value from the type of S to the type of D.
 /// The conversion is not a simple cast, but correctly remaps the
@@ -992,7 +997,7 @@ template<typename S, typename D>
 inline D
 convert_type (const S &src)
 {
-    if (std::is_same<S,D>::value) {
+    if constexpr (std::is_same<S,D>::value) {
         // They must be the same type.  Just return it.
         return (D)src;
     }
@@ -1128,18 +1133,20 @@ bit_pack(cspan<T> data, void* out, int outbits)
 /// will be stored in a successive out[i].
 template<typename T>
 inline void
-bit_unpack(int n, const unsigned char* in, int inbits, T* out)
+bit_unpack(cspan<unsigned char> in, int inbits, span<T> out)
 {
     static_assert(std::is_same<T,uint8_t>::value ||
                   std::is_same<T,uint16_t>::value ||
                   std::is_same<T,uint32_t>::value,
                   "bit_unpack must be unsigned int 8/16/32");
+    OIIO_DASSERT(in.size() * 8 >= inbits * out.size());
     OIIO_DASSERT(inbits >= 1 && inbits < 32);  // surely bugs if not
     // int highest = (1 << inbits) - 1;
+    size_t n = out.size();
     int B = 0, b = 0;
     // Invariant:
     // So far, we have used in[0..B-1] and the high b bits of in[B].
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) {
         long long val = 0;
         int valbits   = 0;  // bits so far we've accumulated in val
         while (valbits < inbits) {
@@ -1170,6 +1177,23 @@ bit_unpack(int n, const unsigned char* in, int inbits, T* out)
         }
         out[i] = val; //T((val * 0xff) / highest);
     }
+}
+
+
+
+/// Decode n packed inbits-bits values from in[...] into normal uint8,
+/// uint16, or uint32 representation of `T out[0..n-1]`. In other words,
+/// each successive `inbits` of `in` (allowing spanning of byte boundaries)
+/// will be stored in a successive out[i].
+/// Note that this is the "unsafe" raw pointer version, and we recommend
+/// instead using the span-based version.
+template<typename T>
+OIIO_DEPRECATED("Use span-based version")
+inline void
+bit_unpack(int n, const unsigned char* in, int inbits, T* out)
+{
+    return bit_unpack(cspan<unsigned char>(in, (n * inbits + 7) / 8),
+                      inbits, span<T>(out, n));
 }
 
 
@@ -1852,7 +1876,7 @@ template<typename T>
 OIIO_FORCEINLINE OIIO_HOSTDEVICE T fast_exp2 (const T& xval) {
     using namespace simd;
     typedef typename T::vint_t intN;
-#if OIIO_SIMD_SSE && !OIIO_MSVS_BEFORE_2022
+#if (OIIO_SIMD_SSE || OIIO_SIMD_NEON) && !OIIO_MSVS_BEFORE_2022
     // See float specialization for explanations
     T x = clamp (xval, T(-126.0f), T(126.0f));
     intN m (x); x -= T(m);

@@ -1,8 +1,13 @@
 #!/usr/bin/env python
+import os
+import shutil
 
 # Copyright Contributors to the OpenImageIO project.
 # SPDX-License-Identifier: Apache-2.0
 # https://github.com/AcademySoftwareFoundation/OpenImageIO
+
+redirect += " 2>&1"
+failureok = True
 
 # Create some test images we need
 command += oiiotool ("--create 320x240 3 -d uint8 -o black.tif")
@@ -41,6 +46,11 @@ command += oiiotool ("--pattern constant:color=.1,.2,.3 64x64+0+0 3 "
             + " --sub -d half -o sub.exr")
 command += oiiotool ("--pattern constant:color=.1,.2,.3 64x64+0+0 3 "
             + " --subc 0.1,0.1,0.1 -d half -o subc.exr")
+            
+# Test -- scale
+command += oiiotool ("--pattern fill:topleft=0,0,1:topright=0,1,0:bottomleft=1,0,1:bottomright=1,1,0 64x64 3"
+            + " --pattern fill:top=0:bottom=1 64x64 1"
+            + " --scale -o scale.exr")
 
 # test --mul of images
 command += oiiotool ("grey64.exr -pattern constant:color=1.5,1,0.5 64x64 3 --mul -o mul.exr")
@@ -180,6 +190,8 @@ command += oiiotool (
             " --pattern constant:color=0.5,0.0,0.0 128x128 3 --label B " +
             " --pop --pop --pop " +
             " R G --add -d half -o labeladd.exr")
+command += oiiotool ('-echo "This should make an error:" ' +
+                     '--create 1x1 3 --label 2hot2handle -o out.tif')
 
 # test subimages
 command += oiiotool ("--pattern constant:color=0.5,0.0,0.0 64x64 3 " +
@@ -228,6 +240,18 @@ command += oiiotool ("--missingfile checker box.tif missing.tif --over -o box_ov
 command += oiiotool ("--pattern fill:left=0,0,0:right=1,1,0 2x2 3 -d half -o dump.exr")
 command += oiiotool ("-echo dumpdata: --dumpdata dump.exr")
 command += oiiotool ("-echo dumpdata:C --dumpdata:C=data dump.exr")
+
+# Test --create-dir
+# Remove `folder1/` if it already exists in order to subsequent test run to pass
+root_folder = "folder1"
+if os.path.exists(root_folder) and os.path.isdir(root_folder):
+    shutil.rmtree(root_folder)
+
+# Validate -o failed due to missing directory `folder1/folder2/`
+command += oiiotool (f"--create 2x2 1 -o {root_folder}/folder2/out.tif")
+# Validate -o sucessed with flag `--create-dir` and `out.tif` is valid and inside directory `folder1/folder2/`
+command += oiiotool (f"--create-dir --create 2x2 1 -o {root_folder}/folder2/out.tif")
+command += oiiotool (f"--info {root_folder}/folder2/out.tif")
 
 # To add more tests, just append more lines like the above and also add
 # the new 'feature.tif' (or whatever you call it) to the outputs list,

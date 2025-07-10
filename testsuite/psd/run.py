@@ -8,9 +8,10 @@ redirect = ' >> out.txt 2>&1 '
 
 files = [ "psd_123.psd", "psd_123_nomaxcompat.psd", "psd_bitmap.psd",
           "psd_indexed_trans.psd", "psd_rgb_8.psd", "psd_rgb_16.psd",
-          "psd_rgb_32.psd", "psd_rgba_8.psd" ]
+          "psd_rgb_32.psd", "psd_rgba_8.psd", "psd_rgb_16_rle.psd" ]
 for f in files:
     command += info_command (OIIO_TESTSUITE_IMAGEDIR + "/" + f)
+    # command += oiiotool (OIIO_TESTSUITE_IMAGEDIR + f"/{f} -o ./{f}.tif")
 
 # Test unassociated alpha metadata
 command += info_command (OIIO_TESTSUITE_IMAGEDIR + "/psd_123.psd", extraargs="--no-autopremult")

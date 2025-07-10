@@ -4,13 +4,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # https://github.com/AcademySoftwareFoundation/OpenImageIO
 
+from __future__ import annotations
 
 import numpy
 import OpenImageIO as oiio
 
 
 # Print the contents of an ImageSpec
-def print_imagespec (spec, msg="") :
+def print_imagespec (spec: oiio.ImageSpec, msg="") :
     if msg != "" :
         print (str(msg))
     print ("  resolution (width,height,depth) = ", spec.width, spec.height, spec.depth)
@@ -76,9 +77,9 @@ try:
     print ("  channel_bytes(1) =", s.channel_bytes(1), "native", s.channel_bytes(1,True))
     print ("  channel_bytes(4) =", s.channel_bytes(4), "native", s.channel_bytes(4,True))
     print ("pixel bytes =", s.pixel_bytes(), "native", s.pixel_bytes(True))
-    print ("scanline bytes =", s.scanline_bytes(), "native", s.scanline_bytes(True))
-    print ("tile bytes =", s.tile_bytes(), "native", s.tile_bytes(True))
-    print ("image bytes =", s.image_bytes(), "native", s.image_bytes(True))
+    print ("scanline bytes =", s.scanline_bytes(), "native", s.scanline_bytes(True), "if uint16", s.scanline_bytes("uint16"))
+    print ("tile bytes =", s.tile_bytes(), "native", s.tile_bytes(True), "if uint16", s.tile_bytes("uint16"))
+    print ("image bytes =", s.image_bytes(), "native", s.image_bytes(True), "if uint16", s.image_bytes("uint16"))
     print ("tile pixels =", s.tile_pixels())
     print ("image_pixels =", s.image_pixels())
     print ("size_t_safe =", s.size_t_safe())
@@ -91,10 +92,10 @@ try:
     s.attribute ("foo_str", "blah")
     s.attribute ("foo_int", 14)
     s.attribute ("foo_float", 3.14)
-    s.attribute ("foo_vector", oiio.TypeDesc.TypeVector, (1, 0, 11))
-    s.attribute ("foo_matrix", oiio.TypeDesc.TypeMatrix,
+    s.attribute ("foo_vector", oiio.TypeVector, (1, 0, 11))
+    s.attribute ("foo_matrix", oiio.TypeMatrix,
                  (1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0, 1, 2, 3, 1))
-    s.attribute ("smpte:TimeCode", oiio.TypeDesc.TypeTimeCode, (18356486, 4294967295))
+    s.attribute ("smpte:TimeCode", oiio.TypeTimeCode, (18356486, 4294967295))
     s.attribute ("ucarr", "uint8[10]", numpy.array([49, 50, 51, 0, 0, 97, 98, 99, 1, 88], dtype='B'))
     s["delfoo_str"] =  "egg"
     s["delfoo_int"] = 29
@@ -175,9 +176,9 @@ try:
     oiio.attribute ("plugin_searchpath", "perfect")
     print ("get_string_attribute plugin_searchpath : ", oiio.get_string_attribute ("plugin_searchpath", "bad"))
     print ("get_int_attribute plugin_searchpath : ", oiio.get_int_attribute ("plugin_searchpath", 0))
-    print ("getattribute TypeString plugin_searchpath : ", oiio.getattribute ("plugin_searchpath", oiio.TypeDesc.TypeString))
-    print ("getattribute TypeFloat plugin_searchpath : ", oiio.getattribute ("plugin_searchpath", oiio.TypeDesc.TypeFloat))
-    print ("getattribute TypeString blahblah : ", oiio.getattribute ("blahblah", oiio.TypeDesc.TypeString))
+    print ("getattribute TypeString plugin_searchpath : ", oiio.getattribute ("plugin_searchpath", oiio.TypeString))
+    print ("getattribute TypeFloat plugin_searchpath : ", oiio.getattribute ("plugin_searchpath", oiio.TypeFloat))
+    print ("getattribute TypeString blahblah : ", oiio.getattribute ("blahblah", oiio.TypeString))
 
     print ("Done.")
 except Exception as detail:
