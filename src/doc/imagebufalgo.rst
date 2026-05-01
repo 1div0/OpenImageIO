@@ -152,6 +152,68 @@ the computation without spawning additional threads, which might tend to
 crowd out the other application threads.
 
 
+SIMD Performance and Data Types
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Many ImageBufAlgo operations use SIMD (Single Instruction, Multiple Data)
+optimizations powered by the Google Highway library to achieve significant
+performance improvements, particularly for integer image formats.
+
+**Integer Type Optimizations:**
+
+OpenImageIO treats all integer images as normalized Standard Dynamic Range
+(SDR) data:
+
+* Unsigned integers (``uint8``, ``uint16``, ``uint32``, ``uint64``) are
+  normalized to the [0.0, 1.0] range: ``float_value = int_value / max_value``
+* Signed integers (``int8``, ``int16``, ``int32``, ``int64``) are normalized
+  to approximately the [-1.0, 1.0] range: ``float_value = int_value / max_value``
+
+Most ImageBufAlgo operations convert integer data to float, perform the
+operation, and convert back. Highway SIMD provides 3-5x speedup for these
+operations compared to scalar code.
+
+**Scale-Invariant Operations:**
+
+Certain operations are *scale-invariant*, meaning they produce identical
+results whether performed on raw integers or normalized floats. For these
+operations, OpenImageIO uses native integer SIMD paths that avoid float
+conversion entirely, achieving 6-12x speedup (2-3x faster than the float
+promotion path):
+
+* ``add``, ``sub`` (with saturation)
+* ``min``, ``max``
+* ``abs``, ``absdiff``
+
+These optimizations automatically activate when all input and output images
+have matching integer types (e.g., all ``uint8``). When types differ or when
+mixing integer and float images, the standard float promotion path is used.
+
+**Controlling SIMD Optimizations:**
+
+Highway SIMD is enabled by default. To disable it globally::
+
+    OIIO::attribute("enable_hwy", 0);
+
+Or via environment variable::
+
+    export OPENIMAGEIO_ENABLE_HWY=0
+
+This is primarily useful for debugging or performance comparison. In normal
+use, the optimizations should remain enabled for best performance.
+
+**Performance Expectations:**
+
+Typical speedups with Highway SIMD (compared to scalar code):
+
+* Float operations: 3-5x faster
+* Integer operations (with float conversion): 3-5x faster
+* Integer scale-invariant operations (native int): 6-12x faster
+* Half-float operations: 3-5x faster
+
+Actual performance depends on the specific operation, image size, data types,
+and hardware capabilities (AVX2, AVX-512, ARM NEON, etc.).
+
 
 .. _sec-iba-patterns:
 
@@ -2127,6 +2189,66 @@ Image comparison and statistics
 .. doxygenfunction:: compare_Yee
 ..
 
+
+|
+
+.. _sec-iba-flip:
+
+FLIP perceptual difference
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. doxygengroup:: FLIP_diff
+   :content-only:
+..
+
+  Examples:
+
+  .. tabs::
+
+     .. code-tab:: c++
+
+        ImageBuf ref ("ref.exr");
+        ImageBuf test ("test.exr");
+
+        // Basic use: returns 1-channel float error map in [0,1].
+        ImageBuf flipmap = ImageBufAlgo::FLIP_diff(ref, test);
+        OIIO::print("Mean FLIP error: {}\n",
+                    flipmap.spec().get_float_attribute("FLIP:meanerror"));
+        OIIO::print("Max  FLIP error: {} at ({}, {})\n",
+                    flipmap.spec().get_float_attribute("FLIP:maxerror"),
+                    flipmap.spec().get_int_attribute("FLIP:maxx"),
+                    flipmap.spec().get_int_attribute("FLIP:maxy"));
+
+        // LDR mode (display-referred images only):
+        ImageBufAlgo::FLIP_diff(flipmap, ref, test, { {"hdr", 0} });
+
+        // For a false-color visualization, pass the result to color_map():
+        ImageBuf colored = ImageBufAlgo::color_map(flipmap, 0, "magma");
+
+     .. code-tab:: py
+
+        ref = ImageBuf("ref.exr")
+        test = ImageBuf("test.exr")
+
+        # Basic use: returns 1-channel float error map in [0,1].
+        flipmap = ImageBufAlgo.FLIP_diff(ref, test)
+        print("Mean FLIP error:", flipmap.spec().get_float_attribute("FLIP:meanerror"))
+        print("Max  FLIP error:", flipmap.spec().get_float_attribute("FLIP:maxerror"),
+              "at", flipmap.spec().get_int_attribute("FLIP:maxx"),
+              flipmap.spec().get_int_attribute("FLIP:maxy"))
+
+        # For a false-color visualization, pass the result to color_map():
+        colored = ImageBufAlgo.color_map(flipmap, 0, "magma")
+
+        # LDR mode:
+        flipmap = ImageBufAlgo.FLIP_diff(ref, test, hdr=0)
+
+     .. code-tab:: bash oiiotool
+
+        # Default HDR mode, outputting per-pixel error map
+        oiiotool ref.exr test.exr --flipdiff -o errormap.exr
+        # Output the false color visualization)
+        oiiotool ref.exr test.exr --flipdiff:colormap=magma -o errorvis.exr
 
 |
 

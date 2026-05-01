@@ -39,14 +39,9 @@
 #include <OpenImageIO/typedesc.h>
 #include <OpenImageIO/memory.h>
 
-OIIO_NAMESPACE_BEGIN
 
-class DeepData;
-class ImageBuf;
-class Timer;
 
-#ifndef OIIO_STRIDE_T_DEFINED
-#    define OIIO_STRIDE_T_DEFINED
+OIIO_NAMESPACE_3_1_BEGIN
 /// Type we use to express how many pixels (or bytes) constitute an image,
 /// tile, or scanline.
 using imagesize_t = uint64_t;
@@ -58,7 +53,21 @@ using stride_t = int64_t;
 /// Special value to indicate a stride length that should be
 /// auto-computed.
 inline constexpr stride_t AutoStride = std::numeric_limits<stride_t>::min();
+
+OIIO_NAMESPACE_3_1_END
+
+// Compatibility
+OIIO_NAMESPACE_BEGIN
+#ifndef OIIO_DOXYGEN
+using v3_1::imagesize_t;
+using v3_1::stride_t;
+using v3_1::AutoStride;
 #endif
+OIIO_NAMESPACE_END
+
+
+
+OIIO_NAMESPACE_3_1_BEGIN
 
 // Signal that this version of ImageBuf has constructors from spans
 #define OIIO_IMAGEINPUT_IMAGE_SPAN_SUPPORT 1
@@ -74,11 +83,6 @@ inline constexpr stride_t AutoStride = std::numeric_limits<stride_t>::min();
 typedef bool (*ProgressCallback)(void *opaque_data, float portion_done);
 
 
-
-// Forward declaration of IOProxy
-namespace Filesystem {
-    class IOProxy;
-}
 
 
 /// ROI is a small helper struct describing a rectangular region of interest
@@ -490,9 +494,34 @@ public:
     }
 
     /// Add a metadata attribute to `extra_attribs`, with the given name and
-    /// data type. The `value` pointer specifies the address of the data to
-    /// be copied.
-    void attribute (string_view name, TypeDesc type, const void *value);
+    /// data type. The `value` span specifies the data to be copied. The data
+    /// type and total size of `value` must match the `type` (if not, an
+    /// assertion will be thrown for debug builds).
+    ///
+    /// @version 3.1
+    template<typename T>
+    void attribute(string_view name, TypeDesc type, span<T> value) {
+        OIIO_DASSERT(BaseTypeFromC<T>::value == type.basetype
+                     && type.size() == value.size_bytes());
+        attribute(name, type, OIIO::as_bytes(value));
+    }
+
+    /// A version of `attribute()` that takes its value from a span of untyped
+    /// bytes. The total size of `value` must match the `type` (if not, an
+    /// assertion will be thrown for debug builds of OIIO, an error will be
+    /// printed for release builds).
+    ///
+    /// @version 3.1
+    void attribute(string_view name, TypeDesc type, cspan<std::byte> value);
+
+    /// A version of `attribute()` where the `value` is only a pointer
+    /// specifying the beginning of the memory where the value should be copied
+    /// from. This is "unsafe" in the sense that there is no assurance that it
+    /// points to a sufficient amount of memory, so the span-based versions of
+    /// `attribute()` are preferred.
+    ///
+    /// This was added in version 2.1.
+    void attribute(string_view name, TypeDesc type, const void *value);
 
     /// Add an `unsigned int` attribute to `extra_attribs`.
     void attribute (string_view name, unsigned int value) {
@@ -609,10 +638,59 @@ public:
                                bool casesensitive = false) const;
 
     /// If the `ImageSpec` contains the named attribute and its type matches
-    /// `type`, copy the attribute value into the memory pointed to by `val`
-    /// (it is up to the caller to ensure there is enough space) and return
-    /// `true`. If no such attribute is found, or if it doesn't match the
-    /// type, return `false` and do not modify `val`.
+    /// `type`, copy the attribute value into the memory pointed to by the
+    /// span `value` and return `true`. If no such attribute is found, or if
+    /// it doesn't match the type, return `false` and do not modify `val`.
+    /// The data type and total size of `value` must match the `type` (if not,
+    /// an assertion will be thrown for debug builds).
+    ///
+    /// EXAMPLES:
+    ///
+    ///     ImageSpec spec;
+    ///     ...
+    ///     // Retrieving an integer attribute:
+    ///     int orientation = 0;
+    ///     spec.getattribute ("orientation", TypeInt, make_span(orientation));
+    ///
+    ///     // Retrieving a string attribute with a char*:
+    ///     const char* compression = nullptr;
+    ///     spec.getattribute ("compression", TypeString, make_span(compression));
+    ///
+    ///     // Alternately, retrieving a string with a ustring:
+    ///     ustring compression;
+    ///     spec.getattribute ("compression", TypeString, make_span(compression));
+    ///
+    /// Note that when retrieving a string, you need to pass a span of either
+    /// `const char*` or `ustring`, not a pointer to the first character of
+    /// the string.  Because the returned values are ustrings, the caller does
+    /// not need to ever free the memory that contains the characters, which
+    /// are owned by the internal ustring table.
+    ///
+    /// @version 3.1
+    template<typename T>
+    bool getattribute(string_view name, TypeDesc type, span<T> value,
+                      bool casesensitive = false) const
+    {
+        OIIO_DASSERT(BaseTypeFromC<T>::value == type.basetype
+                     && type.size() == value.size_bytes());
+        return getattribute(name, type, OIIO::as_writable_bytes(value),
+                            casesensitive);
+    }
+
+    /// A version of `getattribute()` that stores the value in a span of
+    /// untyped bytes. The total size of `value` must match the `type` (if
+    /// not, an assertion will be thrown for debug OIIO builds, an error will
+    /// be printed for release builds).
+    ///
+    /// @version 3.1
+    bool getattribute(string_view name, TypeDesc type, span<std::byte> value,
+                      bool casesensitive = false) const;
+
+    /// A version of `getattribute()` where the `value` is only a pointer
+    /// specifying the beginning of the memory where the value should be
+    /// copied. This is "unsafe" in the sense that there is no assurance that
+    /// it points to a sufficient amount of memory, so the span-based versions
+    /// of `getattribute()` are preferred.
     ///
     /// EXAMPLES:
     ///
@@ -643,7 +721,7 @@ public:
     /// Retrieve the named metadata attribute and return its value as an
     /// `int`. Any integer type will convert to `int` by truncation or
     /// expansion, string data will parsed into an `int` if its contents
-    /// consist of of the text representation of one integer. Floating point
+    /// consist of the text representation of one integer. Floating point
     /// data will not succeed in converting to an `int`. If no such metadata
     /// exists, or are of a type that cannot be converted, the `defaultval`
     /// will be returned.
@@ -652,7 +730,7 @@ public:
     /// Retrieve the named metadata attribute and return its value as a
     /// `float`. Any integer or floating point type will convert to `float`
     /// in the obvious way (like a C cast), and so will string metadata if
-    /// its contents consist of of the text representation of one floating
+    /// its contents consist of the text representation of one floating
     /// point value. If no such metadata exists, or are of a type that cannot
     /// be converted, the `defaultval` will be returned.
     float get_float_attribute (string_view name, float defaultval=0) const;
@@ -1013,6 +1091,9 @@ public:
     /// - `"exif"` :
     ///       Can this format store Exif camera data?
     ///
+    /// - `"cicp"` :
+    ///       Does this format support embedding CICP metadata?
+    ///
     /// - `"ioproxy"` :
     ///       Does this format reader support reading from an `IOProxy`?
     ///
@@ -1099,10 +1180,11 @@ public:
     ///
     /// @returns
     ///         `true` if the file was found and opened successfully.
-    virtual bool open (const std::string& name, ImageSpec &newspec) = 0;
+    OIIO_NODISCARD_ERROR virtual bool open (const std::string& name,
+                                            ImageSpec &newspec) = 0;
 
     /// Open the ImageInput using a UTF-16 encoded wstring filename.
-    bool open (const std::wstring& name, ImageSpec &newspec) {
+    OIIO_NODISCARD_ERROR bool open (const std::wstring& name, ImageSpec &newspec) {
         return open(Strutil::utf16_to_utf8(name), newspec);
     }
 
@@ -1126,13 +1208,14 @@ public:
     ///
     /// @returns
     ///         `true` if the file was found and opened successfully.
-    virtual bool open (const std::string& name, ImageSpec &newspec,
-                       const ImageSpec& config OIIO_MAYBE_UNUSED) {
+    OIIO_NODISCARD_ERROR virtual bool open (const std::string& name,
+                                            ImageSpec &newspec,
+                                            const ImageSpec& config OIIO_MAYBE_UNUSED) {
         return open(name,newspec);
     }
     /// Open the ImageInput using a UTF-16 encoded wstring filename.
-    bool open (const std::wstring& name, ImageSpec &newspec,
-               const ImageSpec& config OIIO_MAYBE_UNUSED) {
+    OIIO_NODISCARD_ERROR bool open (const std::wstring& name, ImageSpec &newspec,
+                                    const ImageSpec& config OIIO_MAYBE_UNUSED) {
         return open(name,newspec);
     }
 
@@ -1330,15 +1413,17 @@ public:
     ///                     y, and z).
     /// @returns            `true` upon success, or `false` upon failure.
     ///
-    virtual bool read_image(int subimage, int miplevel, int chbegin, int chend,
-                            TypeDesc format, const image_span<std::byte>& data);
+    OIIO_NODISCARD_ERROR virtual bool
+    read_image(int subimage, int miplevel, int chbegin, int chend,
+               TypeDesc format, const image_span<std::byte>& data);
 
     /// A version of `read_image()` taking an `image_span<T>`, where the type
     /// of the underlying data is `T`.  This is a convenience wrapper around
     /// the `read_image()` that takes an `image_span<std::byte>`.
     template<typename T>
-    bool read_image(int subimage, int miplevel, int chbegin, int chend,
-                    const image_span<T>& data)
+    OIIO_NODISCARD_ERROR bool read_image(int subimage, int miplevel,
+                                         int chbegin, int chend,
+                                         const image_span<T>& data)
     {
         static_assert(!std::is_const_v<T>,
                       "read_image() does not accept image_span<const T>");
@@ -1351,8 +1436,8 @@ public:
     /// contiguous strides in all dimensions. This is a convenience wrapper
     /// around the `read_image()` that takes an `image_span<T>`.
     template<typename T>
-    bool read_image(int subimage, int miplevel, int chbegin, int chend,
-                    span<T> data)
+    OIIO_NODISCARD_ERROR bool read_image(int subimage, int miplevel,
+                                         int chbegin, int chend, span<T> data)
     {
         static_assert(!std::is_const_v<T>,
                       "read_image() does not accept span<const T>");
@@ -1399,17 +1484,18 @@ public:
     /// Added in OIIO 3.1, this is the "safe" preferred alternative to
     /// the version of read_scanlines that takes raw pointers.
     ///
-    virtual bool read_scanlines(int subimage, int miplevel, int ybegin,
-                                int yend, int chbegin, int chend,
-                                TypeDesc format,
-                                const image_span<std::byte>& data);
+    OIIO_NODISCARD_ERROR virtual bool
+    read_scanlines(int subimage, int miplevel, int ybegin, int yend,
+                   int chbegin, int chend, TypeDesc format,
+                   const image_span<std::byte>& data);
 
     /// A version of `read_scanlines()` taking an `image_span<T>`, where the
     /// type of the underlying data is `T`.  This is a convenience wrapper
     /// around the `read_scanlines()` that takes an `image_span<std::byte>`.
     template<typename T>
-    bool read_scanlines(int subimage, int miplevel, int ybegin, int yend,
-                        int chbegin, int chend, const image_span<T>& data)
+    OIIO_NODISCARD_ERROR bool
+    read_scanlines(int subimage, int miplevel, int ybegin, int yend,
+                   int chbegin, int chend, const image_span<T>& data)
     {
         static_assert(!std::is_const_v<T>,
                       "read_scanlines() does not accept span<const T>");
@@ -1423,8 +1509,9 @@ public:
     /// contiguous strides in all dimensions. This is a convenience wrapper
     /// around the `read_scanlines()` that takes an `image_span<T>`.
     template<typename T>
-    bool read_scanlines(int subimage, int miplevel, int ybegin, int yend,
-                        int chbegin, int chend, span<T> data)
+    OIIO_NODISCARD_ERROR bool read_scanlines(int subimage, int miplevel,
+                                             int ybegin, int yend, int chbegin,
+                                             int chend, span<T> data)
     {
         static_assert(!std::is_const_v<T>,
                       "read_scanlines() does not accept span<const T>");
@@ -1692,12 +1779,12 @@ public:
     ///
     /// @note This call was changed for OpenImageIO 2.0 to include the
     ///     explicit subimage and miplevel parameters.
-    virtual bool read_scanlines (int subimage, int miplevel,
-                                 int ybegin, int yend, int z,
-                                 int chbegin, int chend,
-                                 TypeDesc format, void *data,
-                                 stride_t xstride=AutoStride,
-                                 stride_t ystride=AutoStride);
+    OIIO_NODISCARD_ERROR virtual bool read_scanlines (int subimage, int miplevel,
+                                                int ybegin, int yend, int z,
+                                                int chbegin, int chend,
+                                                TypeDesc format, void *data,
+                                                stride_t xstride=AutoStride,
+                                                stride_t ystride=AutoStride);
 
     /// Read the tile whose upper-left origin is (x,y,z) into `data[]`,
     /// converting if necessary from the native data format of the file into
@@ -1823,14 +1910,14 @@ public:
     /// @param  progress_callback/progress_callback_data
     ///                     Optional progress callback.
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool read_image (int subimage, int miplevel,
-                             int chbegin, int chend,
-                             TypeDesc format, void *data,
-                             stride_t xstride=AutoStride,
-                             stride_t ystride=AutoStride,
-                             stride_t zstride=AutoStride,
-                             ProgressCallback progress_callback=NULL,
-                             void *progress_callback_data=NULL);
+    OIIO_NODISCARD_ERROR virtual bool read_image (int subimage, int miplevel,
+                                            int chbegin, int chend,
+                                            TypeDesc format, void *data,
+                                            stride_t xstride=AutoStride,
+                                            stride_t ystride=AutoStride,
+                                            stride_t zstride=AutoStride,
+                                            ProgressCallback progress_callback=NULL,
+                                            void *progress_callback_data=NULL);
 
     /// @}
 
@@ -2206,10 +2293,11 @@ protected:
     ///
     /// * Whether the resolution and channel count are within the range
     ///   implied by `range`.
-    /// * Whether the channel count is within the `"limit:channels"` OIIO
+    /// * Whether the channel count is within the `"limits:channels"` OIIO
     ///   attribute.
     /// * The total uncompressed pixel data size is expected to be within the
-    ///   `"limit:imagesize_MB"` OIIO attribute.
+    ///   `"limits:imagesize_MB"` OIIO attribute.
+    /// * The full_{width,height,depth} are valid and within the range.
     ///
     bool check_open (const ImageSpec &spec,
                      ROI range = {0, 65535, 0, 65535, 0, 1, 0, 4},
@@ -2452,6 +2540,9 @@ public:
     ///  - `"noimage"` :
     ///        Does this format allow 0x0 sized images, i.e. an image file
     ///        with metadata only and no pixels?
+    ///
+    ///  - `"cicp"` :
+    ///        Does this format support embedding CICP metadata?
     ///
     /// This list of queries may be extended in future releases. Since this
     /// can be done simply by recognizing new query strings, and does not
@@ -3533,7 +3624,7 @@ protected:
     bool iowrite(const void* buf, size_t itemsize, size_t nitems = 1);
 
     /// Helper: seek the proxy, akin to fseek. Return true on success, false
-    /// upon failure and issue an error message. (NOTE: this isionot the same
+    /// upon failure and issue an error message. (NOTE: this is not the same
     /// return value as std::fseek, which returns 0 on success.)
     bool ioseek(int64_t pos, int origin = SEEK_SET);
 
@@ -3613,18 +3704,28 @@ OIIO_API bool has_error();
 /// error messages.
 OIIO_API std::string geterror(bool clear = true);
 
-/// `OIIO::attribute()` sets a global attribute (i.e., a property or
-/// option) of OpenImageIO. The `name` designates the name of the attribute,
-/// `type` describes the type of data, and `val` is a pointer to memory
-/// containing the new value for the attribute.
+/// @defgroup OIIO_attribute (global OIIO::attribute())
+/// @{
 ///
-/// If the name is known, valid attribute that matches the type specified,
-/// the attribute will be set to the new value and `attribute()` will return
-/// `true`.  If `name` is not recognized, or if the types do not match
-/// (e.g., `type` is `TypeFloat` but the named attribute is a string), the
-/// attribute will not be modified, and `attribute()` will return `false`.
+/// `OIIO::attribute()` sets a global attribute (i.e., a property or option)
+/// of OpenImageIO. The `name` designates the name of the attribute, `value`
+/// is the value to use for the attribute, and for some varieties of the call,
+/// `type` is a TypeDesc describing the data type.
 ///
-/// The following are the recognized attributes:
+/// Most varieties of the call will return `true` if `name` is a known
+/// attribute and its expected type is compatible with the type specified. If
+/// `name` is not recognized, or if the types do not match (e.g., `type` is
+/// `TypeFloat` but the named attribute is supposed to be a string), the
+/// internal attribute will not be modified, and `attribute()` will return
+/// `false`.
+///
+/// In all cases, is up to the caller to ensure that `value` is or refers to
+/// the right kind and size of storage for the given type.
+///
+/// Note that all attributes set by this call may also be retrieved by
+/// `OIIO::getattribute()`.
+///
+/// RECOGNIZED ATTRIBUTES
 ///
 /// - `string options`
 ///
@@ -3674,6 +3775,15 @@ OIIO_API std::string geterror(bool clear = true);
 ///    parallel.h utilities) will try to use TBB by default where possible.
 ///    If zero, they will try to use OIIO's native thread pool even if TBB
 ///    is available.
+///
+/// - `int enable_hwy' (0)
+///
+///    If nonzero and Google Highway was found and support configured when
+///    OIIO was built, SIMD accelertion using Highway will be used to
+///    accelerate certain ImageBufAlgo functionality. If this attribute is
+///    set to zero, that Highway-based SIMD acceleration will be disabled
+///    at runtime, even if support was enabled when OIIO was built.
+///    (Added in OIIO 3.2.)
 ///
 /// - `string plugin_searchpath`
 ///
@@ -3741,8 +3851,8 @@ OIIO_API std::string geterror(bool clear = true);
 ///
 /// - `int openexr:core`
 ///
-///    When nonzero, use the new "OpenEXR core C library" when available,
-///    for OpenEXR >= 3.1. This is experimental, and currently defaults to 0.
+///    When nonzero, use the new "OpenEXR core C library" when available.
+///    The default is 1 for OpenEXR >= 3.1.10, 0 for older OpenEXR releases.
 ///
 /// - `int jpeg:com_attributes`
 ///
@@ -3842,28 +3952,81 @@ OIIO_API std::string geterror(bool clear = true);
 ///   further decode anything in the file. This may be a better choice to
 ///   enable globally in an environment where security is a higher priority
 ///   than being tolerant of partially broken image files.
-OIIO_API bool attribute(string_view name, TypeDesc type, const void* val);
+///
+/// EXAMPLES:
+/// ```
+///     // Setting single simple values simply:
+///     bool ok = OIIO::getattribute("threads", 1);  // implied: int
+///     ok = OIIO::attribute("plugin_searchpath", "/foo/bar:/baz");  // implied: string
+///
+///     // Setting a more complex value using a span, with explicit type
+///     float missing[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+///     ok = OIIO::attribute("missingcolor", TypeDesc("float[4]"), make_span(missing));
+/// ```
+///
+/// The different varieties of `OIIO::attribute()` call follow:
+
+/// Set the attribute's value from a span (which may be a single value). The
+/// total size of `value` must match the `type` (if not, an assertion will be
+/// thrown for debug builds of OIIO, an error will be printed for release
+/// builds).
+///
+/// @version 3.1+
+template<typename T>
+inline bool attribute(string_view name, TypeDesc type, span<T> value)
+{
+    OIIO_DASSERT(BaseTypeFromC<T>::value == type.basetype
+                 && type.size() == value.size_bytes());
+    return attribute(name, type, OIIO::as_bytes(value));
+}
+
+/// Set the attribute's value from a span of untyped bytes. The total size of
+/// `value` must match the `type` (if not, an assertion will be thrown for
+/// debug builds of OIIO, an error will be printed for release builds).
+///
+/// @version 3.1+
+OIIO_API bool attribute(string_view name, TypeDesc type, cspan<std::byte> value);
+
+/// Set the named attribute to the contents of memory pointed to by `value`,
+/// with the `type` implying the total size to be copied. This is "unsafe" in
+/// the sense that there is no assurance that it points to a sufficient amount
+/// of memory or value type, so the span-based versions of `attribute()` are
+/// preferred.
+///
+/// This was added in version 2.1.
+OIIO_API bool attribute(string_view name, TypeDesc type, const void* value);
 
 /// Shortcut attribute() for setting a single integer.
-inline bool attribute (string_view name, int val) {
-    return attribute (name, TypeInt, &val);
+inline bool attribute(string_view name, int value) {
+    return attribute(name, TypeInt, &value);
 }
 /// Shortcut attribute() for setting a single float.
-inline bool attribute (string_view name, float val) {
-    return attribute (name, TypeFloat, &val);
+inline bool attribute(string_view name, float value) {
+    return attribute(name, TypeFloat, &value);
 }
 /// Shortcut attribute() for setting a single string.
-inline bool attribute (string_view name, string_view val) {
-    std::string valstr = val;
+inline bool attribute(string_view name, string_view value) {
+    std::string valstr = value;
     const char *s = valstr.c_str();
-    return attribute (name, TypeString, &s);
+    return attribute(name, TypeString, &s);
 }
+/// @}
 
-/// Get the named global attribute of OpenImageIO, store it in `*val`.
-/// Return `true` if found and it was compatible with the type specified,
-/// otherwise return `false` and do not modify the contents of `*val`.  It
-/// is up to the caller to ensure that `val` points to the right kind and
-/// size of storage for the given type.
+
+/// @defgroup OIIO_getattribute (global OIIO::getattribute())
+/// @{
+///
+/// `OIIO::getattribute()` retrieves a named global attribute of OpenImageIO,
+/// and stores it in `value`. These are the retrieval side of the symmetric
+/// set of `OIIO::attribute()` calls.
+///
+/// Most varieties of the call will return `true` if the named attribute was
+/// found and it was compatible with the type specified, otherwise return
+/// `false` and do not modify the contents of `value`.  In all cases, it is up
+/// to the caller to ensure that `val` points to the right kind and size of
+/// storage for the given type.
+///
+/// RECOGNIZED ATTRIBUTES
 ///
 /// In addition to being able to retrieve all the attributes that are
 /// documented as settable by the `OIIO::attribute()` call, `getattribute()`
@@ -3995,55 +4158,115 @@ inline bool attribute (string_view name, string_view val) {
 ///        IBA::resize                  20   0.24s   (avg  12.18ms)
 ///        IBA::zero                     8   0.66ms  (avg   0.08ms)
 ///
+/// EXAMPLES:
+/// ```
+///     // Retrieving a single simple value with success/failure return:
+///     int threads;
+///     bool ok = OIIO::getattribute("threads", threads);
+///     std::string path;
+///     ok = OIIO::getattribute("plugin_searchpath", path);
+///
+///     // Directly returning a single simple value, with default to use
+///     // if the attribute is not found:
+///     int threads = OIIO::get_int_attribute("threads", 0);
+///     string_view path = OIIO::get_string_attribute("plugin_searchpath");
+///
+///     // Returning into a span, with explicit type
+///     float missing[4];
+///     ok = OIIO::getattribute("missingcolor", TypeDesc("float[4]"),
+///                             make_span(missing));
+/// ```
+///
+/// The different varieties of `OIIO::getattribute()` call follow:
+
+/// Store the named attribute's current value into a writable span. The total
+/// size of `value` must match the `type` (if not, an assertion will be thrown
+/// for debug OIIO builds, an error will be printed for release builds).
+///
+/// @version 3.1+
+template<typename T>
+inline bool getattribute(string_view name, TypeDesc type, span<T> value)
+{
+    OIIO_DASSERT(BaseTypeFromC<T>::value == type.basetype
+                 && type.size() == value.size_bytes());
+    return OIIO::v3_1::getattribute(name, type, OIIO::as_writable_bytes(value));
+}
+
+/// Store the value in a span of untyped bytes. The total size of `value` must
+/// match the `type` (if not, an assertion will be thrown for debug OIIO
+/// builds, an error will be printed for release builds).
+///
+/// @version 3.1+
+OIIO_API bool getattribute(string_view name, TypeDesc type,
+                           span<std::byte> value);
+
+/// Store the value into memory pointed to by `val`. This is "unsafe" in the
+/// sense that there is no assurance that it points to a sufficient amount of
+/// memory or will be interpreted as the correct type, so the span-based
+/// versions of `attribute()` are preferred.
 OIIO_API bool getattribute(string_view name, TypeDesc type, void* val);
 
-/// Shortcut getattribute() for retrieving a single integer.
-/// The value is placed in `val`, and the function returns `true` if the
-/// attribute was found and was legally convertible to an int.
-inline bool getattribute (string_view name, int &val) {
-    return getattribute (name, TypeInt, &val);
+/// Retrieve a single-integer attribute. The value is placed in `value`, and
+/// the function returns `true` if the attribute was found and was legally
+/// convertible to an int.
+inline bool getattribute (string_view name, int &value) {
+    return getattribute (name, TypeInt, &value);
 }
-/// Shortcut getattribute() for retrieving a single float.
-/// The value is placed in `val`, and the function returns `true` if the
-/// attribute was found and was legally convertible to a float.
-inline bool getattribute (string_view name, float &val) {
-    return getattribute (name, TypeFloat, &val);
+
+/// Retrieve a single-float attribute. The value is placed in `value`, and the
+/// function returns `true` if the attribute was found and was legally
+/// convertible to a float.
+inline bool getattribute (string_view name, float &value) {
+    return getattribute (name, TypeFloat, &value);
 }
-/// Shortcut getattribute() for retrieving a single string as a
-/// `std::string`. The value is placed in `val`, and the function returns
-/// `true` if the attribute was found.
-inline bool getattribute (string_view name, std::string &val) {
+
+/// Retrieve a single-string attribute, placed as a `std::string` into
+/// `value`, and the function returns `true` if the attribute was found and
+/// was legally convertible to an string.
+inline bool getattribute (string_view name, std::string &value) {
     ustring s;
     bool ok = getattribute (name, TypeString, &s);
     if (ok)
-        val = s.string();
+        value = s.string();
     return ok;
 }
-/// Shortcut getattribute() for retrieving a single string as a `char*`.
-inline bool getattribute (string_view name, char **val) {
-    return getattribute (name, TypeString, val);
+
+/// Retrieve a single-string attribute, placed as a `const char*` into
+/// `*value`, and the function returns `true` if the attribute was found and
+/// was legally convertible to an string. Note that the `const char*`
+/// retrieved is really the characters belonging to a `ustring`, and so is
+/// owned by OIIO and should not be freed by the calling code.
+inline bool getattribute (string_view name, char **value) {
+    return getattribute (name, TypeString, value);
 }
-/// Shortcut getattribute() for retrieving a single integer, with a supplied
-/// default value that will be returned if the attribute is not found or
-/// could not legally be converted to an int.
+
+/// Retrieve a single-integer attribute, with a supplied default value that
+/// will be returned if the attribute is not found or could not legally be
+/// converted to an int.
 inline int get_int_attribute (string_view name, int defaultval=0) {
     int val;
     return getattribute (name, TypeInt, &val) ? val : defaultval;
 }
-/// Shortcut getattribute() for retrieving a single float, with a supplied
-/// default value that will be returned if the attribute is not found or
-/// could not legally be converted to a float.
+
+/// Retrieve a single-float attribute, with a supplied default value that
+/// will be returned if the attribute is not found or could not legally be
+/// converted to a float.
 inline float get_float_attribute (string_view name, float defaultval=0) {
     float val;
     return getattribute (name, TypeFloat, &val) ? val : defaultval;
 }
-/// Shortcut getattribute() for retrieving a single string, with a supplied
-/// default value that will be returned if the attribute is not found.
+
+/// Retrieve a single-string attribute, with a supplied default value that
+/// will be returned if the attribute is not found or could not legally be
+/// converted to an int. default value that will be returned if the attribute
+/// is not found.
 inline string_view get_string_attribute (string_view name,
                                  string_view defaultval = string_view()) {
     ustring val;
     return getattribute (name, TypeString, &val) ? string_view(val) : defaultval;
 }
+
+/// @}
 
 
 /// Set the metadata of the `spec` to presume that color space is `name` (or
@@ -4093,12 +4316,12 @@ inline std::map<std::string, std::vector<std::string>>
 get_extension_map()
 {
     std::map<std::string, std::vector<std::string>> map;
-    auto all_extensions = OIIO::get_string_attribute("extension_list");
-    for (auto oneformat : OIIO::Strutil::splitsv(all_extensions, ";")) {
-        auto format_exts = OIIO::Strutil::splitsv(oneformat, ":", 2);
+    auto all_extensions = get_string_attribute("extension_list");
+    for (auto oneformat : Strutil::splitsv(all_extensions, ";")) {
+        auto format_exts = Strutil::splitsv(oneformat, ":", 2);
         if (format_exts.size() != 2)
             continue;   // something went wrong
-        map[format_exts[0]] = OIIO::Strutil::splits(format_exts[1], ",");
+        map[format_exts[0]] = Strutil::splits(format_exts[1], ",");
     }
     return map;
 }
@@ -4381,15 +4604,18 @@ OIIO_API void log_time(string_view key, const Timer& timer, int count = 1);
 // to force correct linkage on some systems
 OIIO_API void _ImageIO_force_link ();
 
+OIIO_NAMESPACE_3_1_END
+
 
 //////////////////////////////////////////////////////////////////////////
 // DEPRECATED things
 //
-// These are all hidden from ocumentation and internal use, and should trigger
-// deprecation warnings if used externally. They will most likely be removed
-// entirely before the final release of OIIO 3.0.
+// These are all hidden from documentation and internal use, and should
+// trigger deprecation warnings if used externally. They will most likely be
+// removed entirely before the final release of OIIO 3.0.
 //
 #if !defined(OIIO_INTERNAL) && !defined(OIIO_DOXYGEN)
+OIIO_NAMESPACE_BEGIN
 
 #if OIIO_DISABLE_DEPRECATED < OIIO_MAKE_VERSION(2, 1, 0)
 // DEPRECATED(2.1): old name
@@ -4427,11 +4653,59 @@ inline void debug (const char* fmt, const T1& v1, const Args&... args)
 }
 #endif
 
+OIIO_NAMESPACE_END
 #endif
 //
 //////////////////////////////////////////////////////////////////////////
 
+
+
+// Compatibility
+OIIO_NAMESPACE_BEGIN
+#ifndef OIIO_DOXYGEN
+// clang-format on
+using v3_1::add_dither;
+using v3_1::attribute;
+using v3_1::convert_image;
+using v3_1::convert_pixel_values;
+using v3_1::copy_image;
+using v3_1::cspan_from_buffer;
+using v3_1::debug;
+using v3_1::debugfmt;
+using v3_1::declare_imageio_format;
+using v3_1::equivalent_colorspace;
+using v3_1::errorfmt;
+using v3_1::get_extension_map;
+using v3_1::get_float_attribute;
+using v3_1::get_int_attribute;
+using v3_1::get_string_attribute;
+using v3_1::getattribute;
+using v3_1::geterror;
+using v3_1::has_error;
+using v3_1::is_imageio_format_name;
+using v3_1::log_time;
+using v3_1::openimageio_version;
+using v3_1::parallel_convert_image;
+using v3_1::premult;
+using v3_1::ProgressCallback;
+using v3_1::roi_intersection;
+using v3_1::roi_union;
+using v3_1::set_colorspace;
+using v3_1::set_colorspace_rec709_gamma;
+using v3_1::shutdown;
+using v3_1::span_from_buffer;
+using v3_1::wrap_black;
+using v3_1::wrap_clamp;
+using v3_1::wrap_impl;
+using v3_1::wrap_mirror;
+using v3_1::wrap_periodic;
+using v3_1::wrap_periodic_pow2;
+namespace pvt {
+using v3_1::pvt::append_error;
+}
+#endif
 OIIO_NAMESPACE_END
+
 
 
 #if FMT_VERSION >= 100000

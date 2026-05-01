@@ -51,7 +51,7 @@ in the outer OpenImageIO scope:
     TypeFloat2 TypeVector2 TypeVector2i TypeVector3i TypeFloat4
     TypeString TypeTimeCode TypeKeyCode
     TypeBox2 TypeBox2i TypeBox3 TypeBox3i
-    TypeRational TypePointer TypeUstringhash
+    TypeRational TypeURational TypePointer TypeUstringhash
 
 The only types commonly used to store *pixel values* in image files
 are scalars of ``UINT8``, ``UINT16``, `float`, and ``half``.
@@ -215,49 +215,12 @@ These helper functions are not part of any other OpenImageIO class, they
 just exist in the OpenImageIO namespace as general utilities. (See
 :ref:`sec-pythonmiscapi` for the corresponding Python bindings.)
 
-.. doxygenfunction:: OIIO::attribute(string_view, TypeDesc, const void *)
-
-.. cpp:function:: bool OIIO::attribute(string_view name, int val)
-                  bool OIIO::attribute(string_view name, float val)
-                  bool OIIO::attribute(string_view name, string_view val)
-
-    Shortcuts for setting an attribute to a single int, float, or string.
+.. doxygengroup:: OIIO_attribute
+..
 
 
-.. doxygenfunction:: OIIO::getattribute(string_view, TypeDesc, void *)
-
-
-.. cpp:function:: bool getattribute (string_view name, int &val)
-                  bool getattribute (string_view name, float &val)
-                  bool getattribute (string_view name, char **val)
-                  bool getattribute (string_view name, std::string& val)
-
-    Specialized versions of `getattribute()` in which the data type is
-    implied by the type of the argument (for single int, float, or string).
-    Two string versions exist: one that retrieves it as a `std::string` and
-    another that retrieves it as a `char *`. In all cases, the return value
-    is `true` if the attribute is found and the requested data type
-    conversion was legal.
-
-    EXAMPLES::
-
-        int threads;
-        OIIO::getattribute ("threads", &threads);
-        std::string path;
-        OIIO::getattribute ("plugin_searchpath", path);
-
-.. cpp:function:: int get_int_attribute (string_view name, int defaultvalue=0)
-                  float get_float_attribute (string_view name, float defaultvalue=0)
-                  string_view get_string_attribute (string_view name, string_view defaultvalue="")
-
-    Specialized versions of `getattribute()` for common types, in which the
-    data is returned directly, and a supplied default value is returned if
-    the attribute was not found.
-
-    EXAMPLES::
-
-        int threads = OIIO::get_int_attribute ("threads", 0);
-        string_view path = OIIO::get_string_attribute ("plugin_searchpath");
+.. doxygengroup:: OIIO_getattribute
+..
 
 
 
@@ -397,16 +360,39 @@ inside the source code.
     line, but not the full human-readable command line. (This was added in
     OpenImageIO 2.5.11.)
 
+.. cpp:var:: OPENIMAGEIO_ENABLE_HWY
+
+    Controls whether to use Google Highway SIMD library optimizations for
+    ImageBufAlgo operations. If set to "1" (the default), Highway SIMD
+    optimizations will be enabled for supported operations, providing
+    significant performance improvements (typically 3-12x faster) on integer
+    image types. If set to "0", these optimizations will be disabled and fall
+    back to scalar implementations.
+
+    This can also be controlled at runtime via::
+
+        OIIO::attribute("enable_hwy", 1);  // enable (default)
+        OIIO::attribute("enable_hwy", 0);  // disable
+
+    Note: Highway SIMD optimizations are particularly beneficial for integer
+    image formats (uint8, uint16, int8, int16, uint32, int32, etc.) and provide
+    additional speedup for scale-invariant operations (add, sub, min, max,
+    absdiff) that can operate directly on integer data without float conversion.
+
+    This was added in OpenImageIO 3.2.
+
+    NOTE: This is currently disabled by default while we are testing!
+
 .. cpp:var:: OPENIMAGEIO_PYTHON_LOAD_DLLS_FROM_PATH
 
-    Windows only. Mimics the DLL-loading behavior of Python 3.7 and earlier. 
-    If set to "1", all directories under ``PATH`` will be added to the DLL load 
+    Windows only. Mimics the DLL-loading behavior of Python 3.7 and earlier.
+    If set to "1", all directories under ``PATH`` will be added to the DLL load
     path before attempting to import the OpenImageIO module. (This was added in
     OpenImageIO 3.0.3.0)
 
-    Note: This "opt-in-style" behavior replaces and inverts the "opt-out-style" 
-    Windows DLL-loading behavior governed by the now-defunct `OIIO_LOAD_DLLS_FROM_PATH` 
-    environment variable (added in OpenImageIO 2.4.0/2.3.18). 
+    Note: This "opt-in-style" behavior replaces and inverts the "opt-out-style"
+    Windows DLL-loading behavior governed by the now-defunct `OIIO_LOAD_DLLS_FROM_PATH`
+    environment variable (added in OpenImageIO 2.4.0/2.3.18).
 
-    In other words, to reproduce the default Python-module-loading behavior of 
+    In other words, to reproduce the default Python-module-loading behavior of
     earlier versions of OIIO, set ``OPENIMAGEIO_PYTHON_LOAD_DLLS_FROM_PATH=1``.

@@ -14,72 +14,74 @@ NEW or CHANGED MINIMUM dependencies since the last major release are **bold**.
 
 ### Required dependencies -- OIIO will not build at all without these
 
- * C++17 or higher (also builds with C++20)
+ * C++17 or higher (also builds with C++20 and C++23)
      * The default build mode is C++17. This can be controlled by via the
        CMake configuration flag: `-DCMAKE_CXX_STANDARD=20`, etc.
- * Compilers: gcc 9.3 - 14.2, clang 5 - 19, MSVS 2017 - 2022 (v19.14
-   and up), Intel icc 19+, Intel OneAPI C++ compiler 2022+.
- * CMake >= 3.18.2 (tested through 4.0)
- * Imath >= 3.1 (tested through 3.1.x and main)
- * OpenEXR >= 3.1 (tested through 3.3 and main)
+ * Compilers: gcc 9.3 - 15.2, clang 10 - 22, MSVS 2017 - 2026 (v19.14
+   and up), Intel OneAPI C++ compiler 2022+.
+ * CMake >= 3.18.2 (tested through 4.3)
+ * Imath >= 3.1 (tested through 3.2 and main)
+ * OpenEXR >= 3.1 (tested through 3.4 and main)
  * libTIFF >= 4.0 (tested through 4.7 and master)
- * OpenColorIO >= 2.2 (tested through 2.4 and main)
+ * OpenColorIO >= 2.3 (tested through 2.5 and main)
  * libjpeg >= 8 (tested through jpeg9e), or libjpeg-turbo >= 2.1 (tested
    through 3.1)
- * zlib >= 1.2.7 (tested through 1.3.1)
- * [fmtlib](https://github.com/fmtlib/fmt) >= 7.0 (tested through 11.2 and master).
-   If not found at build time, this will be automatically downloaded unless
-   the build sets `-DBUILD_MISSING_FMT=OFF`.
+ * zlib >= 1.2.7 (tested through 1.3.2)
+ * **[fmtlib](https://github.com/fmtlib/fmt) >= 9.0** (tested through 12.1 and master).
+   If not found at build time, this will be automatically downloaded and built.
  * [Robin-map](https://github.com/Tessil/robin-map) (unknown minimum, tested
    through 1.4, which is the recommended version). If not found at build time,
-   this will be automatically downloaded unless the build sets
-   `-DBUILD_MISSING_FMT=OFF`.
+   this will be automatically downloaded and built.
 
 ### Optional dependencies -- features may be disabled if not found
  * If you are building the `iv` viewer (which will be disabled if any of
    these are not found):
-     * Qt5 >= 5.6 (tested through 5.15) or Qt6 (tested through 6.9)
+     * Qt5 >= 5.6 (tested through 5.15) or Qt6 (tested through 6.11)
      * OpenGL
  * If you are building the Python bindings or running the testsuite:
-     * Python >= 3.7 (tested through 3.13)
+     * Python >= 3.9 (tested through 3.13).
      * pybind11 >= 2.7 (tested through 3.0)
-     * NumPy (tested through 2.2.4)
+     * NumPy (tested through 2.4.4)
+     * If you enable the optional nanobind (WIP) backend for source/CMake
+       builds (`OIIO_PYTHON_BINDINGS_BACKEND` is `nanobind` or `both`):
+         * nanobind discoverable by CMake, or installed in the active Python
+           environment so `python -m nanobind --cmake_dir` works
  * If you want support for PNG files:
-     * libPNG >= 1.6.0 (tested though 1.6.50)
+     * libPNG >= 1.6.0 (tested though 1.6.56)
  * If you want support for camera "RAW" formats:
-     * LibRaw >= 0.20 (tested though 0.21.4 and master)
+     * LibRaw >= 0.20 (tested though 0.22.0 and master)
  * If you want support for a wide variety of video formats:
-     * ffmpeg >= 4.0 (tested through 7.0)
+     * ffmpeg >= 4.0 (tested through 8.1)
  * If you want support for jpeg 2000 images:
-     * OpenJpeg >= 2.0 (tested through 2.5.3; we recommend 2.4 or higher
+     * OpenJpeg >= 2.0 (tested through 2.5.4; we recommend 2.4 or higher
        for multithreading support)
  * If you want support for OpenVDB files:
-     * OpenVDB >= 9.0 (tested through 12.0).
+     * OpenVDB >= 9.0 (tested through 13.0).
  * If you want to use TBB as the thread pool:
      * TBB >= 2018 (tested through 2021 and OneTBB)
  * If you want support for converting to and from OpenCV data structures,
    or for capturing images from a camera:
-     * OpenCV 4.x (tested through 4.11)
+     * OpenCV 4.x (tested through 4.13)
  * If you want support for GIF images:
-     * giflib >= 5.0 (tested through 5.2.2)
+     * giflib >= 5.0 (tested through 6.1.2)
  * If you want support for HEIF/HEIC or AVIF images:
-     * libheif >= 1.11 (1.16 required for correct orientation support,
-       tested through 1.19.8)
+     * libheif >= 1.11 (1.16 required for correct orientation support and
+       1.17 required for monochrome HEIC support; tested through 1.21.2)
      * libheif must be built with an AV1 encoder/decoder for AVIF support.
  * If you want support for DICOM medical image files:
-     * DCMTK >= 3.6.1 (tested through 3.6.9)
+     * DCMTK >= 3.6.1 (tested through 3.7.0)
  * If you want support for WebP images:
-     * WebP >= 1.1 (tested through 1.5)
+     * WebP >= 1.1 (tested through 1.6)
  * If you want support for Ptex:
-     * Ptex >= 2.3.1 (probably works for older; tested through 2.4.3)
+     * Ptex >= 2.3.1 (probably works for older; tested through 2.5)
  * If you want to be able to do font rendering into images:
-     * Freetype >= 2.10.0 (tested through 2.13)
+     * Freetype >= 2.10.0 (tested through 2.14)
  * If you want to be able to read "ultra-HDR" embedded in JPEG files:
      * libultrahdr >= 1.3 (tested through 1.4)
  * If you want support for JPEG XL images:
-     * libjxl >= 0.10.1 (tested through 0.11.1)
- * If you want support for "Ultra HDR" inside JPEG images:
-     * libuhdr >= 1.3 (tested through 1.4)
+     * libjxl >= 0.10.1 (tested through 0.11.2)
+ * If you want support for j2c files:
+     * OpenJPH >= 0.21.2 (tested through 0.26)
  * We use PugiXML for XML parsing. There is a version embedded in the OIIO
    tree, but if you want to use an external, system-installed version (as
    may be required by some software distributions with policies against
@@ -158,6 +160,12 @@ Make wrapper (`make PkgName_ROOT=...`).
 **Disabling optional dependencies and individual components**
 
 `USE_PYTHON=0` : Omits building the Python bindings.
+
+`OIIO_PYTHON_BINDINGS_BACKEND=pybind11|nanobind|both` : Select which Python
+binding backend(s) to configure for source/CMake builds. `both` keeps the
+existing pybind11 module and also builds the nanobind (WIP) module. The
+Python packaging path driven by `pyproject.toml` still targets the production
+pybind11 bindings today.
 
 `OIIO_BUILD_TESTS=0` : Omits building tests (you probably don't need them
 unless you are a developer of OIIO or want to verify that your build
@@ -249,6 +257,7 @@ Additionally, a few helpful modifiers alter some build-time options:
 | make USE_QT=0 ...             |  Skip anything that needs Qt                                              |
 | make MYCC=xx MYCXX=yy ...     |  Use custom compilers                                                     |
 | make USE_PYTHON=0 ...         |  Don't build the Python binding                                           |
+| make OIIO_PYTHON_BINDINGS_BACKEND=both ... | For source/CMake builds, build the existing pybind11 bindings and the nanobind (WIP) module |
 | make BUILD_SHARED_LIBS=0      |  Build static library instead of shared                                   |
 | make IGNORE_HOMEBREWED_DEPS=1 |  Ignore homebrew-managed dependencies                                     |
 | make LINKSTATIC=1 ...         |  Link with static external libraries when possible                        |
@@ -449,3 +458,7 @@ You do not need any of these packages in order to build or use
 OpenImageIO. But if you are going to contribute to OpenImageIO
 development, you probably want them, since it is required for executing
 OpenImageIO's test suite (when you run "make test").
+
+
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+<!-- Copyright Contributors to the OpenImageIO Project. -->

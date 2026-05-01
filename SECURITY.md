@@ -8,22 +8,26 @@ security vulnerabilities.
 | Version / branch  | Supported                                            |
 | ----------------- | ---------------------------------------------------- |
 | main              | :white_check_mark: :construction: ALL fixes immediately, but this is a branch under development with a frequently unstable ABI and occasionally unstable API. |
-| 3.0.x             | :white_check_mark: All fixes that can be backported without breaking ABI compatibility. New tagged releases monthly. |
-| 2.5.x             | :warning: Bug fixes backported only if critical or upon request (and if we are able to cleanly backport). New tagged releases only occasionally. |
-| <= 2.4.x          | :x: No longer receiving patches of any kind.        |
+| 3.1.x             | :white_check_mark: All fixes that can be backported without breaking ABI compatibility. New tagged releases monthly. |
+| 3.0.x             | :warning: Important fixes that can be easily backported without breaking ABI compatibility. New tagged releases as needed, and becoming less frequent over time. |
+| <= 2.5.x         | :x: No longer receiving patches of any kind.        |
 
 
 ## Reporting a Vulnerability
 
 If you think you've found a potential vulnerability in OpenImageIO, please
-report it by emailing security@openimageio.org. Only the project administrators
-have access to these messages. Include detailed steps to reproduce the issue,
-and any other information that could aid an investigation. Our policy is to
-respond to vulnerability reports within 14 days.
+report it to the maintainers. Include detailed steps to reproduce the issue,
+and any other information that could aid an investigation.
 
-Our policy is to address critical security vulnerabilities rapidly and post
-patches as quickly as possible.
+The best way to report a vulnerability is to file a GitHub [security
+advisory](https://github.com/AcademySoftwareFoundation/OpenImageIO/security/advisories/new).
+If that is not possible, it is also fine to email your report to
+security@openimageio.org. Only the project administrators have access to these
+reports.
 
+Our policy is to respond to vulnerability reports within 14 days, and to
+address critical security vulnerabilities rapidly and post patches as quickly
+as possible.
 
 ## Other security features
 
@@ -44,7 +48,7 @@ None known
 
 ## History of CVE Fixes
 
-Most recent fixes listed first, more or less
+Most recent fixes listed first, more or less:
 
 - CVE-2024-40630: Fixed incorrect image size for certain HEIC files.
   [advisory](https://github.com/AcademySoftwareFoundation/OpenImageIO/security/advisories/GHSA-jjm9-9m4m-c8p2) (Fixed in 2.5.13.1)

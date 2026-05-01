@@ -40,7 +40,6 @@ add_rgb_rgba.exr     :   64 x   64, 4 channel, float openexr
     PixelAspectRatio: 1
     screenWindowCenter: 0, 0
     screenWindowWidth: 1
-    oiio:ColorSpace: "lin_rec709"
     oiio:subimages: 1
     openexr:lineOrder: "increasingY"
 dumpdata:
@@ -69,7 +68,11 @@ Comparing "autotrim.tif" and "ref/autotrim.tif"
 PASS
 Comparing "trim.tif" and "ref/trim.tif"
 PASS
+Comparing "trimempty.tif" and "ref/trimempty.tif"
+PASS
 Comparing "trimsubimages.tif" and "ref/trimsubimages.tif"
+PASS
+Comparing "trimemptysubimages.tif" and "ref/trimemptysubimages.tif"
 PASS
 Comparing "add.exr" and "ref/add.exr"
 PASS
@@ -122,6 +125,10 @@ PASS
 Comparing "tahoe-filled.tif" and "ref/tahoe-filled.tif"
 PASS
 Comparing "growholes.tif" and "ref/growholes.tif"
+PASS
+Comparing "data-offset-hole-filled.exr" and "ref/data-offset-hole-filled.exr"
+PASS
+Comparing "display-offset-hole-filled.exr" and "ref/display-offset-hole-filled.exr"
 PASS
 Comparing "rangecompress.tif" and "ref/rangecompress.tif"
 PASS

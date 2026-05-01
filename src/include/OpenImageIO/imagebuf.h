@@ -1,5 +1,5 @@
 // Copyright Contributors to the OpenImageIO project.
-// SPDX-License-Identifier: BSD-3-Clause and Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 // https://github.com/AcademySoftwareFoundation/OpenImageIO
 
 
@@ -37,13 +37,7 @@
 
 
 
-OIIO_NAMESPACE_BEGIN
-
-class ImageBuf;
-class ImageBufImpl;  // Opaque type for the unique_ptr.
-class ImageCache;
-class ImageCacheTile;
-
+OIIO_NAMESPACE_3_1_BEGIN
 
 
 /// Return pixel data window for this ImageSpec as a ROI.
@@ -1100,7 +1094,7 @@ public:
     ///             Return true if the operation could be completed,
     ///             otherwise return false.
     ///
-    template<typename T> bool set_pixels(ROI roi, const image_span<T> buffer)
+    template<typename T> bool set_pixels(ROI roi, const image_span<T>& buffer)
     {
         return set_pixels(roi, TypeDescFromC<T>::value(),
                           as_image_span_bytes(buffer));
@@ -1375,6 +1369,16 @@ public:
     void* localpixels();
     const void* localpixels() const;
 
+    /// Return an `image_span<const std::byte>` giving the extent and layout
+    /// of "local" pixel memory, if they are fully in RAM and not backed by an
+    /// ImageCache, or an empty span otherwise.
+    image_span<const std::byte> localpixels_as_byte_image_span() const;
+
+    /// Return an `image_span<std::byte>` giving the extent and layout of
+    /// "local" pixel memory, if they are fully in RAM and not backed by an
+    /// ImageCache, and it is a writable IB, or an empty span otherwise.
+    image_span<std::byte> localpixels_as_writable_byte_image_span();
+
     /// Pixel-to-pixel stride within the localpixels memory.
     stride_t pixel_stride() const;
     /// Scanline-to-scanline stride within the localpixels memory.
@@ -1382,13 +1386,22 @@ public:
     /// Z plane stride within the localpixels memory.
     stride_t z_stride() const;
 
-    /// Is this an in-memory buffer with the data layout "contiguous", i.e.,
+    /// Is this an in-memory buffer with the data layout "fully contiguous",
+    /// i.e.,
     /// ```
     ///     pixel_stride == nchannels * pixeltype().size()
     ///     scanline_stride == pixel_stride * spec().width
     ///     z_stride == scanline_stride * spec().height
     /// ```
     bool contiguous() const;
+
+    /// Is this an in-memory buffer with the data layout "contiguous" for
+    /// each scanline (but not considering whether adjacent scanlines or
+    /// image planes are fully contiguous), i.e.,
+    /// ```
+    ///     pixel_stride == nchannels * pixeltype().size()
+    /// ```
+    bool contiguous_scanline() const;
 
     /// Are the pixels backed by an ImageCache, rather than the whole
     /// image being in RAM somewhere?
@@ -2042,4 +2055,14 @@ protected:
 };
 
 
+OIIO_NAMESPACE_3_1_END
+
+
+// Compatibility
+OIIO_NAMESPACE_BEGIN
+using v3_1::get_roi;
+using v3_1::get_roi_full;
+using v3_1::InitializePixels;
+using v3_1::set_roi;
+using v3_1::set_roi_full;
 OIIO_NAMESPACE_END

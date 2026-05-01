@@ -11,9 +11,25 @@ static ParamValue
 ParamValue_from_pyobject(string_view name, TypeDesc type, int nvalues,
                          ParamValue::Interp interp, const py::object& obj)
 {
+    ParamValue pv;
+    // Unsized uint8[] + bytes infers arraylen — must run before numelements().
+    if (type.basetype == TypeDesc::UINT8 && type.arraylen
+        && py::isinstance<py::bytes>(obj)) {
+        TypeDesc t    = type;
+        std::string s = obj.cast<py::bytes>();
+        if (type.arraylen < 0)
+            t.arraylen = int(s.size()) / nvalues;
+        if (t.arraylen * nvalues == int(s.size())) {
+            std::vector<uint8_t> vals((const uint8_t*)s.data(),
+                                      (const uint8_t*)s.data() + s.size());
+            pv.init(name, t, nvalues, interp, vals.data());
+            return pv;
+        }
+        return pv;
+    }
+
     size_t expected_size = size_t(type.numelements() * type.aggregate
                                   * nvalues);
-    ParamValue pv;
     if (type.basetype == TypeDesc::INT) {
         std::vector<int> vals;
         py_to_stdvector(vals, obj);
@@ -45,18 +61,6 @@ ParamValue_from_pyobject(string_view name, TypeDesc type, int nvalues,
             pv.init(name, type, nvalues, interp, &u[0]);
             return pv;
         }
-    } else if (type.basetype == TypeDesc::UINT8 && type.arraylen
-               && py::isinstance<py::bytes>(obj)) {
-        // Special case: converting a "bytes" object to a byte array
-        std::string s = obj.cast<py::bytes>();
-        if (type.arraylen < 0)  // convert un-specified length to real length
-            type.arraylen = int(s.size()) / nvalues;
-        if (type.arraylen * nvalues == int(s.size())) {
-            std::vector<uint8_t> vals((const uint8_t*)s.data(),
-                                      (const uint8_t*)s.data() + s.size());
-            pv.init(name, type, nvalues, interp, vals.data());
-            return pv;
-        }
     } else if (type.basetype == TypeDesc::UINT8) {
         std::vector<uint8_t> vals;
         py_to_stdvector(vals, obj);
@@ -75,6 +79,15 @@ ParamValue_from_pyobject(string_view name, TypeDesc type, int nvalues,
     // throw std::length_error("ParamValue data length mismatch");
 
     return pv;
+}
+
+
+
+static void
+ParamValueList_attribute_onearg(ParamValueList& self, const std::string& name,
+                                const py::object& obj)
+{
+    attribute_onearg(self, name, obj);
 }
 
 
@@ -240,18 +253,7 @@ declare_paramvalue(py::module& m)
             "value"_a, "casesensitive"_a = true)
         .def("sort", &ParamValueList::sort, "casesensitive"_a = true)
         .def("merge", &ParamValueList::merge, "other"_a, "override"_a = false)
-        .def("attribute",
-             [](ParamValueList& self, const std::string& name, float val) {
-                 self.attribute(name, TypeFloat, &val);
-             })
-        .def("attribute", [](ParamValueList& self, const std::string& name,
-                             int val) { self.attribute(name, TypeInt, &val); })
-        .def("attribute",
-             [](ParamValueList& self, const std::string& name,
-                const std::string& val) {
-                 const char* s = val.c_str();
-                 self.attribute(name, TypeString, &s);
-             })
+        .def("attribute", ParamValueList_attribute_onearg, "name"_a, "val"_a)
         .def("attribute",
              [](ParamValueList& self, const std::string& name, TypeDesc type,
                 const py::object& obj) {

@@ -86,7 +86,8 @@ time_read_image()
     for (ustring filename : input_filename) {
         auto in = ImageInput::open(filename.c_str());
         OIIO_ASSERT(in);
-        in->read_image(0, 0, 0, in->spec().nchannels, conversion, &buffer[0]);
+        (void)in->read_image(0, 0, 0, in->spec().nchannels, conversion,
+                             &buffer[0]);
         in->close();
     }
 }
@@ -126,10 +127,11 @@ time_read_64_scanlines_at_a_time()
             pixelsize = spec.pixel_bytes(true);  // UNKNOWN -> native
         imagesize_t scanlinesize = spec.width * pixelsize;
         for (int y = 0; y < spec.height; y += 64) {
-            in->read_scanlines(/*subimage=*/0, /*miplevel=*/0, y + spec.y,
-                               std::min(y + spec.y + 64, spec.y + spec.height),
-                               0, 0, spec.nchannels, conversion,
-                               &buffer[scanlinesize * y]);
+            bool ok = in->read_scanlines(
+                /*subimage=*/0, /*miplevel=*/0, y + spec.y,
+                std::min(y + spec.y + 64, spec.y + spec.height), 0, 0,
+                spec.nchannels, conversion, &buffer[scanlinesize * y]);
+            OIIO_ASSERT(ok);
         }
         in->close();
     }
@@ -172,8 +174,8 @@ test_read(const std::string& explanation, void (*func)(), int autotile = 64,
     imagecache->attribute("autoscanline", autoscanline);
     double t    = time_trial(func, ntrials);
     double rate = double(total_image_pixels) / t;
-    print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
-          Strutil::timeintervalformat(t, 2), rate / 1.0e6);
+    OIIO::print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
+                Strutil::timeintervalformat(t, 2), rate / 1.0e6);
 }
 
 
@@ -297,8 +299,8 @@ test_write(const std::string& explanation, void (*func)(), int tilesize = 0)
     outspec.tile_depth  = 1;
     double t            = time_trial(func, ntrials);
     double rate         = double(total_image_pixels) / t;
-    print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
-          Strutil::timeintervalformat(t, 2), rate / 1.0e6);
+    OIIO::print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
+                Strutil::timeintervalformat(t, 2), rate / 1.0e6);
 }
 
 
@@ -444,8 +446,8 @@ test_pixel_iteration(const std::string& explanation,
     ib.read(0, 0, preload, TypeFloat);
     double t    = time_trial(std::bind(func, std::ref(ib), iters), ntrials);
     double rate = double(ib.spec().image_pixels()) / (t / iters);
-    print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
-          Strutil::timeintervalformat(t / iters, 3), rate / 1.0e6);
+    OIIO::print("  {}: {} = {:5.1f} Mpel/s\n", explanation,
+                Strutil::timeintervalformat(t / iters, 3), rate / 1.0e6);
 }
 
 
@@ -548,7 +550,9 @@ main(int argc, char** argv)
         auto in = ImageInput::open(input_filename[0].c_str());
         OIIO_ASSERT(in);
         bufspec = in->spec(0, 0);
-        in->read_image(0, 0, 0, bufspec.nchannels, conversion, &buffer[0]);
+        bool ok = in->read_image(0, 0, 0, bufspec.nchannels, conversion,
+                                 &buffer[0]);
+        OIIO_ASSERT(ok);
         in->close();
         in.reset();
         std::cout << "Timing ways of writing images:\n";

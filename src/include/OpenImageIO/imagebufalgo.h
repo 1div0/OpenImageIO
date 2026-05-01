@@ -18,18 +18,14 @@
 #include <OpenImageIO/imagebuf.h>
 #include <OpenImageIO/fmath.h>
 #include <OpenImageIO/parallel.h>
+#include <OpenImageIO/paramlist.h>
 #include <OpenImageIO/span.h>
 #include <OpenImageIO/vecparam.h>
 
 #include <limits>
 
 
-OIIO_NAMESPACE_BEGIN
-
-// forward declarations
-class ColorConfig;
-class ColorProcessor;
-class Filter2D;
+OIIO_NAMESPACE_3_1_BEGIN
 
 
 /// @defgroup ImageBufAlgo_intro (ImageBufAlgo common principles)
@@ -311,7 +307,7 @@ bool OIIO_API render_line (ImageBuf &dst, int x1, int y1, int x2, int y2,
 /// as many values as `roi.chend-1`. The ROI can be used to limit the pixel
 /// area or channels that are modified, and default to the entirety of
 /// `dst`. If `fill` is `true`, the box will be completely filled in,
-/// otherwise only its outlien will be drawn.
+/// otherwise only its outline will be drawn.
 bool OIIO_API render_box (ImageBuf &dst, int x1, int y1, int x2, int y2,
                           cspan<float> color=1.0f, bool fill = false,
                           ROI roi={}, int nthreads=0);
@@ -546,7 +542,7 @@ bool OIIO_API transpose (ImageBuf &dst, const ImageBuf &src,
 /// @}
 
 
-/// Return (or store into `dst`) a copy of `src`, but with whatever seties
+/// Return (or store into `dst`) a copy of `src`, but with whatever series
 /// of rotations, flips, or flops are necessary to transform the pixels into
 /// the configuration suggested by the "Orientation" metadata of the image
 /// (and the "Orientation" metadata is then set to 1, ordinary orientation).
@@ -1250,7 +1246,7 @@ OIIO_API bool contrast_remap (ImageBuf &dst, const ImageBuf &src,
 /// `src` within the ROI, and in the process adjusts the color saturation of
 /// the three consecutive channels starting with `firstchannel` based on the
 /// `scale` parameter: 0.0 fully desaturates to a greyscale image of
-/// percaptually equivalent luminance, 1.0 leaves the colors unchanged,
+/// perceptually equivalent luminance, 1.0 leaves the colors unchanged,
 /// `scale` values inside this range interpolate between them, and `scale` > 1
 /// would increase apparent color saturation.
 ///
@@ -1443,6 +1439,150 @@ int OIIO_API compare_Yee (const ImageBuf &A, const ImageBuf &B,
                           CompareResults &result,
                           float luminance = 100, float fov = 45,
                           ROI roi={}, int nthreads=0);
+
+
+#if OIIO_VERSION_GREATER_EQUAL(3, 2, 0) || defined(OIIO_INTERNAL)
+namespace experimental {
+// These FLIP_diff functions are EXPERIMENTAL and subject to change without
+// breaking our rules about backward compatibility. They are present for our
+// own experimentation but not exposed to external users for versions earlier
+// than 3.2, so far.
+
+/// @defgroup FLIP_diff (FLIP perceptual image difference)
+/// @{
+///
+/// WARNING: This is EXPERIMENTAL and may change at any time. Do not rely
+/// on it prior to the release of OIIO 3.2.
+///
+/// Compute the FLIP perceptual difference between a reference image and a
+/// test image, returning an error map whose pixel values are in [0,1]. FLIP
+/// is a perceptual image difference metric based on human visual perception.
+/// Both LDR and HDR modes are supported.
+///
+/// References:
+/// - Andersson et al., "FLIP: A Difference Evaluator for Alternating
+///   Images", HPG 2020.
+/// - Andersson et al., "Visualizing Errors in Rendered High Dynamic Range
+///   Images", Eurographics 2021.
+///
+/// If the input images do not have a known colorspace, they will be assumed
+/// to be "lin_rec709_scene". If `roi` is not defined, it defaults to the
+/// union of the two images' data windows. Three channels starting at
+/// `roi.chbegin` are used. Currently, alpha or any other additional channels
+/// are not incorporated into the error metric.
+///
+/// Returns (or writes to `dst`) a single-channel float error map in [0,1].
+/// For visualization purposes, it may be helpful to subsequently use the
+/// `ImageBufAlgo::color_map()` function to produce a false-color image of the
+/// error. Summary statistics are stored as metadata attributes on the
+/// returned error map image:
+///
+///   - `"FLIP:meanerror"` (float) : mean perceptual error over all pixels
+///   - `"FLIP:maxerror"`  (float) : maximum per-pixel error
+///   - `"FLIP:maxx"`, `"FLIP:maxy"` (int) : pixel coordinates of maximum error
+///   - `"FLIP:startExposure"`, `"FLIP:stopExposure"` (float) : HDR exposure range
+///   - `"FLIP:numExposures"` (int) : number of HDR exposure steps used
+///
+/// The `options` list contains optional ParamValue's that may control the
+/// reconstruction. The following options are recognized:
+///
+///   - "hdr" : int (default: 1)
+///
+///     Selects between LDR comparision (0), and HDR comparison (1).
+///     By default, we always use the HDR method.
+///
+///   - "maxluminance" : float (default: 2.0)
+///
+///     The top of the expected luminance range, used to compute exposure
+///     settings. If set to 0.0, the "startExposure" and "stopExposure"
+///     will be used instead. (See below for a detailed explanation.)
+///
+///   - "startExposure", "stopExposure" : float (default: NaN)
+/// 
+///     If supplied, and if "maxluminance" is set to 0, specify start and stop
+///     exposures for the HDR FLIP method. If not supplied, they will be
+///     automatically computed from the contents of the image.
+///
+///   - "numExposures" : int (default: 0)
+/// 
+///     The number of exposure samples for HDR FLIP computation (0 means to
+///     automatically compute it).
+///
+///   - "medianluminance" : float (default: 0.18)
+///
+///     The assumed median luminance (used if "maxluminance" is not 0, so
+///     we are using these estimates instead of measuring from the image).
+///     The default 0.18 assumes that "middle grey" is a good guess for
+///     a typical median luminance of the image.
+///
+///   - "ppd" : float (default: 67.02)
+///
+///     Pixels per degree of viewing angle. The default value of 67.02 is
+///     computed as the value for a 3840 pixel (2xHD) image filling a display
+///     that is 0.7m wide, 0.7m in front of the viewer.
+///
+///   - "tonemapper" : string (default: "aces")
+///
+///     HDR tonemapper: "aces", "reinhard", or "hable".
+///
+/// The LDR mode (when the `"hdr"` option is set to 0) clamps all values
+/// beteen 0 and 1. This is recommend only for images in display-referred
+/// color space.
+///
+/// The HDR mode (when the `"hdr"` option is nonzero or not supplied) computes
+/// the LDR FLIP comparison at each of several exposure settings, and returns
+/// the maximum error for each pixel across those exposures. The exposures are
+/// are determined one of three ways:
+///
+/// 1. Based on a maximum expected luminance of the image, communicated via
+/// the `"maxluminance"` option. If not passed, the default is 2.0, which is a
+/// reasonable default for most production frames.  The exposure start and
+/// stop will then be automatically computed based on this maximum, and an
+/// assumption that the median luminance is 0.18 (middle grey of the LDR
+/// portion of the image). This is the default behavior if none of the options
+/// are passed, and is the recommended mode if you do not have a good reason
+/// to override it, because it works well for most production images and the
+/// error metric values will have the same meaning across images.
+///
+/// 2. If "maxluminance" is set to 0 but the "startExposure" and
+/// "stopExposure" options are not supplied, they will be computed
+/// automatically based on the measured maximum and median luminance of the
+/// reference image. This behavior matches the original NVIDIA FLIP paper and
+/// utility, but is less useful when dealing with multiple images, because the
+/// error scaling depends on the content of the image, and thus may differ
+/// from image to image even within a shot.
+///
+/// 3. If "maxluminance" is set to 0 and the "startExposure" and
+/// "stopExposure" options are supplied, those will be used directly as the
+/// exposure settings.
+///
+/// @version 3.2
+///
+
+OIIO_NODISCARD OIIO_API
+ImageBuf FLIP_diff(const ImageBuf& ref, const ImageBuf& test,
+                   KWArgs options = {}, ROI roi = {}, int nthreads = 0);
+
+OIIO_NODISCARD_ERROR OIIO_API
+bool FLIP_diff(ImageBuf& dst, const ImageBuf& ref, const ImageBuf& test,
+               KWArgs options = {}, ROI roi = {}, int nthreads = 0);
+
+/// Helper for FLIP_diff: Compute pixels-per-degree from display geometry.
+/// Default values: 0.7m distance, 3840px width (2x HD), 0.7m monitor width ->
+/// ~67.02.
+OIIO_NODISCARD
+inline constexpr float FLIP_ppd(float monitor_distance_m = 0.7f,
+                                float screen_width_px    = 3840.0f,
+                                float screen_width_m     = 0.7f)
+{
+    return radians(monitor_distance_m * (screen_width_px / screen_width_m));
+}
+
+}  // namespace experimental
+
+#endif
+
+/// @}
 
 
 /// Do all pixels within the ROI have the same values for channels
@@ -2121,14 +2261,14 @@ bool OIIO_API ocionamedtransform (ImageBuf &dst, const ImageBuf &src,
 /// `src` within the ROI, and in the process divides all color channels
 /// (those not alpha or z) by the alpha value, to "un-premultiply" them.
 /// This presumes that the image starts of as "associated alpha" a.k.a.
-/// "premultipled," and you are converting to "unassociated alpha." For
+/// "premultiplied," and you are converting to "unassociated alpha." For
 /// pixels with alpha == 0, the color values are not modified.
 ///
 /// The `premult` operation returns (or copies into `dst`) the pixels of
 /// `src` within the ROI, and in the process multiplies all color channels
 /// (those not alpha or z) by the alpha value, to "premultiply" them.  This
 /// presumes that the image starts of as "unassociated alpha" a.k.a.
-/// "non-premultipled" and converts it to "associated alpha / premultipled."
+/// "non-premultiplied" and converts it to "associated alpha / premultiplied."
 ///
 /// The `repremult` operation is like `premult`, but preserves the color
 /// values of pixels whose alpha is 0. This is intended for cases where you
@@ -2251,7 +2391,9 @@ enum MakeTextureMode {
 ///                                 the coordinates for normal maps. ("")
 ///    - `maketx:verbose` (int) :   How much detail should go to outstream (0).
 ///    - `maketx:runstats` (int) :  If nonzero, print run stats to outstream (0).
+///    - `maketx:threads` (int) :   Number of threads to use (0 = auto).
 ///    - `maketx:resize` (int) :    If nonzero, resize to power of 2. (0)
+///    - `maketx:keepaspect` (int): If nonzero, save aspect ratio to metadata. (0)
 ///    - `maketx:nomipmap` (int) :  If nonzero, only output the top MIP level (0).
 ///    - `maketx:updatemode` (int) : If nonzero, write new output only if the
 ///                                  output file doesn't already exist, or is
@@ -2372,6 +2514,36 @@ enum MakeTextureMode {
 ///                           factor. The default is 0, disabling the
 ///                           feature. If you use this feature, a suggested
 ///                           value is 256.
+///    - `maketx:slopefilter` (string) :
+///                           When used in MakeTxBumpWithSlopes mode, this
+///                           sets the filter for computing the slopes when 
+///                           `--bumpformat` is set to "height". The default
+///                           value is "sobel". The option "centraldiff"
+///                           matches the behavior of `txmake` and is less
+///                           prone to ring-shaped artifacting. (sobel)
+///    - `maketx:bumpinverts` (int) :
+///                           When used in MakeTxBumpWithSlopes mode, a
+///                           non-zero value inverts the computed slopes on the
+///                           s/u/x direction. (0)
+///    - `maketx:bumpinvertt` (int) :
+///                           When used in MakeTxBumpWithSlopes mode, a
+///                           non-zero value inverts the computed slopes on the
+///                           t/v/y direction. (0)
+///    - `maketx:bumpscale` (float) :
+///                           When used in MakeTxBumpWithSlopes mode, this
+///                           scales the strength of the resulting bumpslopes 
+///                           map. (1.0)
+///    - `maketx:bumprange` (string) :
+///                           When used in MakeTxBumpWithSlopes mode, this
+///                           sets the convention used for normal map data when
+///                           `--bumpformat` is set to "normal". When set to 
+///                           "centered", the normals data is assumed to exist
+///                           on the range [-1,1]. When set to "positive", the 
+///                           normals data is assumed to exist on the range 
+///                           [0,1]. When set to "auto", the default value, the
+///                           range is inferred based on whether or not
+///                           negative values are present in the input image. 
+///                           (auto)
 ///    - `maketx:cdf` (int) :
 ///                           If nonzero, will write a Gaussian CDF and
 ///                           Inverse Gaussian CDF as per-channel metadata
@@ -2504,7 +2676,7 @@ bool OIIO_API deep_merge (ImageBuf &dst, const ImageBuf &A,
 /// Return the samples of deep image `src` that are closer than the opaque
 /// frontier of deep image holdout, returning true upon success and false
 /// for any failures. Samples of `src` that are farther than the first
-/// opaque sample of holdout (for the corresponding pixel)will not be copied
+/// opaque sample of holdout (for the corresponding pixel) will not be copied
 /// to `dst`. Image holdout is only used as the depth threshold; no sample
 /// values from holdout are themselves copied to `dst`.
 ImageBuf OIIO_API deep_holdout (const ImageBuf &src, const ImageBuf &holdout,
@@ -2675,4 +2847,15 @@ inline bool fit(ImageBuf &dst, const ImageBuf &src, Filter2D *filter,
 
 }  // end namespace ImageBufAlgo
 
+OIIO_NAMESPACE_END
+
+
+// Compatibility
+OIIO_NAMESPACE_BEGIN
+#ifndef OIIO_DOXYGEN
+using v3_1::Image_or_Const;
+namespace ImageBufAlgo {
+using namespace OIIO::v3_1::ImageBufAlgo;
+}
+#endif
 OIIO_NAMESPACE_END

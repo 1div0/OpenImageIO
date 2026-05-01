@@ -21,7 +21,7 @@
 #include "imageio_pvt.h"
 
 
-OIIO_NAMESPACE_BEGIN
+OIIO_NAMESPACE_3_1_BEGIN
 
 
 template<typename DSTTYPE>
@@ -63,7 +63,7 @@ ImageBufAlgo::channels(ImageBuf& dst, const ImageBuf& src, int nchannels,
         return ok;
     }
 
-    pvt::LoggedTimer logtime("IBA::channels");
+    OIIO::pvt::LoggedTimer logtime("IBA::channels");
     // Not intended to create 0-channel images.
     if (nchannels <= 0) {
         dst.errorfmt("{}-channel images not supported", nchannels);
@@ -105,7 +105,6 @@ ImageBufAlgo::channels(ImageBuf& dst, const ImageBuf& src, int nchannels,
     newspec.channelformats.clear();
     newspec.alpha_channel = -1;
     newspec.z_channel     = -1;
-    bool all_same_type    = true;
     for (int c = 0; c < nchannels; ++c) {
         int csrc = channelorder[c];
         // If the user gave an explicit name for this channel, use it...
@@ -122,8 +121,6 @@ ImageBufAlgo::channels(ImageBuf& dst, const ImageBuf& src, int nchannels,
         }
         TypeDesc type = src.spec().channelformat(csrc);
         newspec.channelformats.push_back(type);
-        if (type != newspec.channelformats.front())
-            all_same_type = false;
         // Use the names (or designation of the src image, if
         // shuffle_channel_names is true) to deduce the alpha and z channels.
         if ((shuffle_channel_names && csrc == src.spec().alpha_channel)
@@ -134,8 +131,10 @@ ImageBufAlgo::channels(ImageBuf& dst, const ImageBuf& src, int nchannels,
             || Strutil::iequals(newspec.channelnames[c], "Z"))
             newspec.z_channel = c;
     }
-    if (all_same_type)                   // clear per-chan formats if
-        newspec.channelformats.clear();  // they're all the same
+    newspec.format = TypeDesc::basetype_merge(newspec.channelformats);
+    // clear per-chan formats if they're all the same
+    if (TypeDesc::all_types_equal(newspec.channelformats))
+        newspec.channelformats.clear();
 
     // Update the image (realloc with the new spec)
     dst.reset(newspec);
@@ -228,7 +227,7 @@ bool
 ImageBufAlgo::channel_append(ImageBuf& dst, const ImageBuf& A,
                              const ImageBuf& B, ROI roi, int nthreads)
 {
-    pvt::LoggedTimer logtime("IBA::channel_append");
+    OIIO::pvt::LoggedTimer logtime("IBA::channel_append");
     // If the region is not defined, set it to the union of the valid
     // regions of the two source images.
     if (!roi.defined())
@@ -294,4 +293,4 @@ ImageBufAlgo::channel_append(const ImageBuf& A, const ImageBuf& B, ROI roi,
 }
 
 
-OIIO_NAMESPACE_END
+OIIO_NAMESPACE_3_1_END

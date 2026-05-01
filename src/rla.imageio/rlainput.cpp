@@ -78,7 +78,7 @@ private:
 
     /// Helper: read the RLA header and scanline offset table.
     ///
-    inline bool read_header();
+    bool read_header();
 
     /// Helper: read and decode a single channel group consisting of
     /// channels [first_channel .. first_channel+num_channels-1], which
@@ -86,11 +86,11 @@ private:
     bool decode_channel_group(int first_channel, short num_channels,
                               short num_bits, int y);
 
-    /// Helper: decode a span of n RLE-encoded bytes from encoded[0..elen-1]
+    /// Helper: decode a span of n RLE-encoded bytes from encoded[]
     /// into buf[0],buf[stride],buf[2*stride]...buf[(n-1)*stride].
     /// Return the number of encoded bytes we ate to fill buf.
-    size_t decode_rle_span(unsigned char* buf, int n, int stride,
-                           const char* encoded, size_t elen);
+    size_t decode_rle_span(span<unsigned char> buf, int n, int stride,
+                           cspan<char> encoded);
 
     /// Helper: determine channel TypeDesc
     inline TypeDesc get_channel_typedesc(short chan_type, short chan_bits);
@@ -112,10 +112,10 @@ private:
             swap_endian(s, 2);
             swap_endian(&i);
         }
-        print(out,
-              "{:d}/{:d} {:d}/{:d} {:d}/{:d} {:d}/{:d} ({:d} {:d}) ({:d})\n",
-              u.c[0], ((char*)u.c)[0], u.c[1], ((char*)u.c)[1], u.c[2],
-              ((char*)u.c)[2], u.c[3], ((char*)u.c)[3], s[0], s[1], i);
+        Strutil::print(
+            out, "{:d}/{:d} {:d}/{:d} {:d}/{:d} {:d}/{:d} ({:d} {:d}) ({:d})\n",
+            u.c[0], ((char*)u.c)[0], u.c[1], ((char*)u.c)[1], u.c[2],
+            ((char*)u.c)[2], u.c[3], ((char*)u.c)[3], s[0], s[1], i);
         ioseek(pos);
     }
 };
@@ -175,7 +175,7 @@ RLAInput::open(const std::string& name, ImageSpec& newspec)
 
 
 
-inline bool
+bool
 RLAInput::read_header()
 {
     // Read the image header, which should have the same exact layout as
@@ -200,6 +200,17 @@ RLAInput::read_header()
     }
     if (m_rla.NumOfChannelBits == 0)
         m_rla.NumOfChannelBits = 8;  // apparently, this can happen
+
+    if (m_rla.NumOfMatteBits == 0 && m_rla.NumOfMatteChannels > 0) {
+        errorfmt("{} matte channels but 0 matte bits. Possible corrupt input?",
+                 m_rla.NumOfMatteChannels);
+        return false;
+    }
+    if (m_rla.NumOfAuxBits == 0 && m_rla.NumOfAuxChannels > 0) {
+        errorfmt("{} aux channels but 0 aux bits. Possible corrupt input?",
+                 m_rla.NumOfAuxChannels);
+        return false;
+    }
 
     // Immediately following the header is the scanline offset table --
     // one uint32_t for each scanline, giving absolute offsets (from the
@@ -234,10 +245,11 @@ RLAInput::seek_subimage(int subimage, int miplevel)
         ioseek(0);
         if (!read_header())
             return false;  // read_header always calls error()
-        diff = subimage;
+        diff       = subimage;
+        m_subimage = 0;
     }
     // forward scrolling -- skip subimages until we're at the right place
-    while (diff > 0 && m_rla.NextOffset != 0) {
+    while (diff > 0 && m_subimage < subimage && m_rla.NextOffset != 0) {
         if (!ioseek(m_rla.NextOffset)) {
             errorfmt("Could not seek to header offset. Corrupted file?");
             return false;
@@ -245,6 +257,7 @@ RLAInput::seek_subimage(int subimage, int miplevel)
         if (!read_header())
             return false;  // read_header always calls error()
         --diff;
+        ++m_subimage;
     }
     if (diff > 0 && m_rla.NextOffset == 0) {  // no more subimages to read
         errorfmt("Unknown subimage");
@@ -308,6 +321,15 @@ RLAInput::seek_subimage(int subimage, int miplevel)
     m_spec.full_depth  = 1;
     m_spec.full_x      = m_rla.WindowLeft;
     m_spec.full_y      = m_spec.full_height - 1 - m_rla.WindowTop;
+
+    // Check validity of resolutions. The width and height are the difference
+    // between left and right (and top/down) coordinates, which are both
+    // int16_t, giving a maximum of 2^16-1 resolution in each direction. And
+    // the max number of channels is up to 3 color, up to 3 matte, and up to
+    // 256 auxiliary channels.
+    if (!check_open(m_spec, { 0, (1 << 16) - 1, 0, (1 << 16) - 1, 0, 1, 0,
+                              3 + 3 + 256 }))
+        return false;
 
     // set channel formats and stride
     int z_channel = -1;
@@ -397,11 +419,6 @@ RLAInput::seek_subimage(int subimage, int miplevel)
 
     float gamma = Strutil::from_string<float>(m_rla.Gamma);
     if (gamma > 0.f) {
-        // Round gamma to the nearest hundredth to prevent stupid
-        // precision choices and make it easier for apps to make
-        // decisions based on known gamma values. For example, you want
-        // 2.2, not 2.19998.
-        gamma = roundf(100.0 * gamma) / 100.0f;
         set_colorspace_rec709_gamma(m_spec, gamma);
     }
 
@@ -475,23 +492,28 @@ RLAInput::close()
 
 
 size_t
-RLAInput::decode_rle_span(unsigned char* buf, int n, int stride,
-                          const char* encoded, size_t elen)
+RLAInput::decode_rle_span(span<unsigned char> buf, int n, int stride,
+                          cspan<char> encoded)
 {
-    size_t e = 0;
+    size_t e    = 0;               // position we're reading in encoded
+    size_t elen = encoded.size();  // Number of encoded bytes to decode
+    size_t b    = 0;               // postition we're writing in buf
     while (n > 0 && e < elen) {
-        signed char count = (signed char)encoded[e++];
+        int count = (signed char)encoded[e++];
         if (count >= 0) {
             // run count positive: value repeated count+1 times
-            for (int i = 0; i <= count && n && e < elen;
-                 ++i, buf += stride, --n)
-                *buf = encoded[e];
+            if (count + 1 > n)
+                break;  // asking for a count that will overrun the buffer
+            for (int i = 0; i <= count; ++i, b += stride, --n)
+                buf[b] = encoded[e];
             ++e;
         } else {
             // run count negative: repeat bytes literally
             count = -count;  // make it positive
-            for (; count && n > 0 && e < elen; --count, buf += stride, --n)
-                *buf = encoded[e++];
+            if (count > n)
+                break;  // asking for a count that will overrun the buffer
+            for (; count && n > 0 && e < elen; --count, b += stride, --n)
+                buf[b] = encoded[e++];
         }
     }
     if (n != 0) {
@@ -525,7 +547,7 @@ RLAInput::decode_channel_group(int first_channel, short num_channels,
         offset    = 0;
         pixelsize = m_spec.pixel_bytes(true);
         for (int i = 0; i < first_channel; ++i)
-            offset += m_spec.channelformats[i].size();
+            offset += m_spec.channelformat(i).size();
     }
 
     // Read the big-endian values into the buffer.
@@ -568,14 +590,23 @@ RLAInput::decode_channel_group(int first_channel, short num_channels,
         // and strides to decode_rle_span.
         size_t eoffset = 0;
         for (int bytes = 0; bytes < chsize && length > 0; ++bytes) {
-            size_t e = decode_rle_span(&m_buf[offset + c * chsize + bytes],
+            size_t e = decode_rle_span(make_span(m_buf).subspan(
+                                           offset + c * chsize + bytes),
                                        m_spec.width, pixelsize,
-                                       &encoded[eoffset], length);
+                                       make_span(encoded).subspan(eoffset));
             if (!e)
                 return false;
             eoffset += e;
             length -= e;
         }
+    }
+
+    int bytes_per_chan = ceil2(std::max(int(num_bits), 8)) / 8;
+    if (size_t(offset + (m_spec.width - 1) * pixelsize
+               + num_channels * bytes_per_chan)
+        > m_buf.size()) {
+        errorfmt("Probably corrupt file (buffer overrun avoided)");
+        return false;  // Probably corrupt? Would have overrun
     }
 
     // If we're little endian, swap endianness in place for 2- and
@@ -604,15 +635,7 @@ RLAInput::decode_channel_group(int first_channel, short num_channels,
     // OIIO conventions.
     if (num_bits == 8 || num_bits == 16 || num_bits == 32) {
         // ok -- no rescaling needed
-    }
-    int bytes_per_chan = ceil2(std::max(int(num_bits), 8)) / 8;
-    if (size_t(offset + (m_spec.width - 1) * pixelsize
-               + num_channels * bytes_per_chan)
-        > m_buf.size()) {
-        errorfmt("Probably corrupt file (buffer overrun avoided)");
-        return false;  // Probably corrupt? Would have overrun
-    }
-    if (num_bits == 10) {
+    } else if (num_bits == 10) {
         // fast, common case -- use templated hard-code
         for (int x = 0; x < m_spec.width; ++x) {
             uint16_t* b = (uint16_t*)(&m_buf[offset + x * pixelsize]);
@@ -658,7 +681,13 @@ RLAInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
     y = m_spec.height - (y - m_spec.y) - 1;
 
     // Seek to scanline start, based on the scanline offset table
-    ioseek(m_sot[y]);
+    if (y < 0 || y >= m_spec.height) {
+        // Invalid scanline
+        return false;
+    }
+    OIIO_DASSERT(m_sot.size() == size_t(m_spec.height));
+    if (!ioseek(m_sot[y]))
+        return false;
 
     // Now decode and interleave the channels.
     // The channels are non-interleaved (i.e. rrrrrgggggbbbbb...).

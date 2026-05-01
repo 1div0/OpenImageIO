@@ -1,37 +1,33 @@
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+<!-- Copyright Contributors to the OpenImageIO Project. -->
+
+
 Contributing to OpenImageIO
 ===========================
 
-> NOTE: This is the proposed post-ASWF-move version of CONTRIBUTING. After the
-> project is legally transferred and moved to the new repo, this file will
-> replace the one at the project root.
->
-> TO DO:
->
-> - [X] Update the mail list sign-up page after the mail list moves.
-> - [ ] Update the repo URL
-> - [ ] Double check the security and info email addresses.
->
-
-Code contributions to OpenImageIO are always welcome, and [nearly 200
+Code contributions to OpenImageIO are always welcome, and [nearly 250
 people](https://github.com/AcademySoftwareFoundation/OpenImageIO/blob/main/CREDITS.md) have done
 so over the years.  Please review this document to get a briefing on our
 process.
 
 
+General Tips for Open Source Development
+----------------------------------------
+
+* GitHub's [Open Source Guides](https://opensource.guide/)
+  - Especially the guide on [How to Contribute to Open Source](https://opensource.guide/how-to-contribute/)
+
+
 Mail List and Slack
 -------------------
-
-Contributors should be reading the oiio-dev mail list:
 
 * [oiio-dev](https://lists.aswf.io/g/oiio-dev)
 For developers of the OpenImageIO code itself, or users who are really
 interested in the OIIO internals. This is where we mostly discuss the code
 (including bug reports), but are also happy to answer user questions about
-use or working of OIIO.
+use or working of OIIO. You can sign up for the mail list on your own using the link above.
 
-You can sign up for the mail list on your own using the link above.
-
-The [ASWF Slack](https://slack.aswf.io/) has an `openimageio` channel. Sign up
+* [ASWF Slack](https://slack.aswf.io/) has an `openimageio` channel. Sign up
 for the Slack on your own, then under "channels", select "browse channels" and
 you should see the openimageio channel (among those of the other projects and
 working groups).
@@ -55,7 +51,7 @@ enhancements: https://github.com/AcademySoftwareFoundation/OpenImageIO/issues
 
 **If you are merely asking a question ("how do I...")**, please do not file an
 issue, but instead ask the question on the [oiio-dev mailing
-list](https://lists.aswf.io/g/oiio-dev).
+list](https://lists.aswf.io/g/oiio-dev) or on the Slack channel.
 
 If you are submitting a bug report, please be sure to note which version of
 OIIO you are using, on what platform (OS/version, which compiler you used,
@@ -76,6 +72,26 @@ Suspected security vulnerabilities should be reported by the same process.
 
 If confidentiality precludes a public question or issue for any reason, you
 may contact us privately at [security@openimageio.org](security@openimageio.org).
+
+
+Policy on AI Tools
+------------------
+
+Please read our [Policy on AI Coding Assistants](docs/dev/AI_Policy.md)
+before contributing or particpating in the project in any way mediated by "AI"
+assistants.
+
+High-level summary:
+- Human must always be in the loop, and is the responsible party for
+  the contents of a PR (including fully understanding and being able
+  to explain, defend, and modify it in response to review comments).
+- Interact with the project and community yourself, not by agent.
+- Disclose what tools you used and how. At a minimum, we require an
+  "Assisted-by: TOOL/MODEL" line in the commit comments and PR description.
+- Don't waste maintainer's time with low quality PRs.
+
+Please do read the whole [Policy on AI Coding Assistants](docs/dev/AI_Policy.md)
+for all the details.
 
 
 Contributor License Agreement (CLA) and Intellectual Property
@@ -215,7 +231,7 @@ under `fix:`, because that appears first in the list).
 It is also encouraged, when it makes sense to do so, to put a subcategory in
 parenthesis after the prefix, like `fix(exr):` or `feat(IBA):`. It's ok to use
 obvious abbreviations for major classes or subsections: IB=ImageBuf,
-IBA=ImageBufAlgo, IC=ImageCace, TS=TextureSystem, etc. If there is no clear
+IBA=ImageBufAlgo, IC=ImageCache, TS=TextureSystem, etc. If there is no clear
 single format or class that is the man focus of the patch, then you can omit
 the subcategory.
 
@@ -238,33 +254,33 @@ repository. The protocol is like this:
 your own repository on GitHub, and then clone it to get a repository on your
 local machine.
 
-1. Edit, compile, and test your changes. Run clang-format (see the
+2. Edit, compile, and test your changes. Run clang-format (see the
 instructions on coding style below).
 
-1. Push your changes to your fork (each unrelated pull request to a separate
+3. Push your changes to your fork (each unrelated pull request to a separate
 "topic branch", please).
 
-1. Make a "pull request" on GitHub for your patch.
+4. Make a "pull request" on GitHub for your patch.
 
-2. If your patch will induce a major compatibility break, or has a design
+5. If your patch will induce a major compatibility break, or has a design
 component that deserves extended discussion or debate among the wider OIIO
 community, then it may be prudent to email oiio-dev pointing everybody to
 the pull request URL and discussing any issues you think are important.
 
-1. All pull requests automatically launch CI jobs on GitHub Actions to
+6. All pull requests automatically launch CI jobs on GitHub Actions to
 ensure that the build completes and that the tests suite runs correctly, for
 a variety of platform, compiler, library, and flag combinations. The status
 of the CI tests for your PR will be displayed on the GitHub PR page. We will
 not accept PRs that don't build cleanly or pass the existing testsuite.
 
-1. The reviewer will look over the code and critique on the "comments" area.
+7. The reviewer will look over the code and critique on the "comments" area.
 Reviewers may ask for changes, explain problems they found, congratulate the
 author on a clever solution, etc. But until somebody says "LGTM" (looks good
 to me), the code should not be committed. Sometimes this takes a few rounds
 of give and take. Please don't take it hard if your first try is not
 accepted. It happens to all of us.
 
-1. After approval, one of the senior developers (with commit approval to the
+8. After approval, one of the senior developers (with commit approval to the
 official main repository) will merge your fixes into the main branch.
 
 Please see the [Code Review](docs/dev/CodeReview.md) document for more

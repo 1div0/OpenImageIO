@@ -269,7 +269,7 @@ Control flow
 Scriptability is provided by the use of control flow statements.
 The usual programming constructs are supported:
 
-* Conditionals : `--if` *condition* `--then` *commands...* `--else` *commands...* `--endif`
+* Conditionals : `--if` *condition* *commands...* `--else` *commands...* `--endif`
 
 * General looping: `--while` *condition* *commands...* `--endwhile`
 
@@ -709,13 +709,19 @@ Color convert an image
 ----------------------
 
 This command linearizes a JPEG assumed to be in sRGB, saving as an HDRI
-OpenEXR file::
+OpenEXR file in ACEScg color space::
 
-    oiiotool photo.jpg --colorconvert sRGB linear -o output.exr
+    oiiotool photo.jpg --colorconvert srgb acescg -o output.exr
 
 And the other direction::
 
-    oiiotool render.exr --colorconvert linear sRGB -o fortheweb.png
+    oiiotool render.exr --colorconvert acescg srgb -o fortheweb.png
+
+Above, we're using the short aliases "srgb" and "acescg", but it's also fine
+to use the canonical Color Interop Forum names::
+
+    oiiotool photo.jpg --colorconvert srgb_rec709_scene lin_ap1_scene -o output.exr
+    oiiotool render.exr --colorconvert lin_ap1_scene srgb_rec709_scene -o fortheweb.png
 
 This converts between two named color spaces (presumably defined by your
 facility's OpenColorIO configuration)::
@@ -862,11 +868,17 @@ Split a multi-image file into separate files
 --------------------------------------------
 
 Take a multi-image TIFF file, split into its constituent subimages and
-output each one to a different file, with names `sub0001.tif`,
-`sub0002.tif`, etc.::
+output each one to a different file, with names `sub.0001.tif`,
+`sub.0002.tif`, etc.::
 
-    oiiotool multi.tif -sisplit -o:all=1 sub%04d.tif
+    oiiotool multi.tif -sisplit -o:all=1 sub.%04d.tif
 
+Take a multi-image OpenEXR file (called "multi-part" in OpenEXR parlance),
+split into its constituent subimages and output each one to a different file,
+with names `sub.beauty.exr`, `sub.albedo.exr`, etc., using the name of each
+subimage according to its metadata::
+
+    oiiotool multi.exr -sisplit -o:all=1 "sub.{TOP.'oiio:subimagename'}.exr"
 
 
 |
@@ -891,7 +903,7 @@ output each one to a different file, with names `sub0001.tif`,
 
 .. option:: -q
 
-    Quet mode --- print out less information about what :program:`oiiotool`
+    Quiet mode --- print out less information about what :program:`oiiotool`
     is doing (only errors).
 
 .. option:: -n
@@ -975,6 +987,12 @@ output each one to a different file, with names `sub0001.tif`,
     Examples::
 
         oiiotool --oiioattrib debug 1 in.jpg -o out.jpg
+
+.. option:: --experimental
+
+    Enables experimental features. Use at your own risk.
+
+    This was added in OIIO 3.1.13.
 
 
 .. _sec-oiiotool-control-flow-commands:
@@ -1492,16 +1510,24 @@ Writing images
         Output all images currently on the stack using a pattern.
         See further explanation below.
 
-    The `all=n` option causes *all* images on the image stack to be output,
-    with the filename argument used as a pattern assumed to contain a `%d`,
-    which will be substituted with the index of the image (beginning with
-    *n*). For example, to take a multi-image TIFF and extract all the
-    subimages and save them as separate files::
+    The `all=n` option causes *all* images on the image stack to be output. If
+    the *filename* argument contains expression substitution notation, the
+    substitution will be re-evaluated for each image output. Also, if the
+    *filename* argument contains a `%d`, that will be substituted with the
+    index of the image (beginning with *n*). For example, to take a
+    multi-image TIFF and extract all the subimages and save them as separate
+    files::
     
         oiiotool multi.tif -sisplit -o:all=1 sub%04d.tif
     
     This will output the subimges as separate files `sub0001.tif`,
     `sub0002.tif`, and so on.
+
+    Expression substitution can be used to insert the subimage name
+    into each filename::
+    
+        oiiotool multi.tif -sisplit -o:all=1 "sub.{TOP.'oiio:subimagename'}.tif"
+    
 
 
 .. option:: -otex <filename>
@@ -1529,6 +1555,9 @@ Writing images
       `:resize=` *int*
         If nonzero, resize to a power of 2 before starting to create the
         MIPpmap levels. (default: 0)
+      `:keepaspect=` *int*
+        If nonzero, add metadata to maintain the image aspect ratio even when
+        `resize=1`. (default: 0)
       `:nomipmap=` *int*
         If nonzero, do not create MIP-map levels at all. (default: 0)
       `:updatemode=` *int*
@@ -1572,6 +1601,20 @@ Writing images
       `:uvslopes_scale=` *float*
         For `-obump` only, specifies the amount to scale the bump-map slopes
         by. (default: 0.0, meaning not to use this feature)
+      `:slopefilter=` *string*
+        For `-obump` only, specifies the filter to use for slope computation
+        when `bumpformat=height`. (default: sobel)
+      `:bumpinverts=` *int*
+        For `-obump` only, inverts slopes on the s/u/x direction. (default: 0)
+      `:bumpinvertt=` *int*
+        For `-obump` only, inverts slopes on the t/v/y direction. (default: 0)
+      `:bumpscale=` *float*
+        For `-obump` only, scales the strength of the resulting map. (default: 
+        1.0)
+      `:bumprange=` *string*
+        For `obump` only, specifies the normal data convention when 
+        `bumpformat=normal` as one of `centered`, `positive`, `auto`. 
+        (default: auto)
       `:cdf=` *int*
         If nonzero, will add to the texture metadata the forward and inverse
         Gaussian CDF, which can be used by shaders to implement
@@ -1591,7 +1634,7 @@ Writing images
 
         oiiotool in.tif -otex out.tx
     
-        oiiotool in.jpg --colorconvert sRGB linear -d uint16 -otex out.tx
+        oiiotool in.jpg --colorconvert srgb_rec709_scene lin_rec709_scene -d uint16 -otex out.tx
     
         oiiotool --pattern:checker 512x512 3 -d uint8 -otex:wrap=periodic checker.tx
     
@@ -1858,6 +1901,10 @@ Writing images
           221  > 1,1,1
         65315  within range
 
+
+:program:`oiiotool` commands that compare images
+================================================
+
 .. option:: --diff
             --fail <A> --failpercent <B> --hardfail <C>
             --warn <A> --warnpercent <B> --hardwarn <C>
@@ -1882,10 +1929,90 @@ Writing images
 .. option:: --pdiff
 
     This command computes the difference of the current image and the next
-    image on the stack using a perceptual metric, and prints whether or not
-    they match according to that metric.  This command does not alter the
+    image on the stack using the Yee perceptual metric, and prints whether or
+    not they match according to that metric.  This command does not alter the
     image stack.
 
+.. option:: --flipdiff
+
+    Compute the FLIP perceptual difference of the top two images on the stack
+    (removing them), optionally print error metrics, and leave the per-pixel
+    error map on the stack.
+
+    Limitations: Currently, this only operates on the first subimage,
+    and the first three (RGB) channels, and does not work on volumetric
+    or "deep" images.
+
+    Optional appended modifiers include:
+
+      `:hdr=` *int* (default: 1)
+        If nonzero, computes the HDR FLIP comparison. If zero, computes
+        the LDR FLIP comparision. The default is 1, for HDR mode.
+      `:maxluminance=` *float* (default: 2.0)
+        The top of the expected luminance range, used to compute exposure
+        settings. If set to 0.0, the "startExposure" and "stopExposure"
+        will be used instead. The default is 2.0, which should be adequate
+        for most production scenarios.
+      `:medianluminance=` *float* (default: 0.18)
+        The assumed median luminance (used if "maxluminance" is not 0, so
+        we are using these estimates instead of measuring from the image).
+        The default 0.18 assumes that "middle grey" is a good guess for
+        a typical median luminance of the image.
+      `:ppd=` *float* (default:67.02)
+        Specifies the horizontal pixels per degree of viewing. The default
+        value of 67.02 is computed as the value for a 3840 pixel (2xHD) image
+        filling a display that is 0.7m wide, 0.7m in front of the viewer.
+      `:tonemapper=` *name* (default: "aces")
+        Specifies the HDR tonemapper: one of "aces" (default), "reinhard", or
+        "hable".
+      `:startExposure=` *float* `:stopExposure=` *float*
+        If supplied, and if "maxluminance" is set to 0, specify start and stop
+        exposures for the HDR FLIP method. If not supplied, they will be
+        automatically computed from the contents of the image.
+      `:numExposures=` *int* (default: 0)
+        The number of exposures for HDR FLIP computation (default: 0, which
+        means to automatically compute it).
+      `:colormap=` *name*
+        If absent or empty, the output error image will be a single channel
+        grey value. If present and the name of a color map (the same set
+        accepted by the oiiotool `--colormap` action), the output error
+        image will be a 3-channel RGB false-color visualization of the
+        perceptual error for each pixel.
+      `:print=` *int* (default: 1)
+        If nonzero, will print information such as the average and maximum
+        error of the pixels. The default is 1, meaning that the report will
+        print to stdout. Set to 0 to suppress the printing.
+      `:fail=` *float*
+        If set, a PASS/FAIL message will be printed to the console, with
+        "failing" meaning that any pixel's error metric exceeded the threshold
+        specified as the value for this parameter. In the case of a failure,
+        the oiiotool run itself will have a shell error code.
+
+    The command also sets metadata on the result image based on the FLIP
+    computation:
+
+      `"FLIP:meanerror"`
+        Mean of error map in [0,1].
+      `"FLIP:maxerror"`
+        Maximum perceptual pixel error.
+      `"FLIP:maxx"`
+        x coordinate of the pixel with the highest error.
+      `"FLIP:maxy"`
+        y coordinate of the pixel with the highest error.
+      `"FLIP:startExposure"`, `"FLIP:stopExposure"`
+        (HDR mode only) The start and stop exposure stops used.
+      `"FLIP:numExposures"`
+        (HDR mode only) Number of exposure steps used.
+
+    Examples::
+
+        # Default HDR mode, with false-color visualization
+        oiiotool reference.exr test.exr --flipdiff:colormap=magma -o error.exr
+
+        # LDR mode (for display-referred images), 1-channel error map
+        oiiotool reference.jpg test.jpg --flipdiff:hdr=0 -o error.exr
+
+    This command was added in OIIO 3.2.
 
 
 :program:`oiiotool` commands that change the current image metadata
@@ -4335,15 +4462,12 @@ current top image.
 Many of the color management commands depend on an installation of
 OpenColorIO (http://opencolorio.org).
 
-If OIIO has been compiled with OpenColorIO support and the environment
-variable `$OCIO` is set to point to a valid OpenColorIO configuration file,
-you will have access to all the color spaces that are known by that OCIO
-configuration.  Alternately, you can use the `--colorconfig` option to
-explicitly point to a configuration file. If no  valid configuration file is
-found (either in `$OCIO` or specified by `--colorconfig}` or OIIO was not
-compiled with OCIO support, then the only color space transformats available
-are `linear` to `Rec709` (and vice versa) and `linear` to `sRGB` (and vice
-versa).
+If the environment variable `$OCIO` is set to point to a valid OpenColorIO
+configuration file, you will have access to all the color spaces that are
+known by that OCIO configuration.  Alternately, you can use the
+`--colorconfig` option to explicitly point to a configuration file. If no
+valid configuration file is found (either in `$OCIO` or specified by
+`--colorconfig`), then the built-in OCIO "default" config will be used.
 
 If you ask for :program:`oiiotool` help (`oiiotool --help`), at the very
 bottom you will see the list of all color spaces, looks, and displays that
@@ -4656,6 +4780,15 @@ will be printed with the command `oiiotool --colorconfiginfo`.
 
     This was added to OpenImageIO 2.5.
 
+.. option:: --cicp <pri>,<trc>,<mtx>,<vfr>
+    
+    The `--cicp` command adds, modifies, or removes a `"CICP"` attribute 
+    belonging to the top image, stored as an array of four integers.  
+    The integers represent, in order, the color primaries, transfer 
+    function, color matrix (for YUV colorspaces), and 
+    video-full-range-flag.
+
+    This was added to OpenImageIO 3.1.
 
 |
 

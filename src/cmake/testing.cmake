@@ -21,6 +21,23 @@ set(OIIO_TESTSUITE_IMAGEDIR "${PROJECT_BINARY_DIR}/testsuite" CACHE PATH
     "Location of oiio-images, openexr-images, libtiffpic, etc.." )
 
 
+# Build a single ENVIRONMENT list entry "PYTHONPATH=..." for CTest.
+# On Windows, keep this deterministic and do not append inherited PYTHONPATH:
+# semicolon-separated values can be split by CMake list processing when used
+# as test ENVIRONMENT entries.
+function (oiio_tests_pythonpath_env_entry out_var prefix_dir)
+    if (WIN32)
+        set (_pythonpath "${prefix_dir}")
+    else ()
+        if (DEFINED ENV{PYTHONPATH} AND NOT "$ENV{PYTHONPATH}" STREQUAL "")
+            string (CONCAT _pythonpath "${prefix_dir}" ":" "$ENV{PYTHONPATH}")
+        else ()
+            set (_pythonpath "${prefix_dir}")
+        endif ()
+    endif ()
+    set (${out_var} "PYTHONPATH=${_pythonpath}" PARENT_SCOPE)
+endfunction ()
+
 
 # oiio_add_tests() - add a set of test cases.
 #
@@ -30,6 +47,7 @@ set(OIIO_TESTSUITE_IMAGEDIR "${PROJECT_BINARY_DIR}/testsuite" CACHE PATH
 #                    [ URL http://find.reference.cases.here.com ]
 #                    [ FOUNDVAR variable_name ... ]
 #                    [ ENABLEVAR variable_name ... ]
+#                    [ DISABLEVAR variable_name ... ]
 #                    [ SUFFIX suffix ]
 #                    [ ENVIRONMENT "VAR=value" ... ]
 #                  )
@@ -43,30 +61,46 @@ set(OIIO_TESTSUITE_IMAGEDIR "${PROJECT_BINARY_DIR}/testsuite" CACHE PATH
 # not existing and true, will skip the test.
 #
 # The optional ENABLEVAR introduces variables (typically ENABLE_Foo) that
-# if existing and yet false, will skip the test.
+# if existing and yet false/off/zero, will skip the test. (Not existing
+# does NOT disable the test.)
+#
+# The optional DISABLEVAR introduces variables that, if existing and
+# true/on/nonzero, will skip the test.
 #
 # The optional SUFFIX is appended to the test name.
 #
-# The optinonal ENVIRONMENT is a list of environment variables to set for the
+# The optional ENVIRONMENT is a list of environment variables to set for the
 # test.
 #
 macro (oiio_add_tests)
-    cmake_parse_arguments (_ats "" "SUFFIX;TESTNAME" "URL;IMAGEDIR;LABEL;FOUNDVAR;ENABLEVAR;ENVIRONMENT" ${ARGN})
+    cmake_parse_arguments (_ats "" "SUFFIX;TESTNAME" "URL;IMAGEDIR;LABEL;FOUNDVAR;ENABLEVAR;DISABLEVAR;ENVIRONMENT" ${ARGN})
        # Arguments: <prefix> <options> <one_value_keywords> <multi_value_keywords> args...
     set (_ats_testdir "${OIIO_TESTSUITE_IMAGEDIR}/${_ats_IMAGEDIR}")
     # If there was a FOUNDVAR param specified and that variable name is
     # not defined, mark the test as broken.
+    set (_test_disabled FALSE)
+    set (_test_notfound FALSE)
     foreach (_var ${_ats_FOUNDVAR})
+        # FOUNDVAR entires had better exist and be true
         if (NOT ${_var})
             set (_ats_LABEL "broken")
+            set (_test_notfound TRUE)
         endif ()
     endforeach ()
     set (_test_disabled 0)
     foreach (_var ${_ats_ENABLEVAR})
+        # ENABLEVAR, *if* it exists, must be true. But not existing is fine.
         if ((NOT "${${_var}}" STREQUAL "" AND NOT "${${_var}}") OR
             (NOT "$ENV{${_var}}" STREQUAL "" AND NOT "$ENV{${_var}}"))
             set (_ats_LABEL "broken")
-            set (_test_disabled 1)
+            set (_test_disabled TRUE)
+        endif ()
+    endforeach ()
+    foreach (_var ${_ats_DISABLEVAR})
+        # DISABLEVAR, if true, disable the test. Not existing is fine.
+        if (${_var})
+            set (_ats_LABEL "broken")
+            set (_test_disabled TRUE)
         endif ()
     endforeach ()
     # For OCIO 2.2+, have the testsuite use the default built-in config
@@ -74,6 +108,8 @@ macro (oiio_add_tests)
                                   "OIIO_TESTSUITE_OCIOCONFIG=ocio://default")
     if (_test_disabled)
         message (STATUS "Skipping test(s) ${_ats_UNPARSED_ARGUMENTS} because of disabled ${_ats_ENABLEVAR}")
+    elseif (_test_notfound)
+        message (STATUS "Skipping test(s) ${_ats_UNPARSED_ARGUMENTS} because of missing dependency from ${_ats_FOUNDVAR}")
     elseif (_ats_IMAGEDIR AND NOT EXISTS ${_ats_testdir})
         # If the directory containing reference data (images) for the test
         # isn't found, point the user at the URL.
@@ -110,6 +146,7 @@ macro (oiio_add_tests)
                              "OIIO_TESTSUITE_ROOT=${_testsuite}"
                              "OIIO_TESTSUITE_SRC=${_testsrcdir}"
                              "OIIO_TESTSUITE_CUR=${_testdir}"
+                             "Python_EXECUTABLE=${Python3_EXECUTABLE}"
                              ${_ats_ENVIRONMENT})
             if (NOT ${_ats_testdir} STREQUAL "")
                 set_property(TEST ${_testname} APPEND PROPERTY ENVIRONMENT
@@ -148,8 +185,9 @@ macro (oiio_add_all_tests)
                     oiiotool-text
                     oiiotool-xform
                     diff
+                    flip
                     dither dup-channels
-                    jpeg-corrupt jpeg-metadata
+                    jpeg jpeg-corrupt jpeg-metadata
                     maketx oiiotool-maketx
                     misnamed-file
                     missingcolor
@@ -180,6 +218,7 @@ macro (oiio_add_all_tests)
                     texture-uint8
                     texture-width0blur
                     texture-wrapfill
+                    texture-blurfix
                     texture-fat texture-skinny
                     texture-stats
                     texture-threadtimes
@@ -207,29 +246,85 @@ macro (oiio_add_all_tests)
     # Python interpreter itself won't be linked with the right asan
     # libraries to run correctly.
     if (USE_PYTHON AND NOT BUILD_OIIOUTIL_ONLY AND NOT SANITIZE)
-        oiio_add_tests (
-            docs-examples-python
-            python-colorconfig
-            python-deep 
-            python-imagebuf
-            python-imagecache
-            python-imageoutput
-            python-imagespec
-            python-paramlist
-            python-roi
-            python-texturesys
-            python-typedesc
-            filters
-            )
-        # These Python tests also need access to oiio-images
-        oiio_add_tests (
-            python-imageinput python-imagebufalgo
-            IMAGEDIR oiio-images
-            )
+        if (WIN32)
+            # On Windows CI we run the install target before tests. Use the
+            # installed package path to avoid multi-config output layout quirks.
+            set (_installed_python_site_packages
+                "${CMAKE_INSTALL_PREFIX}/${PYTHON_SITE_ROOT_DIR}")
+            oiio_tests_pythonpath_env_entry (_pybind_tests_pythonpath
+                "${_installed_python_site_packages}")
+            oiio_tests_pythonpath_env_entry (_nanobind_tests_pythonpath
+                "${CMAKE_BINARY_DIR}/lib/python/nanobind/$<CONFIG>")
+        else ()
+            oiio_tests_pythonpath_env_entry (_pybind_tests_pythonpath
+                "${CMAKE_BINARY_DIR}/lib/python/site-packages")
+            oiio_tests_pythonpath_env_entry (_nanobind_tests_pythonpath
+                "${CMAKE_BINARY_DIR}/lib/python/nanobind")
+        endif ()
+        set (nanobind_python_tests
+             python-imagespec
+             python-paramlist
+             python-roi
+             python-typedesc)
+        set (nanobind_python_test_suffix ".nanobind")
+        if (OIIO_BUILD_PYTHON_PYBIND11)
+            oiio_add_tests (
+                docs-examples-python
+                python-colorconfig
+                python-deep
+                python-imagebuf
+                python-imagecache
+                python-imageoutput
+                python-imagespec
+                python-paramlist
+                python-roi
+                python-texturesys
+                python-typedesc
+                filters
+                ENVIRONMENT "${_pybind_tests_pythonpath}"
+                )
+            # These Python tests also need access to oiio-images
+            oiio_add_tests (
+                python-imageinput python-imagebufalgo
+                IMAGEDIR oiio-images
+                ENVIRONMENT "${_pybind_tests_pythonpath}"
+                )
+        else ()
+            set (nanobind_python_test_suffix "")
+        endif ()
+
+        if (OIIO_BUILD_PYTHON_NANOBIND)
+            oiio_add_tests (
+                ${nanobind_python_tests}
+                SUFFIX ${nanobind_python_test_suffix}
+                ENVIRONMENT "${_nanobind_tests_pythonpath}"
+                )
+        endif ()
     endif ()
 
     oiio_add_tests (oiiotool-color
                     FOUNDVAR OpenColorIO_FOUND)
+
+    # Tests to run with HWY enabled.
+    # Remember to add tests here as hwy enabled IBA functions are added
+    oiio_add_tests ( oiiotool
+                     oiiotool-composite
+                     oiiotool-xform
+                     docs-examples-cpp
+        FOUNDVAR hwy_FOUND
+        ENABLEVAR OIIO_USE_HWY
+        SUFFIX ".hwy"
+        ENVIRONMENT "OPENIMAGEIO_ENABLE_HWY=1"
+        )
+
+    oiio_add_tests ( python-imagebufalgo
+        FOUNDVAR hwy_FOUND
+        ENABLEVAR OIIO_USE_HWY  USE_PYTHON OIIO_BUILD_PYTHON_PYBIND11
+        DISABLEVAR BUILD_OIIOUTIL_ONLY SANITIZE
+        SUFFIX ".hwy"
+        ENVIRONMENT "OPENIMAGEIO_ENABLE_HWY=1"
+        IMAGEDIR oiio-images
+        )
 
     # List testsuites for specific formats or features which might be not found
     # or be intentionally disabled, or which need special external reference
@@ -250,6 +345,9 @@ macro (oiio_add_all_tests)
                     ENABLEVAR ENABLE_FITS
                     IMAGEDIR fits-images
                     URL http://www.cv.nrao.edu/fits/data/tests/)
+    oiio_add_tests (ffmpeg
+                    ENABLEVAR ENABLE_FFMPEG
+                    FOUNDVAR FFmpeg_FOUND)
     oiio_add_tests (gif
                     FOUNDVAR GIF_FOUND ENABLEVAR ENABLE_GIF
                     IMAGEDIR oiio-images/gif URL "Recent checkout of OpenImageIO-images")
@@ -275,12 +373,14 @@ macro (oiio_add_all_tests)
                     FOUNDVAR OPENJPEG_FOUND
                     IMAGEDIR oiio-images URL "Recent checkout of OpenImageIO-images")
     oiio_add_tests (htj2k
-                    FOUNDVAR OPENJPH_FOUND
+                    FOUNDVAR openjph_FOUND
                     IMAGEDIR oiio-images URL "Recent checkout of OpenImageIO-images")
     oiio_add_tests (jpeg2000-j2kp4files
                     FOUNDVAR OPENJPEG_FOUND
                     IMAGEDIR j2kp4files_v1_5
                     URL http://www.itu.int/net/ITU-T/sigdb/speimage/ImageForm-s.aspx?val=10100803)
+    oiio_add_tests (jxl
+                    FOUNDVAR JXL_FOUND)
     set (all_openexr_tests
          openexr-suite openexr-multires openexr-chroma openexr-decreasingy
          openexr-v2 openexr-window perchannel oiiotool-deep)
@@ -291,6 +391,10 @@ macro (oiio_add_all_tests)
         # OpenEXR 3.1.10 is the first release where the exr core library
         # properly supported all compression types (DWA in particular).
         list (APPEND all_openexr_tests openexr-compression)
+    endif ()
+    if (OpenEXR_VERSION VERSION_GREATER_EQUAL 3.3)
+        # OpenEXR 3.3 is when IDManifest was introduced
+        list (APPEND all_openexr_tests openexr-idmanifest)
     endif ()
     # Run all OpenEXR tests without core library
     oiio_add_tests (${all_openexr_tests} openexr-luminance-chroma
@@ -347,13 +451,31 @@ macro (oiio_add_all_tests)
                     ENABLEVAR ENABLE_TARGA
                     IMAGEDIR oiio-images)
     endif()
-    if (NOT WIN32)
+    if (WIN32)
+        if (OIIO_BUILD_TOOLS)
+            # Add test for long path handling if support is enabled at the system level.
+            execute_process (
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/testsuite/windows-long-paths/check_registry.py"
+                RESULT_VARIABLE _reg_check_status
+                OUTPUT_QUIET ERROR_QUIET
+            )
+            if (_reg_check_status EQUAL 0)
+                add_test (NAME windows-long-paths
+                          COMMAND
+                          ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/testsuite/windows-long-paths/test.py"
+                          --source-root "${CMAKE_SOURCE_DIR}"
+                          --oiiotool-path $<TARGET_FILE:oiiotool>)
+            else ()
+                message (STATUS "Skipping Windows long path test: System-level support is not enabled")
+            endif ()
+        endif ()
+    else ()
         oiio_add_tests (term
                         ENABLEVAR ENABLE_TERM)
         # I just could not get this test to work on Windows CI. The test fails
         # when comparing the output, but the saved artifacts compare just fine
         # on my system. Maybe someone will come back to this.
-        endif ()
+    endif ()
     oiio_add_tests (tiff-suite tiff-depths tiff-misc
                     IMAGEDIR oiio-images/libtiffpic)
     oiio_add_tests (webp

@@ -29,7 +29,7 @@ Reading ../oiio-images/ico/oiio.ico
     SHA-1: F44C9B94AB7D612F62A4DC29FD9C56FD173F2614
     channel list: R, G, B, A
     oiio:BitsPerSample: 2
-    oiio:ColorSpace: "sRGB"
+    oiio:ColorSpace: "srgb_rec709_scene"
     oiio:UnassociatedAlpha: 1
  subimage  7:   48 x   48, 4 channel, uint8 ico
     SHA-1: 127700A3DACBF25FCD800642D78F8EE91EDE24B9
@@ -46,3 +46,7 @@ Reading ../oiio-images/ico/oiio.ico
 Comparing "../oiio-images/ico/oiio.ico" and "oiio.ico"
 PASS
 iconvert ERROR: Unsupported image color depth, probably corrupt file
+iconvert ERROR copying "src/crash-002c.ico" to "out.tif" :
+	Read error: hit end of file in ico reader
+iconvert ERROR copying "src/bad-palette.ico" to "out.tif" :
+	Possible corruption: index exceeds palette size

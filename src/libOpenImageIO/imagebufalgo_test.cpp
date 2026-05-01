@@ -43,6 +43,10 @@ static bool wedge         = false;
 static int threadcounts[] = { 1,  2,  4,  8,  12,  16,   20,
                               24, 28, 32, 64, 128, 1024, 1 << 30 };
 
+static const int hwy_build = OIIO_USE_HWY;
+static int hwy_on          = hwy_build;
+
+
 
 static void
 getargs(int argc, char* argv[])
@@ -199,10 +203,19 @@ test_zero_fill()
 
     // Timing
     Benchmarker bench;
-    ImageBuf buf_rgba_float(ImageSpec(1000, 1000, 4, TypeFloat));
-    ImageBuf buf_rgba_uint8(ImageSpec(1000, 1000, 4, TypeUInt8));
-    ImageBuf buf_rgba_half(ImageSpec(1000, 1000, 4, TypeHalf));
-    ImageBuf buf_rgba_uint16(ImageSpec(1000, 1000, 4, TypeDesc::UINT16));
+    bench.trials(ntrials);
+    bench.iterations(iterations);
+#if defined(NDEBUG) || !defined(OIIO_CI)
+    const int rez = 1000;
+#else
+    // Only for debug builds that are part of OIIO's CI - reduce resolution to
+    // make it run faster
+    const int rez = 256;
+#endif
+    ImageBuf buf_rgba_float(ImageSpec(rez, rez, 4, TypeFloat));
+    ImageBuf buf_rgba_uint8(ImageSpec(rez, rez, 4, TypeUInt8));
+    ImageBuf buf_rgba_half(ImageSpec(rez, rez, 4, TypeHalf));
+    ImageBuf buf_rgba_uint16(ImageSpec(rez, rez, 4, TypeDesc::UINT16));
     float vals[] = { 0, 0, 0, 0 };
     bench("  IBA::fill float[4] ",
           [&]() { ImageBufAlgo::fill(buf_rgba_float, cspan<float>(vals)); });
@@ -258,6 +271,8 @@ test_copy()
 
     // Timing
     Benchmarker bench;
+    bench.trials(ntrials);
+    bench.iterations(iterations);
     ImageSpec spec_rgba_float(1000, 1000, 4, TypeFloat);
     ImageSpec spec_rgba_uint8(1000, 1000, 4, TypeUInt8);
     ImageSpec spec_rgba_half(1000, 1000, 4, TypeHalf);
@@ -399,7 +414,7 @@ test_channel_append()
 void
 test_add()
 {
-    std::cout << "test add\n";
+    print("test add{}\n", hwy_on ? " (HWY)" : "");
 
     // Create buffers
     const float Aval[] = { 0.1f, 0.2f, 0.3f, 0.4f };
@@ -425,7 +440,7 @@ test_add()
 void
 test_sub()
 {
-    std::cout << "test sub\n";
+    print("test sub{}\n", hwy_on ? " (HWY)" : "");
 
     // Create buffers
     const float Aval[] = { 0.1f, 0.2f, 0.3f, 0.4f };
@@ -451,7 +466,7 @@ test_sub()
 void
 test_mul()
 {
-    std::cout << "test mul\n";
+    print("test mul{}\n", hwy_on ? " (HWY)" : "");
 
     // Create buffers
     // Create buffers
@@ -478,7 +493,7 @@ test_mul()
 void
 test_mad()
 {
-    std::cout << "test mad\n";
+    print("test mad{}\n", hwy_on ? " (HWY)" : "");
     const int WIDTH = 4, HEIGHT = 4, CHANNELS = 4;
     ImageSpec spec(WIDTH, HEIGHT, CHANNELS, TypeDesc::FLOAT);
 
@@ -509,6 +524,86 @@ test_mad()
     OIIO_CHECK_EQUAL(comp.maxerror, 0.0f);
 }
 
+
+
+void
+test_hwy_strided_roi_fallback()
+{
+#if OIIO_USE_HWY
+    std::cout << "test hwy strided roi fallback\n";
+
+    int prev_enable_hwy = 0;
+    OIIO::getattribute("enable_hwy", prev_enable_hwy);
+
+    ImageSpec spec(64, 64, 4, TypeDesc::UINT8);
+    ImageBuf A(spec), B(spec), C(spec);
+    ImageBufAlgo::fill(A, { 0.2f, 0.4f, 0.6f, 0.8f });
+    ImageBufAlgo::fill(B, { 0.1f, 0.3f, 0.5f, 0.7f });
+    ImageBufAlgo::fill(C, { 0.05f, 0.05f, 0.05f, 0.05f });
+
+    ROI roi     = get_roi(A.spec());
+    roi.chbegin = 0;
+    roi.chend   = 3;  // RGB only => non-contiguous for RGBA interleaving
+
+    {
+        ImageBuf R0(spec), R1(spec);
+        ImageBufAlgo::fill(R0, { 0.9f, 0.8f, 0.7f, 0.6f });
+        ImageBufAlgo::fill(R1, { 0.9f, 0.8f, 0.7f, 0.6f });
+        OIIO::attribute("enable_hwy", 0);
+        ImageBufAlgo::add(R0, A, B, roi);
+        OIIO::attribute("enable_hwy", 1);
+        ImageBufAlgo::add(R1, A, B, roi);
+        auto comp = ImageBufAlgo::compare(R0, R1, 0.0f, 0.0f);
+        OIIO_CHECK_EQUAL(comp.maxerror, 0.0f);
+    }
+    {
+        ImageBuf R0(spec), R1(spec);
+        ImageBufAlgo::fill(R0, { 0.9f, 0.8f, 0.7f, 0.6f });
+        ImageBufAlgo::fill(R1, { 0.9f, 0.8f, 0.7f, 0.6f });
+        OIIO::attribute("enable_hwy", 0);
+        ImageBufAlgo::sub(R0, A, B, roi);
+        OIIO::attribute("enable_hwy", 1);
+        ImageBufAlgo::sub(R1, A, B, roi);
+        auto comp = ImageBufAlgo::compare(R0, R1, 0.0f, 0.0f);
+        OIIO_CHECK_EQUAL(comp.maxerror, 0.0f);
+    }
+    {
+        ImageBuf R0(spec), R1(spec);
+        ImageBufAlgo::fill(R0, { 0.9f, 0.8f, 0.7f, 0.6f });
+        ImageBufAlgo::fill(R1, { 0.9f, 0.8f, 0.7f, 0.6f });
+        OIIO::attribute("enable_hwy", 0);
+        ImageBufAlgo::mul(R0, A, B, roi);
+        OIIO::attribute("enable_hwy", 1);
+        ImageBufAlgo::mul(R1, A, B, roi);
+        auto comp = ImageBufAlgo::compare(R0, R1, 0.0f, 0.0f);
+        OIIO_CHECK_EQUAL(comp.maxerror, 0.0f);
+    }
+    {
+        ImageBuf R0(spec), R1(spec);
+        ImageBufAlgo::fill(R0, { 0.9f, 0.8f, 0.7f, 0.6f });
+        ImageBufAlgo::fill(R1, { 0.9f, 0.8f, 0.7f, 0.6f });
+        OIIO::attribute("enable_hwy", 0);
+        ImageBufAlgo::div(R0, A, B, roi);
+        OIIO::attribute("enable_hwy", 1);
+        ImageBufAlgo::div(R1, A, B, roi);
+        auto comp = ImageBufAlgo::compare(R0, R1, 0.0f, 0.0f);
+        OIIO_CHECK_EQUAL(comp.maxerror, 0.0f);
+    }
+    {
+        ImageBuf R0(spec), R1(spec);
+        ImageBufAlgo::fill(R0, { 0.9f, 0.8f, 0.7f, 0.6f });
+        ImageBufAlgo::fill(R1, { 0.9f, 0.8f, 0.7f, 0.6f });
+        OIIO::attribute("enable_hwy", 0);
+        ImageBufAlgo::mad(R0, A, B, C, roi);
+        OIIO::attribute("enable_hwy", 1);
+        ImageBufAlgo::mad(R1, A, B, C, roi);
+        auto comp = ImageBufAlgo::compare(R0, R1, 0.0f, 0.0f);
+        OIIO_CHECK_EQUAL(comp.maxerror, 0.0f);
+    }
+
+    OIIO::attribute("enable_hwy", prev_enable_hwy);
+#endif
+}
 
 
 // Tests ImageBufAlgo::min
@@ -596,6 +691,8 @@ test_over(TypeDesc dtype = TypeFloat)
 
     // Timing
     Benchmarker bench;
+    bench.trials(ntrials);
+    bench.iterations(iterations);
     ImageSpec onekfloat(1000, 1000, 4, TypeFloat);
     BG = filled_image(BGval, 1000, 1000);
     FG = filled_image({ 0.0f, 0.0f, 0.0f, 0.0f }, 1000, 1000);
@@ -637,6 +734,43 @@ test_zover()
             for (int c = 0; c < nc; ++c)
                 OIIO_CHECK_EQUAL(R.getchannel(r.x(), r.y(), 0, c), Aval[c]);
     }
+}
+
+
+
+// Test ImageBuf::resample
+void
+test_resample()
+{
+    std::cout << "test resample\n";
+
+    // Timing
+    Benchmarker bench;
+    bench.trials(ntrials);
+    bench.iterations(iterations);
+    bench.units(Benchmarker::Unit::ms);
+
+    ImageSpec spec_hd_rgba_f(1920, 1080, 4, TypeFloat);
+    ImageSpec spec_hd_rgba_u8(1920, 1080, 4, TypeUInt8);
+    ImageBuf buf_hd_rgba_f(spec_hd_rgba_f);
+    ImageBuf buf_hd_rgba_u8(spec_hd_rgba_u8);
+    float red_rgba[] = { 1.0, 0.0, 0.0, 1.0 };
+    ImageBufAlgo::fill(buf_hd_rgba_f, red_rgba);
+    ImageBufAlgo::fill(buf_hd_rgba_u8, red_rgba);
+    ImageBuf smallf(ImageSpec(1024, 512, 4, TypeFloat));
+    ImageBuf smallu8(ImageSpec(1024, 512, 4, TypeUInt8));
+    bench("  IBA::resample HD->1024x512 rgba f->f    interp   ",
+          [&]() { ImageBufAlgo::resample(smallf, buf_hd_rgba_f, true); });
+    bench("  IBA::resample HD->1024x512 rgba f->u8   interp   ",
+          [&]() { ImageBufAlgo::resample(smallu8, buf_hd_rgba_f, true); });
+    bench("  IBA::resample HD->1024x512 rgba u8->u8  interp   ",
+          [&]() { ImageBufAlgo::resample(smallu8, buf_hd_rgba_u8, true); });
+    bench("  IBA::resample HD->1024x512 rgba f->f   no interp ",
+          [&]() { ImageBufAlgo::resample(smallf, buf_hd_rgba_f, false); });
+    bench("  IBA::resample HD->1024x512 rgba f->u8  no interp ",
+          [&]() { ImageBufAlgo::resample(smallu8, buf_hd_rgba_f, false); });
+    bench("  IBA::resample HD->1024x512 rgba u8->u8 no interp ",
+          [&]() { ImageBufAlgo::resample(smallu8, buf_hd_rgba_u8, false); });
 }
 
 
@@ -1037,10 +1171,10 @@ void
 benchmark_parallel_image(int res, int iters)
 {
     using namespace ImageBufAlgo;
-    print("\nTime old parallel_image for {}x{}\n", res, res);
+    OIIO::print("\nTime old parallel_image for {}x{}\n", res, res);
 
-    print("  threads time    rate   (best of {})\n", ntrials);
-    print("  ------- ------- -------\n");
+    OIIO::print("  threads time    rate   (best of {})\n", ntrials);
+    OIIO::print("  ------- ------- -------\n");
     ImageSpec spec(res, res, 3, TypeDesc::FLOAT);
     ImageBuf X(spec), Y(spec);
     ImageBufAlgo::zero(Y);
@@ -1064,16 +1198,16 @@ benchmark_parallel_image(int res, int iters)
         };
         double range;
         double t = time_trial(func, ntrials, iters, &range) / iters;
-        print("  {:4}   {:7.3f} ms  {:5.1f} Mpels/s\n", nt, t * 1000,
-              double(res * res) / t / 1.0e6);
+        OIIO::print("  {:4}   {:7.3f} ms  {:5.1f} Mpels/s\n", nt, t * 1000,
+                    double(res * res) / t / 1.0e6);
         if (!wedge)
             break;  // don't loop if we're not wedging
     }
 
-    print("\nTime new parallel_image for {}x{}\n", res, res);
+    OIIO::print("\nTime new parallel_image for {}x{}\n", res, res);
 
-    print("  threads time    rate   (best of {})\n", ntrials);
-    print("  ------- ------- -------\n");
+    OIIO::print("  threads time    rate   (best of {})\n", ntrials);
+    OIIO::print("  ------- ------- -------\n");
     for (int i = 0; threadcounts[i] <= numthreads; ++i) {
         int nt = wedge ? threadcounts[i] : numthreads;
         // default_thread_pool()->resize (nt);
@@ -1081,8 +1215,8 @@ benchmark_parallel_image(int res, int iters)
         auto func = [&]() { parallel_image(Y.roi(), nt, exercise); };
         double range;
         double t = time_trial(func, ntrials, iters, &range) / iters;
-        print("  {:4}   {:6.2f} ms  {:5.1f} Mpels/s\n", nt, t * 1000,
-              double(res * res) / t / 1.0e6);
+        OIIO::print("  {:4}   {:6.2f} ms  {:5.1f} Mpels/s\n", nt, t * 1000,
+                    double(res * res) / t / 1.0e6);
         if (!wedge)
             break;  // don't loop if we're not wedging
     }
@@ -1143,13 +1277,15 @@ void
 test_color_management()
 {
     ColorConfig config;
-    auto processor = config.createColorProcessor("lin_srgb", "srgb");
+    auto processor = config.createColorProcessor("lin_rec709_scene",
+                                                 "srgb_rec709_scene");
     // These color spaces might not be found if the site running this test
     // has a weirdo OCIO config that doesn't contain those names. If we fail,
     // try again using the built-in config (OCIO 2.2+) and hope for the best.
     if (!processor)
         processor = ColorConfig("ocio://default")
-                        .createColorProcessor("lin_srgb", "srgb");
+                        .createColorProcessor("lin_rec709_scene",
+                                              "srgb_rec709_scene");
     OIIO_CHECK_ASSERT(processor);
 
     // Test the IBA::colorconvert version that works on a color at a time
@@ -1176,7 +1312,7 @@ test_color_management()
 static void
 test_yee()
 {
-    print("Testing Yee comparison\n");
+    OIIO::print("Testing Yee comparison\n");
     ImageSpec spec(1, 1, 3, TypeDesc::FLOAT);
     ImageBuf img1(spec);
     ImageBufAlgo::fill(img1, { 0.1f, 0.1f, 0.1f });
@@ -1187,6 +1323,73 @@ test_yee()
     OIIO_CHECK_EQUAL(n, 1);
     OIIO_CHECK_EQUAL(cr.maxx, 0);
     OIIO_CHECK_EQUAL(cr.maxy, 0);
+}
+
+
+
+void
+test_FLIP()
+{
+    OIIO::print("Testing FLIP_diff comparison\n");
+
+    // FLIP_diff(A, A) should produce an all-zero error map.
+    ImageSpec spec(32, 32, 3, TypeDesc::FLOAT);
+    ImageBuf img(spec);
+    ImageBufAlgo::fill(img, { 0.3f, 0.5f, 0.7f });
+    ImageBuf result = ImageBufAlgo::experimental::FLIP_diff(img, img);
+    OIIO_CHECK_ASSERT(!result.has_error());
+    OIIO_CHECK_EQUAL(result.nchannels(), 1);
+    OIIO_CHECK_EQUAL_THRESH(result.spec().get_float_attribute("FLIP:maxerror"),
+                            0.0f, 1.0e-5f);
+
+    // FLIP_diff(black, white) should produce a nonzero error map in [0,1].
+    ImageBuf black(spec), white(spec);
+    ImageBufAlgo::fill(black, { 0.0f, 0.0f, 0.0f });
+    ImageBufAlgo::fill(white, { 1.0f, 1.0f, 1.0f });
+    ImageBuf bw = ImageBufAlgo::experimental::FLIP_diff(black, white);
+    OIIO_CHECK_ASSERT(!bw.has_error());
+    OIIO_CHECK_EQUAL(bw.nchannels(), 1);
+    // Max error should be positive and in range [0,1].
+    float maxerror  = bw.spec().get_float_attribute("FLIP:maxerror");
+    float meanerror = bw.spec().get_float_attribute("FLIP:meanerror");
+    OIIO_CHECK_EQUAL(maxerror, ImageBufAlgo::computePixelStats(bw).max[0]);
+    OIIO_CHECK_ASSERT(maxerror > 0.0);
+    OIIO_CHECK_ASSERT(meanerror > 0.0);
+    OIIO_CHECK_ASSERT(maxerror <= 1.0);
+
+    // Test FLIP_ppd helper.
+    float ppd = ImageBufAlgo::experimental::FLIP_ppd(0.7f, 3840.0f, 0.7f);
+    OIIO_CHECK_ASSERT(ppd > 60.0f && ppd < 80.0f);
+
+    // Benchmarking
+    Benchmarker bench;
+    bench.trials(ntrials);
+    bench.iterations(iterations);
+#if defined(NDEBUG) || !defined(OIIO_CI)
+    const int xres = 4096, yres = 2160;
+#else
+    // Only for debug builds that are part of OIIO's CI - reduce resolution to
+    // make it run faster
+    const int xres = 4096 / 2, yres = 2160 / 2;
+#endif
+    ImageSpec bigspec(xres, yres, 3, TypeFloat);
+    ImageBuf ramp  = ImageBufAlgo::fill({ 0.0f, 0.0f, 0.0f },
+                                        { 1.0f, 0.0f, 0.0f },
+                                        { 0.0f, 1.0f, 0.0f },
+                                        { 0.0f, 0.0f, 1.0f }, bigspec.roi());
+    ImageBuf noisy = ramp;
+    ImageBufAlgo::noise(noisy, "gaussian", 0.0, 0.001f);
+    ImageBuf flipresult(ImageSpec(xres, yres, 1, TypeFloat));
+    bench(Strutil::format("FLIP_diff() LDR {}", xres), [&]() {
+        auto buf OIIO_MAYBE_UNUSED
+            = ImageBufAlgo::experimental::FLIP_diff(flipresult, noisy, ramp,
+                                                    { { "hdr", 0 } });
+    });
+    bench(Strutil::format("FLIP_diff() HDR {}", xres), [&]() {
+        auto buf OIIO_MAYBE_UNUSED
+            = ImageBufAlgo::experimental::FLIP_diff(flipresult, noisy, ramp,
+                                                    { { "hdr", 1 } });
+    });
 }
 
 
@@ -1219,9 +1422,9 @@ static void
 test_simple_perpixel()
 {
     TypeDesc td = TypeDescFromC<T>::value();
-    print("test_simple_perpixel {}\n", td);
+    OIIO::print("test_simple_perpixel {}\n", td);
     {
-        print("  unary op\n");
+        OIIO::print("  unary op\n");
         ImageBuf src = filled_image({ 0.25f, 0.5f, 0.75f, 1.0f }, 4, 4, td);
         ImageBuf result;
         // Test with raw function pointer
@@ -1259,7 +1462,7 @@ test_simple_perpixel()
         }
     }
     {
-        print("  binary op\n");
+        OIIO::print("  binary op\n");
         ImageBuf srcA   = filled_image({ 0.25f, 0.5f, 0.75f, 1.0f }, 4, 4, td);
         ImageBuf srcB   = filled_image({ 1.0f, 2.0f, 3.0f, 4.0f }, 4, 4, td);
         ImageBuf result = ImageBufAlgo::perpixel_op(
@@ -1281,11 +1484,20 @@ test_simple_perpixel()
         // Timing test: how much more expensive is the perpixel_op than the
         // fully optimized per-type version?
         Benchmarker bench;
+        bench.trials(ntrials);
+        bench.iterations(iterations);
         bench.units(Benchmarker::Unit::ms);
-        ImageBuf af(ImageSpec(2048, 2048, 4, TypeFloat));
-        ImageBuf bf(ImageSpec(2048, 2048, 4, TypeFloat));
-        ImageBuf au8(ImageSpec(2048, 2048, 4, TypeUInt8));
-        ImageBuf bu8(ImageSpec(2048, 2048, 4, TypeUInt8));
+#if defined(NDEBUG) || !defined(OIIO_CI)
+        const int rez = 2048;
+#else
+        // Only for debug builds that are part of OIIO's CI - reduce resolution to
+        // make it run faster
+        const int rez = 1024;
+#endif
+        ImageBuf af(ImageSpec(rez, rez, 4, TypeFloat));
+        ImageBuf bf(ImageSpec(rez, rez, 4, TypeFloat));
+        ImageBuf au8(ImageSpec(rez, rez, 4, TypeUInt8));
+        ImageBuf bu8(ImageSpec(rez, rez, 4, TypeUInt8));
         bench("  IBA::add() float",
               [&]() { ImageBuf r = ImageBufAlgo::add(af, bf); });
         bench("  IBA::add() u8",
@@ -1314,15 +1526,15 @@ test_simple_perpixel()
 
 template<class T>
 std::string
-mosaic(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
-       const std::string& pattern, const float (&white_balance)[4],
-       int nthreads);
+do_mosaic(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
+          const std::string& pattern, const float (&white_balance)[4],
+          int nthreads);
 
 template<>
 std::string
-mosaic<float>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
-              const std::string& pattern, const float (&white_balance)[4],
-              int nthreads)
+do_mosaic<float>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
+                 const std::string& pattern, const float (&white_balance)[4],
+                 int nthreads)
 {
     return ImageBufAlgo::mosaic_float(dst, src, x_offset, y_offset, pattern,
                                       white_balance, nthreads);
@@ -1330,9 +1542,9 @@ mosaic<float>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
 
 template<>
 std::string
-mosaic<half>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
-             const std::string& pattern, const float (&white_balance)[4],
-             int nthreads)
+do_mosaic<half>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
+                const std::string& pattern, const float (&white_balance)[4],
+                int nthreads)
 {
     return ImageBufAlgo::mosaic_half(dst, src, x_offset, y_offset, pattern,
                                      white_balance, nthreads);
@@ -1340,9 +1552,9 @@ mosaic<half>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
 
 template<>
 std::string
-mosaic<uint16_t>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
-                 const std::string& pattern, const float (&white_balance)[4],
-                 int nthreads)
+do_mosaic<uint16_t>(ImageBuf& dst, const ImageBuf& src, int x_offset,
+                    int y_offset, const std::string& pattern,
+                    const float (&white_balance)[4], int nthreads)
 {
     return ImageBufAlgo::mosaic_uint16(dst, src, x_offset, y_offset, pattern,
                                        white_balance, nthreads);
@@ -1350,9 +1562,9 @@ mosaic<uint16_t>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
 
 template<>
 std::string
-mosaic<uint8_t>(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
-                const std::string& pattern, const float (&white_balance)[4],
-                int nthreads)
+do_mosaic<uint8_t>(ImageBuf& dst, const ImageBuf& src, int x_offset,
+                   int y_offset, const std::string& pattern,
+                   const float (&white_balance)[4], int nthreads)
 {
     return ImageBufAlgo::mosaic_uint8(dst, src, x_offset, y_offset, pattern,
                                       white_balance, nthreads);
@@ -1419,8 +1631,8 @@ test_demosaic(const DemosaicTestConfig& config, const ImageBuf& src_image,
             ImageSpec dst_spec(src_spec.width, src_spec.height, 1, type);
             ImageBuf mosaiced_image(dst_spec);
 
-            std::string layout = mosaic<T>(mosaiced_image, src_image, x, y,
-                                           config.pattern, wb, 0);
+            std::string layout = do_mosaic<T>(mosaiced_image, src_image, x, y,
+                                              config.pattern, wb, 0);
 
             mosaiced_image.specmod().attribute("raw:FilterPattern", layout);
             mosaiced_image.specmod().attribute("raw:WhiteBalance",
@@ -1475,7 +1687,7 @@ test_demosaic(const DemosaicTestConfig& config, const ImageBuf& src_image,
 static void
 test_demosaic()
 {
-    print("Testing Demosaicing\n");
+    OIIO::print("Testing Demosaicing\n");
 
     ImageSpec src_spec(256, 256, 3, TypeDesc::FLOAT);
     ImageBuf src_image(src_spec);
@@ -1551,6 +1763,17 @@ test_demosaic()
 }
 
 
+
+// clang-format off
+// Neat trick macro to prefix in front of the calls where we want to
+// run it in both hwy and non-hwy modes. It will loop over both settings.
+#define HWY_TEST                                    \
+    for (hwy_on = 0; hwy_on <= hwy_build; ++hwy_on) \
+        OIIO::attribute("enable_hwy", hwy_on), /* next command */
+// clang-format on
+
+
+
 int
 main(int argc, char** argv)
 {
@@ -1561,6 +1784,11 @@ main(int argc, char** argv)
     iterations /= 10;
     ntrials = 1;
 #endif
+#if !defined(NDEBUG)
+    // For debug+CI combination runs, reduce to truly one iteration.
+    if (Strutil::stoi(Sysutil::getenv("OpenImageIO_CI")) != 0)
+        iterations = 1;
+#endif
 
     getargs(argc, argv);
 
@@ -1570,15 +1798,17 @@ main(int argc, char** argv)
     test_crop();
     test_paste();
     test_channel_append();
-    test_add();
-    test_sub();
-    test_mul();
-    test_mad();
+    HWY_TEST test_add();
+    HWY_TEST test_sub();
+    HWY_TEST test_mul();
+    HWY_TEST test_mad();
+    test_hwy_strided_roi_fallback();
     test_min();
     test_max();
     test_over(TypeFloat);
     test_over(TypeHalf);
     test_zover();
+    test_resample();
     test_compare();
     test_isConstantColor();
     test_isConstantChannel();
@@ -1591,6 +1821,7 @@ main(int argc, char** argv)
     test_opencv();
     test_color_management();
     test_yee();
+    test_FLIP();
     test_demosaic();
     test_simple_perpixel<float>();
     test_simple_perpixel<half>();
@@ -1598,7 +1829,9 @@ main(int argc, char** argv)
     benchmark_parallel_image(64, iterations * 64);
     benchmark_parallel_image(512, iterations * 16);
     benchmark_parallel_image(1024, iterations * 4);
+#if defined(NDEBUG) || !defined(OIIO_CI)
     benchmark_parallel_image(2048, iterations);
+#endif
 
     return unit_test_failures;
 }

@@ -4,7 +4,7 @@
 
 cmake_minimum_required (VERSION 3.18.2...4.0)
 
-set (OpenImageIO_VERSION "3.1.3.0")
+set (OpenImageIO_VERSION "3.2.0.1")
 set (OpenImageIO_VERSION_OVERRIDE "" CACHE STRING
      "Version override (use with caution)!")
 mark_as_advanced (OpenImageIO_VERSION_OVERRIDE)
@@ -40,7 +40,7 @@ if (CMAKE_VERSION VERSION_LESS 3.21)
     endif ()
 endif ()
 
-# Set up module path for our own cmake modules and add some esential ones
+# Set up module path for our own cmake modules and add some essential ones
 list (APPEND CMAKE_MODULE_PATH
       "${PROJECT_SOURCE_DIR}/src/cmake/modules"
       "${PROJECT_SOURCE_DIR}/src/cmake")
@@ -112,6 +112,7 @@ else ()
 endif ()
 option (${PROJ_NAME}_BUILD_TOOLS "Build the command-line tools" ON)
 option (${PROJ_NAME}_BUILD_TESTS "Build the unit tests" ON)
+set_option (OIIO_USE_HWY "Enable experimental Google Highway SIMD optimizations (if Highway is available)" OFF VERBOSE)
 set (OIIO_LIBNAME_SUFFIX "" CACHE STRING
      "Optional name appended to ${PROJECT_NAME} libraries that are built")
 option (BUILD_OIIOUTIL_ONLY "If ON, will build *only* libOpenImageIO_Util" OFF)
@@ -141,6 +142,12 @@ if (TEX_BATCH_SIZE)
     add_compile_definitions (OIIO_TEXTURE_SIMD_BATCH_WIDTH=${TEX_BATCH_SIZE})
 endif ()
 
+# If we're building this just for CI, define a symbol so the code can
+# tell (and reduce complexity of some tests)
+set_option (OIIO_CI "Set if this build is for our GHA CI" OFF)
+if (OIIO_CI)
+    add_compile_definitions (OIIO_CI=1)
+endif ()
 
 # Namespace settings
 #
@@ -191,7 +198,9 @@ if (IGNORE_HOMEBREWED_DEPS)
     # Define the list of prefixes to ignore
     set (HOMEBREW_PREFIXES
          /opt/homebrew
+         /opt/homebrew/Cellar
          /usr/local
+         /usr/local/Cellar
          /usr/X11
          /usr/X11R6
          /opt/X11
@@ -271,7 +280,6 @@ endif ()
 # Disable building of certain tools when building Python wheels
 if (SKBUILD)
     set (ENABLE_iconvert OFF)
-    set (ENABLE_idiff OFF)
     set (ENABLE_igrep OFF)
     set (ENABLE_iinfo OFF)
     set (ENABLE_testtex OFF)
@@ -306,7 +314,12 @@ else ()
     set (_py_dev_found Python3_Development.Module_FOUND)
 endif ()
 if (USE_PYTHON AND ${_py_dev_found} AND NOT BUILD_OIIOUTIL_ONLY)
-    add_subdirectory (src/python)
+    if (OIIO_BUILD_PYTHON_PYBIND11)
+        add_subdirectory (src/python)
+    endif ()
+    if (OIIO_BUILD_PYTHON_NANOBIND)
+        add_subdirectory (src/python-nanobind)
+    endif ()
 else ()
     message (STATUS "Not building Python bindings: USE_PYTHON=${USE_PYTHON}, Python3_Development.Module_FOUND=${Python3_Development.Module_FOUND}")
 endif ()

@@ -43,8 +43,10 @@ getargs(int argc, char* argv[])
              OIIO_INTRO_STRING)
       .usage("simd_test [options]");
 
-    ap.arg("--iterations %d", &iterations)
+    ap.arg("--iters %d", &iterations)
       .help(Strutil::fmt::format("Number of iterations (default: {})", iterations));
+    ap.arg("--iterations %d", &iterations)
+      .hidden();  // obsolete synonym for --iters
     ap.arg("--trials %d", &ntrials)
       .help("Number of trials");
 
@@ -1970,6 +1972,12 @@ main(int argc, char* argv[])
     iterations /= 10;
     ntrials = 1;
 #endif
+#if !defined(NDEBUG)
+    // For debug+CI combination runs, reduce to truly one iteration.
+    if (Strutil::stoi(Sysutil::getenv("OpenImageIO_CI")) != 0)
+        iterations = 1;
+#endif
+
     for (int i = 0; i < 16; ++i) {
         dummy_float[i] = 1.0f;
         dummy_int[i]   = 1;

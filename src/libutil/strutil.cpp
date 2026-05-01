@@ -5,13 +5,7 @@
 
 #include <OpenImageIO/platform.h>
 
-// Special dance to disable warnings in the included files related to
-// the deprecation of unicode conversion functions.
-OIIO_PRAGMA_WARNING_PUSH
-OIIO_CLANG_PRAGMA(clang diagnostic ignored "-Wdeprecated-declarations")
-#include <codecvt>
 #include <locale>
-OIIO_PRAGMA_WARNING_POP
 
 #include <algorithm>
 #include <cmath>
@@ -59,6 +53,18 @@ OIIO_PRAGMA_WARNING_POP
 
 
 OIIO_NAMESPACE_BEGIN
+namespace pvt {
+static const char* oiio_debug_env = getenv("OPENIMAGEIO_DEBUG");
+#ifdef NDEBUG
+OIIO_UTIL_API int
+    oiio_print_debug(oiio_debug_env ? Strutil::stoi(oiio_debug_env) : 0);
+#else
+OIIO_UTIL_API int
+    oiio_print_debug(oiio_debug_env ? Strutil::stoi(oiio_debug_env) : 1);
+#endif
+OIIO_UTIL_API int oiio_print_uncaught_errors(1);
+}  // namespace pvt
+
 
 
 namespace {
@@ -67,7 +73,7 @@ static std::mutex output_mutex;
 // On systems that support it, get a location independent locale.
 #if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) \
     || defined(__FreeBSD_kernel__) || defined(__OpenBSD__)           \
-    || defined(__GLIBC__)
+    || defined(__GLIBC__) || defined(__NetBSD__)
 static locale_t c_loc = newlocale(LC_ALL_MASK, "C", nullptr);
 #elif defined(_WIN32)
 static _locale_t c_loc = _create_locale(LC_ALL, "C");
@@ -75,6 +81,18 @@ static _locale_t c_loc = _create_locale(LC_ALL, "C");
 
 };  // namespace
 
+
+
+#if OIIO_VERSION_LESS(3, 1, 2) /* remove at next ABI compatibility boundary */
+void
+pvt::log_fmt_error(const char* message)
+{
+    print("fmt exception: {}\n", message);
+    Strutil::pvt::append_error(std::string("fmt exception: ") + message);
+}
+#endif
+
+OIIO_NAMESPACE_END
 
 
 // Locale-independent quickie ASCII digit and alphanum tests, good enough
@@ -101,6 +119,7 @@ isdigit(char c)
 }
 
 
+OIIO_NAMESPACE_3_1_BEGIN
 
 OIIO_NO_SANITIZE_ADDRESS const char*
 c_str(string_view str)
@@ -127,7 +146,7 @@ c_str(string_view str)
     // in C++17 string_view. So maybe we'll find ourselves relying on it a
     // lot less, and therefore the performance hit of doing it foolproof
     // won't be as onerous.
-    if (str[str.size()] == 0)  // 0-terminated
+    if (str.data()[str.size()] == 0)  // 0-terminated
         return str.data();
 
     // Rare case: may not be 0-terminated. Bite the bullet and construct a
@@ -166,20 +185,6 @@ Strutil::sync_output(std::ostream& file, string_view str, bool flush)
 
 
 
-namespace pvt {
-static const char* oiio_debug_env = getenv("OPENIMAGEIO_DEBUG");
-#ifdef NDEBUG
-OIIO_UTIL_API int
-    oiio_print_debug(oiio_debug_env ? Strutil::stoi(oiio_debug_env) : 0);
-#else
-OIIO_UTIL_API int
-    oiio_print_debug(oiio_debug_env ? Strutil::stoi(oiio_debug_env) : 1);
-#endif
-OIIO_UTIL_API int oiio_print_uncaught_errors(1);
-}  // namespace pvt
-
-
-
 // ErrorHolder houses a string, with the addition that when it is destroyed,
 // it will disgorge any un-retrieved error messages, in an effort to help
 // beginning users diagnose their problems if they have forgotten to call
@@ -189,11 +194,16 @@ struct ErrorHolder {
 
     ~ErrorHolder()
     {
-        if (!error_msg.empty() && pvt::oiio_print_uncaught_errors) {
-            OIIO::print(
-                "OpenImageIO exited with a pending error message that was never\n"
-                "retrieved via OIIO::geterror(). This was the error message:\n{}\n",
-                error_msg);
+        if (!error_msg.empty() && OIIO::pvt::oiio_print_uncaught_errors) {
+            try {
+                OIIO::print(
+                    "OpenImageIO exited with a pending error message that was never\n"
+                    "retrieved via OIIO::geterror(). This was the error message:\n{}\n",
+                    error_msg);
+            } catch (...) {
+                // Swallow any exceptions (e.g., from fmt's fwrite_fully)
+                // to avoid std::terminate from throwing in a destructor.
+            }
         }
     }
 };
@@ -244,17 +254,6 @@ Strutil::pvt::geterror(bool clear)
         error_msg.clear();
     return e;
 }
-
-
-#if OIIO_VERSION_LESS(3, 1, 2) /* remove at next ABI compatibility boundary */
-void
-pvt::log_fmt_error(const char* message)
-{
-    print("fmt exception: {}\n", message);
-    Strutil::pvt::append_error(std::string("fmt exception: ") + message);
-}
-#endif
-
 
 
 void
@@ -526,6 +525,14 @@ strcasecmp(const char* a, const char* b)
     return strcasecmp_l(a, b, c_loc);
 #elif defined(_WIN32)
     return _stricmp_l(a, b, c_loc);
+#elif defined(__NetBSD__)
+    const unsigned char *us1 = (const unsigned char*)a,
+                        *us2 = (const unsigned char*)b;
+
+    while (tolower_l(*us1, c_loc) == tolower_l(*us2++, c_loc))
+        if (*us1++ == '\0')
+            return (0);
+    return (tolower_l(*us1, c_loc) - tolower_l(*--us2, c_loc));
 #else
 #    error("need equivalent of strcasecmp_l on this platform");
 #endif
@@ -541,6 +548,19 @@ strncasecmp(const char* a, const char* b, size_t size)
     return strncasecmp_l(a, b, size, c_loc);
 #elif defined(_WIN32)
     return _strnicmp_l(a, b, size, c_loc);
+#elif defined(__NetBSD__)
+    if (size != 0) {
+        const unsigned char *us1 = (const unsigned char*)a,
+                            *us2 = (const unsigned char*)b;
+
+        do {
+            if (tolower_l(*us1, c_loc) != tolower_l(*us2++, c_loc))
+                return (tolower_l(*us1, c_loc) - tolower_l(*--us2, c_loc));
+            if (*us1++ == '\0')
+                break;
+        } while (--size != 0);
+    }
+    return (0);
 #else
 #    error("need equivalent of strncasecmp_l on this platform");
 #endif
@@ -932,44 +952,89 @@ Strutil::replace(string_view str, string_view pattern, string_view replacement,
 
 
 
-// Conversion functions between UTF-8 and UTF-16 for windows.
+// UTF-8 <-> UTF-16 conversion utilities.
 //
-// For historical reasons, the standard encoding for strings on windows is
-// UTF-16, whereas the unix world seems to have settled on UTF-8.  These two
-// encodings can be stored in std::string and std::wstring respectively, with
-// the caveat that they're both variable-width encodings, so not all the
-// standard string methods will make sense (for example std::string::size()
-// won't return the number of glyphs in a UTF-8 string, unless it happens to
-// be made up of only the 7-bit ASCII subset).
+// OIIO uses UTF-8 for all string/path handling. On Windows, OS APIs require
+// UTF-16 (wchar_t*), so we convert at API boundaries. Some non-Windows uses
+// also exist (e.g., parsing UTF-16 ICC profile metadata).
 //
-// The standard windows API functions usually have two versions, a UTF-16
-// version with a 'W' suffix (using wchar_t* strings), and an ANSI version
-// with a 'A' suffix (using char* strings) which uses the current windows
-// code page to define the encoding.  (To make matters more confusing there is
-// also a further "TCHAR" version which is #defined to the UTF-16 or ANSI
-// version, depending on whether UNICODE is defined during compilation.
-// This is meant to make it possible to support compiling libraries in
-// either unicode or ansi mode from the same codebase.)
+// On Windows, we use the native MultiByteToWideChar/WideCharToMultiByte APIs.
+// On other platforms, we use hand-rolled UTF-8/UTF-16 codec functions below,
+// replacing the deprecated std::codecvt_utf8_utf16 (removed in C++26).
 //
-// Using std::string as the string container (as in OIIO) implies that we
-// can't use UTF-16.  It also means we need a variable-width encoding to
-// represent characters in non-Latin alphabets in an unambiguous way; the
-// obvious candidate is UTF-8.  File paths in OIIO are considered to be
-// represented in UTF-8, and must be converted to UTF-16 before passing to
-// windows API file opening functions.
-//
-// On the other hand, the encoding used for the ANSI versions of the windows
-// API is the current windows code page.  This is more compatible with the
-// default setup of the standard windows command prompt, and may be more
-// appropriate for error messages.
+// Note: wchar_t is 16-bit on Windows (natural UTF-16) but 32-bit on
+// macOS/Linux. The non-Windows path still produces UTF-16 encoding in
+// wchar_t units (with surrogate pairs) to match the expected semantics of
+// utf8_to_utf16wstring().
+
+// Decode one UTF-8 sequence starting at `src[pos]`, advance `pos` past it,
+// and return the codepoint. Returns 0xFFFD on malformed input and advances
+// past the bad byte(s).
+static uint32_t
+decode_utf8(const char* src, size_t len, size_t& pos)
+{
+    auto byte    = [&](size_t i) -> uint8_t { return uint8_t(src[i]); };
+    auto is_cont = [](uint8_t b) { return (b & 0xC0) == 0x80; };
+    uint8_t b0   = byte(pos);
+    if (b0 < 0x80) {
+        pos += 1;
+        return b0;
+    } else if ((b0 & 0xE0) == 0xC0 && pos + 1 < len && is_cont(byte(pos + 1))) {
+        uint32_t cp = (uint32_t(b0 & 0x1F) << 6)
+                      | uint32_t(byte(pos + 1) & 0x3F);
+        pos += 2;
+        return cp >= 0x80 ? cp : 0xFFFD;  // reject overlong
+    } else if ((b0 & 0xF0) == 0xE0 && pos + 2 < len && is_cont(byte(pos + 1))
+               && is_cont(byte(pos + 2))) {
+        uint32_t cp = (uint32_t(b0 & 0x0F) << 12)
+                      | (uint32_t(byte(pos + 1) & 0x3F) << 6)
+                      | uint32_t(byte(pos + 2) & 0x3F);
+        pos += 3;
+        if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))
+            return 0xFFFD;  // overlong or surrogate
+        return cp;
+    } else if ((b0 & 0xF8) == 0xF0 && pos + 3 < len && is_cont(byte(pos + 1))
+               && is_cont(byte(pos + 2)) && is_cont(byte(pos + 3))) {
+        uint32_t cp = (uint32_t(b0 & 0x07) << 18)
+                      | (uint32_t(byte(pos + 1) & 0x3F) << 12)
+                      | (uint32_t(byte(pos + 2) & 0x3F) << 6)
+                      | uint32_t(byte(pos + 3) & 0x3F);
+        pos += 4;
+        return (cp >= 0x10000 && cp <= 0x10FFFF) ? cp : 0xFFFD;
+    }
+    pos += 1;  // skip bad byte
+    return 0xFFFD;
+}
+
+
+// Encode a Unicode codepoint as UTF-8, appending to `out`.
+static void
+encode_utf8(uint32_t cp, std::string& out)
+{
+    if (cp < 0x80) {
+        out += char(cp);
+    } else if (cp < 0x800) {
+        out += char(0xC0 | (cp >> 6));
+        out += char(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += char(0xE0 | (cp >> 12));
+        out += char(0x80 | ((cp >> 6) & 0x3F));
+        out += char(0x80 | (cp & 0x3F));
+    } else if (cp <= 0x10FFFF) {
+        out += char(0xF0 | (cp >> 18));
+        out += char(0x80 | ((cp >> 12) & 0x3F));
+        out += char(0x80 | ((cp >> 6) & 0x3F));
+        out += char(0x80 | (cp & 0x3F));
+    }
+}
+
 
 std::wstring
 Strutil::utf8_to_utf16wstring(string_view str) noexcept
 {
 #ifdef _WIN32
     // UTF8<->UTF16 conversions are primarily needed on Windows, so use the
-    // fastest option (C++11 <codecvt> is many times slower due to locale
-    // access overhead, and is deprecated starting with C++17).
+    // fastest option.
     std::wstring result;
     result.resize(
         MultiByteToWideChar(CP_UTF8, 0, str.data(), str.length(), NULL, 0));
@@ -977,15 +1042,23 @@ Strutil::utf8_to_utf16wstring(string_view str) noexcept
                         (int)result.size());
     return result;
 #else
-    try {
-        OIIO_PRAGMA_WARNING_PUSH
-        OIIO_CLANG_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
-        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> conv;
-        OIIO_PRAGMA_WARNING_POP
-        return conv.from_bytes(str.data(), str.data() + str.size());
-    } catch (const std::exception&) {
-        return std::wstring();
+    // Decode UTF-8 into codepoints and encode as UTF-16 stored in wchar_t
+    // units (matching the behavior of the now-deprecated codecvt_utf8_utf16).
+    std::wstring result;
+    result.reserve(str.size());
+    size_t pos = 0;
+    while (pos < str.size()) {
+        uint32_t cp = decode_utf8(str.data(), str.size(), pos);
+        if (cp < 0x10000) {
+            result += wchar_t(cp);
+        } else {
+            // Encode as surrogate pair in wchar_t units
+            cp -= 0x10000;
+            result += wchar_t(0xD800 + (cp >> 10));
+            result += wchar_t(0xDC00 + (cp & 0x3FF));
+        }
     }
+    return result;
 #endif
 }
 
@@ -996,8 +1069,7 @@ Strutil::utf16_to_utf8(const std::wstring& str) noexcept
 {
 #ifdef _WIN32
     // UTF8<->UTF16 conversions are primarily needed on Windows, so use the
-    // fastest option (C++11 <codecvt> is many times slower due to locale
-    // access overhead, and is deprecated starting with C++17).
+    // fastest option.
     std::string result;
     result.resize(WideCharToMultiByte(CP_UTF8, 0, str.data(), str.length(),
                                       NULL, 0, NULL, NULL));
@@ -1005,15 +1077,33 @@ Strutil::utf16_to_utf8(const std::wstring& str) noexcept
                         (int)result.size(), NULL, NULL);
     return result;
 #else
-    try {
-        OIIO_PRAGMA_WARNING_PUSH
-        OIIO_CLANG_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
-        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> conv;
-        OIIO_PRAGMA_WARNING_POP
-        return conv.to_bytes(str);
-    } catch (const std::exception&) {
-        return std::string();
+    // Decode UTF-16 stored in wchar_t units (matching the behavior of the
+    // now-deprecated codecvt_utf8_utf16) and encode as UTF-8.
+    std::string result;
+    result.reserve(str.size() * 2);
+    size_t i = 0;
+    while (i < str.size()) {
+        uint32_t w = uint32_t(str[i]);
+        uint32_t cp;
+        if (w >= 0xD800 && w <= 0xDBFF && i + 1 < str.size()) {
+            uint32_t w2 = uint32_t(str[i + 1]);
+            if (w2 >= 0xDC00 && w2 <= 0xDFFF) {
+                cp = 0x10000 + ((w - 0xD800) << 10) + (w2 - 0xDC00);
+                i += 2;
+            } else {
+                cp = 0xFFFD;  // unpaired high surrogate
+                i += 1;
+            }
+        } else if (w >= 0xDC00 && w <= 0xDFFF) {
+            cp = 0xFFFD;  // unpaired low surrogate
+            i += 1;
+        } else {
+            cp = w;
+            i += 1;
+        }
+        encode_utf8(cp, result);
     }
+    return result;
 #endif
 }
 
@@ -1030,15 +1120,32 @@ Strutil::utf16_to_utf8(const std::u16string& str) noexcept
                         &result[0], (int)result.size(), NULL, NULL);
     return result;
 #else
-    try {
-        OIIO_PRAGMA_WARNING_PUSH
-        OIIO_CLANG_PRAGMA(GCC diagnostic ignored "-Wdeprecated-declarations")
-        std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> conv;
-        return conv.to_bytes(str);
-        OIIO_PRAGMA_WARNING_POP
-    } catch (const std::exception&) {
-        return std::string();
+    // Decode UTF-16 from char16_t units and encode as UTF-8.
+    std::string result;
+    result.reserve(str.size() * 2);
+    size_t i = 0;
+    while (i < str.size()) {
+        uint32_t w = uint32_t(str[i]);
+        uint32_t cp;
+        if (w >= 0xD800 && w <= 0xDBFF && i + 1 < str.size()) {
+            uint32_t w2 = uint32_t(str[i + 1]);
+            if (w2 >= 0xDC00 && w2 <= 0xDFFF) {
+                cp = 0x10000 + ((w - 0xD800) << 10) + (w2 - 0xDC00);
+                i += 2;
+            } else {
+                cp = 0xFFFD;
+                i += 1;
+            }
+        } else if (w >= 0xDC00 && w <= 0xDFFF) {
+            cp = 0xFFFD;
+            i += 1;
+        } else {
+            cp = w;
+            i += 1;
+        }
+        encode_utf8(cp, result);
     }
+    return result;
 #endif
 }
 
@@ -1494,6 +1601,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 */
+// SPDX-License-Identifier: MIT
 
 #define UTF8_ACCEPT 0
 #define UTF8_REJECT 12
@@ -1571,6 +1679,7 @@ Strutil::utf8_to_unicode(string_view str, std::vector<uint32_t>& uvec)
 
    René Nyffenegger rene.nyffenegger@adp-gmbh.ch
 */
+// SPDX-License-Identifier: Zlib
 std::string
 Strutil::base64_encode(string_view str)
 {
@@ -1987,4 +2096,5 @@ Strutil::eval_as_bool(string_view value)
     }
 }
 
-OIIO_NAMESPACE_END
+
+OIIO_NAMESPACE_3_1_END

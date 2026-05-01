@@ -374,9 +374,9 @@ try:
     b.setpixel(0, 1, (.5,.5,.5,1))
     b.setpixel(1, 1, (1,1,1,1))
     dumpimg (b, msg="linear src=")
-    r = test_iba (ImageBufAlgo.colorconvert, b, "Linear", "sRGB")
+    r = test_iba (ImageBufAlgo.colorconvert, b, "lin_rec709", "sRGB")
     dumpimg (r, msg="to srgb =")
-    r = ImageBufAlgo.colorconvert(r, "sRGB", "Linear")
+    r = ImageBufAlgo.colorconvert(r, "sRGB", "lin_rec709")
     dumpimg (r, msg="back to linear =")
     # Just to test, make a matrix that halves red, doubles green,
     # adds 0.1 to blue.
@@ -417,6 +417,25 @@ try:
     print ("  warns", compresults.nwarn, "fails", compresults.nfail)
 
     # compare_Yee,
+
+    # FLIP_diff
+    black = make_constimage(64, 64, 3, oiio.FLOAT, (0, 0, 0))
+    white = make_constimage(64, 64, 3, oiio.FLOAT, (1, 1, 1))
+    same  = make_constimage(64, 64, 3, oiio.FLOAT, (0.5, 0.5, 0.5))
+    errmap = ImageBufAlgo.FLIP_diff(same, same)
+    print("FLIP_diff same vs same: mean=%.5g max=%.5g"
+          % (errmap.spec().get_float_attribute("FLIP:meanerror"),
+             errmap.spec().get_float_attribute("FLIP:maxerror")))
+    errmap = ImageBufAlgo.FLIP_diff(black, white)
+    print("FLIP_diff black vs white: mean=%.5g max=%.5g"
+          % (errmap.spec().get_float_attribute("FLIP:meanerror"),
+             errmap.spec().get_float_attribute("FLIP:maxerror")))
+    assert (errmap.spec().get_float_attribute("FLIP:meanerror") > 0
+            and errmap.spec().get_float_attribute("FLIP:maxerror") <= 1.0)
+    ppd = ImageBufAlgo.FLIP_ppd(0.7, 3840, 0.7)
+    print("FLIP_ppd = %.4g" % ppd)
+    assert 60 < ppd < 80
+
     # isConstantColor, isConstantChannel
 
     b = ImageBuf (ImageSpec(256,256,3,oiio.UINT8))
@@ -532,7 +551,7 @@ try:
     bad.clear()
 
     # fillholes_pushpull
-    b = test_iba (ImageBufAlgo.fillholes_pushpull, ImageBuf(OIIO_TESTSUITE_ROOT+"/oiiotool/ref/hole.tif"))
+    b = test_iba (ImageBufAlgo.fillholes_pushpull, ImageBuf(OIIO_TESTSUITE_ROOT+"/oiiotool/src/hole.tif"))
     write (b, "tahoe-filled.tif", oiio.UINT8)
 
     # over

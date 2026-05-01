@@ -22,7 +22,7 @@ template<typename T>
 static std::string
 test_numeric(cspan<T> data, TypeDesc type, int num_elements = 1)
 {
-    ParamValue p("name", type, num_elements, data.data());
+    ParamValue p("name", type, num_elements, data);
     int n = type.numelements() * num_elements;
     for (int i = 0; i < n; ++i)
         OIIO_CHECK_EQUAL(p.get<T>(i), data[i]);
@@ -126,6 +126,13 @@ test_value_types()
     }
 
     {
+        const void* ptr = reinterpret_cast<const void*>(size_t(0xdeadbeef));
+        ParamValue p("name", TypeDesc::PTR, 1, make_cspan(&ptr, 1));
+        OIIO_CHECK_EQUAL(p.get<void*>(), ptr);
+        OIIO_CHECK_EQUAL(p.get_string(), "0xdeadbeef");
+    }
+
+    {
         int imatrix[] = { 100, 200, 300, 400 };
         ret           = test_numeric(make_cspan(imatrix[0]), TypeInt);
         OIIO_CHECK_EQUAL(ret, "100");
@@ -169,7 +176,7 @@ test_value_types()
         OIIO_CHECK_EQUAL(p.get_string(), smatrix[0]);
 
         ParamValue q("name", TypeString, sizeof(smatrix) / sizeof(char*),
-                     &smatrix);
+                     make_cspan(&smatrix[0], 2));
         OIIO_CHECK_EQUAL(q.get_string(),
                          "\"this is \\\"a test\\\"\", \"this is another test\"");
     }
@@ -184,7 +191,8 @@ test_value_types()
         OIIO_CHECK_EQUAL(
             s, "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16");
         ParamValue q("name", TypeMatrix,
-                     sizeof(matrix16) / (16 * sizeof(float)), matrix16);
+                     sizeof(matrix16) / (16 * sizeof(float)),
+                     make_cspan(&matrix16[0][0], 32));
         OIIO_CHECK_EQUAL(
             q.get_string(),
             "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25");
@@ -193,7 +201,7 @@ test_value_types()
     // Test rational
     {
         int rat[2] = { 1, 2 };
-        ParamValue p("name", TypeRational, 1, rat);
+        ParamValue p("name", TypeRational, 1, make_cspan(rat));
         // make sure we can retrieve it as int[2] (numerator, denominator)
         OIIO_CHECK_EQUAL(p.get<int>(0), rat[0]);
         OIIO_CHECK_EQUAL(p.get<int>(1), rat[1]);
@@ -276,8 +284,11 @@ test_from_string()
 void
 populate_pvl(ParamValueList& pl)
 {
-    pl["foo"]  = 42;
-    pl["pi"]   = float(M_PI);
+    pl["foo"]       = 42;
+    pl["foostring"] = "42";
+    pl["pi"]        = float(M_PI);
+    pl["pistring"]  = Strutil::to_string(float(M_PI));
+
     pl["bar"]  = "barbarbar?";
     pl["bar2"] = std::string("barbarbar?");
     pl["bar3"] = ustring("barbarbar?");
@@ -299,12 +310,17 @@ test_paramlist()
     print("ParamValueList pl footprint is: {}\n", pvt::footprint(pl));
 
     OIIO_CHECK_EQUAL(pl.get_int("foo"), 42);
+    OIIO_CHECK_EQUAL(pl.get_int("foostring"), 42);
+    OIIO_CHECK_EQUAL(pl.get_int("foostring", -12, false, false), -12);
     OIIO_CHECK_EQUAL(pl.get_int("pi", 4), 4);  // should fail int
     OIIO_CHECK_EQUAL(pl.get_float("pi"), float(M_PI));
+    OIIO_CHECK_EQUAL(pl.get_float("pistring"), float(M_PI));
+    OIIO_CHECK_EQUAL(pl.get_float("pistring", 3.0f, false, false), 3.0f);
     OIIO_CHECK_EQUAL(pl.get_int("bar"), 0);
     OIIO_CHECK_EQUAL(pl.get_int("bar"), 0);
     OIIO_CHECK_EQUAL(pl.get_string("bar"), "barbarbar?");
     OIIO_CHECK_EQUAL(pl.get_string("foo"), "42");
+    OIIO_CHECK_EQUAL(pl.get_string("foo", "fail", false, false), "fail");
     OIIO_CHECK_ASSERT(pl.find("foo") != pl.cend());
     OIIO_CHECK_ASSERT(pl.find("Foo") == pl.cend());
     OIIO_CHECK_ASSERT(pl.find("Foo", TypeDesc::UNKNOWN, false) != pl.cend());

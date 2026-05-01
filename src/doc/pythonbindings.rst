@@ -72,7 +72,7 @@ described in detail in Section :ref:`sec-typedesc`, is replicated for Python.
     These names are also exported to the `OpenImageIO` namespace.
 
 
-.. py::method:: TypeDesc.TypeDesc(typename='unknown')
+.. py:method:: TypeDesc.TypeDesc(typename='unknown')
 
     Construct a `TypeDesc` object the easy way: from a string description.
     If the type name is omitted, it will default to`UNKNOWN`.
@@ -97,7 +97,7 @@ described in detail in Section :ref:`sec-typedesc`, is replicated for Python.
 
 
 
-.. py::method:: TypeDesc.TypeDesc(basetype=oiio.UNKNOWN, aggregate=oiio.SCALAR, vecsemantics=NOSEMANTICS, arraylen=0)
+.. py:method:: TypeDesc.TypeDesc(basetype=oiio.UNKNOWN, aggregate=oiio.SCALAR, vecsemantics=NOSEMANTICS, arraylen=0)
 
     Construct a `TypeDesc` object the hard way: from individual enum tokens
     describing the base type, aggregate class, semantic hints, and array length.
@@ -128,7 +128,8 @@ described in detail in Section :ref:`sec-typedesc`, is replicated for Python.
              TypeFloat2 TypeVector2 TypeFloat4
              TypeVector2i TypeVector3i
              TypeMatrix TypeMatrix33
-             TypeTimeCode TypeKeyCode TypeRational TypePointer
+             TypeTimeCode TypeKeyCode TypeRational TypeURational
+             TypePointer
 
     Pre-constructed `TypeDesc` objects for some common types, available in the
     outer OpenImageIO scope.
@@ -729,7 +730,7 @@ Section :ref:`sec-ImageSpec`, is replicated for Python.
     .. code-block:: python
 
         spec = ImageSpec(...)
-        spec.set_colorspace ("sRGB")
+        spec.set_colorspace ("srgb_rec709_scene")
 
 
 .. py:method:: ImageSpec.undefined ()
@@ -751,7 +752,7 @@ function that opens a file and prints all the relevant header information:
     from OpenImageIO import ImageInput
 
     # Print the contents of an ImageSpec
-    def print_imagespec (spec, subimage=0, mip=0) :
+    def print_imagespec (spec: ImageSpec, subimage: int=0, mip: int=0) :
         if spec.depth <= 1 :
             print ("  resolution %dx%d%+d%+d" % (spec.width, spec.height, spec.x, spec.y))
         else :
@@ -787,7 +788,7 @@ function that opens a file and prints all the relevant header information:
                 print (" ", i.name, "=", i.value)
 
 
-    def poor_mans_iinfo (filename) :
+    def poor_mans_iinfo (filename: str) :
         input = ImageInput.open (filename)
         if not input :
             print ('Could not open "' + filename + '"')
@@ -1243,7 +1244,7 @@ Example: Reading pixel values from a file to find min/max
     #!/usr/bin/env python 
     import OpenImageIO as oiio
     
-    def find_min_max (filename) :
+    def find_min_max (filename: str) :
         input = ImageInput.open (filename)
         if not input :
             print ('Could not open "' + filename + '"')
@@ -3286,6 +3287,98 @@ Image comparison and statistics
 
 
 
+.. py:method:: ImageBuf ImageBufAlgo.FLIP_diff (ref, test, hdr=1, maxluminance=2.0, medianluminance=0.18, ppd=0.0, tonemapper="aces", roi=ROI.All, nthreads=0)
+               bool ImageBufAlgo.FLIP_diff (dst, ref, test, hdr=1, maxluminance=2.0, medianluminance=0.18, ppd=0.0, tonemapper="aces", roi=ROI.All, nthreads=0)
+
+    WARNING: This is EXPERIMENTAL and may change at any time. Do not rely
+    on it prior to the release of OIIO 3.2.
+
+    Compute the `FLIP <https://research.nvidia.com/publication/2020-07_flip-difference-evaluator-alternating-images>`_
+    perceptual difference between images `ref` and `test`, returning a
+    single-channel float error map whose pixel values lie in [0,1].  Higher
+    values indicate larger perceived differences.
+
+    If the image's ``oiio:ColorSpace`` metadata does not clearly define a
+    color space, it will be assumed to be ``lin_rec709_scene`` before
+    processing. Three channels starting at ``roi.chbegin`` are used.
+
+    Summary statistics are stored as metadata attributes on the result
+    ``ImageBuf``:
+
+    .. code-block:: python
+
+        errmap = ImageBufAlgo.FLIP_diff (ref_image, test_image)
+        errmap.spec().get_float_attribute("FLIP:meanerror")   # mean perceptual error
+        errmap.spec().get_float_attribute("FLIP:maxerror")    # maximum per-pixel error
+        errmap.spec().get_int_attribute("FLIP:maxx")          # x coordinate of max-error pixel
+        errmap.spec().get_int_attribute("FLIP:maxy")          # y coordinate of max-error pixel
+        errmap.spec().get_float_attribute("FLIP:startExposure") # HDR: first exposure stop used
+        errmap.spec().get_float_attribute("FLIP:stopExposure")  # HDR: last exposure stop used
+        errmap.spec().get_int_attribute("FLIP:numExposures")  # HDR: number of exposure steps used
+
+    Options:
+
+    * `hdr` (int, default 1) — set to 0 to force use of LDR-FLIP mode (should
+      only be used for images in a LDR display-referred color space).
+    * `maxluminance` (float, default 2.0) — estimated maximum luminance
+    * `medianluminance` (float, default 0.18) — estimated median luminance
+    * `ppd` (float, default 67.02) — pixels per degree of visual angle
+    * `tonemapper` (str, default ``"aces"``) — HDR tonemapper:
+      ``"aces"``, ``"reinhard"``, or ``"hable"``
+    * `startExposure`, `stopExposure` (float) - The start and end exposures
+      for HDR FLIP. If not supplied, they will be computed automatically based
+      on the `maxluminance`, which if it is 0, will be computed based on the
+      value range in the reference image.
+    * `numExposures` (int) - The number of exposures used for HDR FLIP. If
+      not supplied, it will be computed automatically.
+
+    Tip: For a false-color visualization pass the result to
+    :py:meth:`ImageBufAlgo.color_map`.
+
+    See also :py:meth:`ImageBufAlgo.FLIP_ppd` for computing `ppd` from
+    display geometry.
+
+    This was added in OpenImageIO 3.2.
+
+    Example:
+
+    .. code-block:: python
+
+        ref  = ImageBuf("ref.exr")
+        test = ImageBuf("test.exr")
+
+        # Basic use: 1-channel float error map in [0,1].
+        errmap = ImageBufAlgo.FLIP_diff(ref, test)
+        print("Mean FLIP error:", errmap.spec().get_float_attribute("FLIP:meanerror"))
+        print("Max  FLIP error:", errmap.spec().get_float_attribute("FLIP:maxerror"),
+              "at", errmap.spec().get_int_attribute("FLIP:maxx"),
+              errmap.spec().get_int_attribute("FLIP:maxy"))
+
+        # LDR mode (display-referred images only):
+        errmap = ImageBufAlgo.FLIP_diff(ref, test, hdr=0)
+
+        # False-color visualization:
+        colored = ImageBufAlgo.color_map(errmap, 0, "magma")
+
+
+
+.. py:method:: float ImageBufAlgo.FLIP_ppd (monitor_distance_m=0.7, screen_width_px=3840, screen_width_m=0.7)
+
+    Compute the pixels-per-degree value for use as the `ppd` argument to
+    :py:meth:`ImageBufAlgo.FLIP_diff`, given the viewing distance in meters,
+    the screen width in pixels, and the screen width in meters.  The default
+    values correspond to ~67 ppd (a common desktop monitor at typical viewing
+    distance).
+
+    Example:
+
+    .. code-block:: python
+
+        ppd = ImageBufAlgo.FLIP_ppd(0.5, 2560, 0.6)
+        errmap = ImageBufAlgo.FLIP_diff(ref, test, ppd=ppd)
+
+
+
 .. py:method:: tuple ImageBufAlgo.isConstantColor (src, threshold=0.0, roi=ROI.All, nthreads=0)
 
     If all pixels of `src` within the ROI have the same values (for the
@@ -3888,6 +3981,73 @@ sections) work with deep inputs::
 
 |
 
+.. _sec-pythoncolorconfig:
+
+
+ColorConfig
+===========
+
+The `ColorConfig` class that represents the set of color transformations that
+are allowed.
+
+If OpenColorIO is enabled at build time, this configuration is loaded at
+runtime, allowing the user to have complete control of all color transformation
+math. See the
+`OpenColorIO documentation <https://opencolorio.readthedocs.io>`_ for details.
+
+If OpenColorIO is not enabled at build time, a generic color configuration
+is provided for minimal color support.
+
+..
+  TODO: The documentation for this class is incomplete.
+
+.. py:method:: get_cicp (colorspace)
+
+    Find CICP code corresponding to the colorspace.
+    Return a sequence of 4 ints, or None if not found.
+
+    Example:
+
+    .. code-block:: python
+
+        colorconfig = oiio.ColorConfig()
+        cicp = colorconfig.get_cicp("pq_rec2020_display")
+        if cicp:
+            primaries, transfer, matrix, color_range = cicp
+
+    This function was added in OpenImageIO 3.1.
+
+
+.. py:method:: get_color_interop_id (colorspace)
+
+    Find color interop ID for the given colorspace.
+    Returns empty string if not found.
+
+    Example:
+
+    .. code-block:: python
+
+        colorconfig = oiio.ColorConfig()
+        interop_id = colorconfig.get_color_interop_id("Rec.2100-PQ - Display")
+
+    This function was added in OpenImageIO 3.1.
+
+
+.. py:method:: get_color_interop_id (cicp)
+
+    Find color interop ID corresponding to the CICP code.
+    Returns empty string if not found.
+
+    Example:
+
+    .. code-block:: python
+
+        colorconfig = oiio.ColorConfig()
+        interop_id = colorconfig.get_color_interop_id([9, 16, 9, 1])
+
+    This function was added in OpenImageIO 3.1.
+
+
 .. _sec-pythonmiscapi:
 
 Miscellaneous Utilities
@@ -3961,12 +4121,12 @@ details.
     .. code-block:: python
 
         spec = oiio.ImageSpec()
-        oiio.set_colorspace (spec, "lin_rec709")
+        oiio.set_colorspace (spec, "lin_rec709_scene")
 
     This function was added in OpenImageIO 3.0.
 
 
-.. py:method:: set_colorspace_rec709_gamma (spec, name)
+.. py:method:: set_colorspace_rec709_gamma (spec, gamma)
 
     Set the metadata of the `spec` to reflect Rec709 color primaries and the
     given gamma.
@@ -3992,7 +4152,7 @@ details.
 
         # ib is an ImageBuf
         cs = ib.spec().get_string_attribute("oiio:ColorSpace")
-        if oiio.equivalent_colorspace(cs, "sRGB") :
+        if oiio.equivalent_colorspace(cs, "srgb_rec709_scene") :
             print ("The image is sRGB")
 
     This function was added in OpenImageIO 3.0.
@@ -4041,8 +4201,8 @@ following boilerplate:
     # Create an ImageBuf holding a n image of constant color, given the
     # resolution, data format (defaulting to UINT8), fill value, and image
     # origin.
-    def make_constimage (xres, yres, chans=3, format=oiio.UINT8, value=(0,0,0),
-                         xoffset=0, yoffset=0) :
+    def make_constimage (xres: int, yres: int, chans: int=3, format: TypeDesc=oiio.UINT8, value: tuple[int, int, int]=(0,0,0),
+                         xoffset: int=0, yoffset: int=0) -> ImageBuf:
         spec = ImageSpec (xres,yres,chans,format)
         spec.x = xoffset
         spec.y = yoffset
@@ -4062,7 +4222,7 @@ what to do with it next.
 
     # Save an ImageBuf to a given file name, with optional forced image format
     # and error handling.
-    def write_image (image, filename, format=oiio.UNKNOWN) :
+    def write_image (image: ImageBuf, filename: str, format: TypeDesc=oiio.UNKNOWN) :
         if not image.has_error :
             image.write (filename, format)
         if image.has_error :

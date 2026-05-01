@@ -15,7 +15,7 @@ if (NOT USE_EXTERNAL_PUGIXML)
           ../include/OpenImageIO/detail/pugixml/pugixml.hpp
           ../include/OpenImageIO/detail/pugixml/pugixml.cpp
     )
-    if (CMAKE_COMPILER_IS_GNUCC AND NOT ${GCC_VERSION} VERSION_LESS 6.0)
+    if (CMAKE_COMPILER_IS_GNUCC)
         set_source_files_properties (formatspec.cpp xmp.cpp
                                      PROPERTIES COMPILE_FLAGS -Wno-error=placement-new)
     endif ()
@@ -30,15 +30,9 @@ if (NOT MSVC)
                              PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations")
 endif()
 
-if (CMAKE_COMPILER_IS_GNUCC AND ${GCC_VERSION} VERSION_GREATER_EQUAL 9.0)
+if (CMAKE_COMPILER_IS_GNUCC)
     set_source_files_properties (../libutil/SHA1.cpp
                                  PROPERTIES COMPILE_FLAGS -Wno-stringop-truncation)
-endif ()
-
-if (CMAKE_COMPILER_IS_GNUCC AND ${GCC_VERSION} VERSION_GREATER_EQUAL 6.0
-    AND ${GCC_VERSION} VERSION_LESS 7.0)
-    set_source_files_properties (../openvdb.imageio/openvdbinput.cpp
-                                 PROPERTIES COMPILE_FLAGS -Wno-error=strict-overflow)
 endif ()
 
 set (libOpenImageIO_srcs
@@ -57,7 +51,7 @@ set (libOpenImageIO_srcs
                           imagebufalgo_xform.cpp
                           imagebufalgo_demosaic.cpp
                           imagebufalgo_yee.cpp
-                          imagebufalgo_yee.cpp
+                          imagebufalgo_flip.cpp
                           deepdata.cpp exif.cpp exif-canon.cpp
                           formatspec.cpp
                           icc.cpp imagebuf.cpp
@@ -169,10 +163,21 @@ target_link_libraries (OpenImageIO
             $<TARGET_NAME_IF_EXISTS:pugixml::pugixml>
             $<TARGET_NAME_IF_EXISTS:TBB::tbb>
             $<TARGET_NAME_IF_EXISTS:Freetype::Freetype>
-            ${BZIP2_LIBRARIES}
+            $<TARGET_NAME_IF_EXISTS:BZip2::BZip2>
             ZLIB::ZLIB
             ${CMAKE_DL_LIBS}
         )
+
+# Google Highway (hwy) is an optional optimization dependency.
+set (_oiio_use_hwy 0)
+if (OIIO_USE_HWY AND TARGET hwy::hwy)
+    set (_oiio_use_hwy 1)
+    target_link_libraries (OpenImageIO PRIVATE hwy::hwy)
+    if (TARGET hwy::hwy_contrib)
+        target_link_libraries (OpenImageIO PRIVATE hwy::hwy_contrib)
+    endif ()
+endif ()
+target_compile_definitions (OpenImageIO PRIVATE OIIO_USE_HWY=${_oiio_use_hwy})
 
 if (WIN32)
     target_link_libraries (OpenImageIO PRIVATE psapi)
@@ -258,11 +263,13 @@ if (OIIO_BUILD_TESTS AND BUILD_TESTING)
                           LINK_LIBRARIES OpenImageIO Imath::Imath
                           FOLDER "Unit Tests" NO_INSTALL)
     add_test (unit_image_span ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/image_span_test)
+    set_tests_properties (unit_image_span PROPERTIES COST 10)
 
     fancy_add_executable (NAME imagebuf_test SRC imagebuf_test.cpp
                           LINK_LIBRARIES OpenImageIO
                           FOLDER "Unit Tests" NO_INSTALL)
     add_test (unit_imagebuf ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/imagebuf_test)
+    set_tests_properties (unit_imagebuf PROPERTIES COST 30)
 
     fancy_add_executable (NAME imagecache_test SRC imagecache_test.cpp
                           LINK_LIBRARIES OpenImageIO
@@ -277,7 +284,9 @@ if (OIIO_BUILD_TESTS AND BUILD_TESTING)
                                          ${OpenCV_LIBRARIES}
                                          ${OPENIMAGEIO_IMATH_TARGETS}
                           FOLDER "Unit Tests" NO_INSTALL)
+    target_compile_definitions (imagebufalgo_test PRIVATE OIIO_USE_HWY=${_oiio_use_hwy})
     add_test (unit_imagebufalgo ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/imagebufalgo_test)
+    set_tests_properties (unit_imagebufalgo PROPERTIES PROCESSORS 2 COST 60)
 
     fancy_add_executable (NAME imagespec_test SRC imagespec_test.cpp
                           LINK_LIBRARIES OpenImageIO
@@ -288,6 +297,7 @@ if (OIIO_BUILD_TESTS AND BUILD_TESTING)
                           LINK_LIBRARIES OpenImageIO
                           FOLDER "Unit Tests" NO_INSTALL)
     add_test (unit_imageinout ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/imageinout_test)
+    set_tests_properties (unit_imageinout PROPERTIES PROCESSORS 2 COST 30)
 
     if (NOT DEFINED ENV{OpenImageIO_CI})
         fancy_add_executable (NAME imagespeed_test SRC imagespeed_test.cpp

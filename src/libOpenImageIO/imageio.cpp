@@ -53,6 +53,14 @@ int png_linear_premult(0);
 int tiff_half(0);
 int tiff_multithread(1);
 int dds_bc5normal(0);
+#if OIIO_USE_HWY
+// hwy enabled at build time, but allow env var to override at runtime While
+// we're still testing, default to disabled. We intend to change the default
+// to be enabled in time for the release of 3.2.
+int enable_hwy = Strutil::stoi(Sysutil::getenv("OPENIMAGEIO_ENABLE_HWY", "0"));
+#else
+int enable_hwy = 0;  // Not enabled at build time
+#endif
 int limit_channels(1024);
 int limit_imagesize_MB(std::min(32 * 1024,
                                 int(Sysutil::physical_memory() >> 20)));
@@ -118,9 +126,10 @@ public:
             double time         = item.second.first;
             double percall      = time / ncalls;
             bool use_ms_percall = (percall < 0.1);
-            print(out, "{:25s}{:6d} {:7.3f}s  (avg {:6.2f}{})\n", item.first,
-                  ncalls, time, percall * (use_ms_percall ? 1000.0 : 1.0),
-                  use_ms_percall ? "ms" : "s");
+            OIIO::print(out, "{:25s}{:6d} {:7.3f}s  (avg {:6.2f}{})\n",
+                        item.first, ncalls, time,
+                        percall * (use_ms_percall ? 1000.0 : 1.0),
+                        use_ms_percall ? "ms" : "s");
         }
         return out.str();
     }
@@ -219,9 +228,7 @@ oiio_build_compiler()
     using Strutil::fmt::format;
 
     std::string comp;
-#if OIIO_INTEL_CLASSIC_COMPILER_VERSION
-    comp = format("Intel icc {}", OIIO_INTEL_CLASSIC_COMPILER_VERSION);
-#elif OIIO_INTEL_LLVM_COMPILER
+#if OIIO_INTEL_LLVM_COMPILER
     comp = format("Intel icx {}.{}", __clang_major__, __clang_minor__);
 #elif OIIO_APPLE_CLANG_VERSION
     comp = format("Apple clang {}.{}", __clang_major__, __clang_minor__);
@@ -256,19 +263,23 @@ oiio_build_platform()
     platform = "UnknownOS";
 #endif
     platform += "/";
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_AMD64)
     platform += "x86_64";
-#elif defined(__i386__)
+#elif defined(__i386__) || defined(_M_IX86)
     platform += "i386";
-#elif defined(_M_ARM64) || defined(__aarch64__) || defined(__aarch64)
+#elif defined(_M_ARM64) || defined(__aarch64__) || defined(__aarch64) \
+    || defined(__ARM_ARCH)
     platform += "ARM";
 #else
-    platform = "unknown arch?";
+    platform += "unknown arch?";
 #endif
     return platform;
 }
 
+OIIO_NAMESPACE_END
 
+
+OIIO_NAMESPACE_3_1_BEGIN
 
 void
 shutdown()
@@ -326,6 +337,21 @@ log_time(string_view key, const Timer& timer, int count)
 
 
 bool
+attribute(string_view name, TypeDesc type, cspan<std::byte> value)
+{
+    if (value.size_bytes() != type.size()) {
+        OIIO::errorfmt(
+            "OIIO::attribute given a {}-byte span as data for a {}-byte attribute {} {}",
+            value.size(), type.size(), type, name);
+        OIIO_DASSERT(value.size_bytes() == type.size());
+        return false;
+    }
+    return attribute(name, type, value.data());
+}
+
+
+
+bool
 attribute(string_view name, TypeDesc type, const void* val)
 {
     if (name == "options" && type == TypeDesc::STRING) {
@@ -342,7 +368,7 @@ attribute(string_view name, TypeDesc type, const void* val)
     }
     if (Strutil::starts_with(name, "gpu:")
         || Strutil::starts_with(name, "cuda:")) {
-        return pvt::gpu_attribute(name, type, val);
+        return OIIO::pvt::gpu_attribute(name, type, val);
     }
 
     // Things below here need to buarded by the attrib_mutex
@@ -385,6 +411,12 @@ attribute(string_view name, TypeDesc type, const void* val)
     }
     if (name == "dds:bc5normal" && type == TypeInt) {
         dds_bc5normal = *(const int*)val;
+        return true;
+    }
+    if (name == "enable_hwy" && type == TypeInt) {
+#if OIIO_USE_HWY
+        enable_hwy = *(const int*)val;
+#endif
         return true;
     }
     if (name == "limits:channels" && type == TypeInt) {
@@ -446,6 +478,21 @@ attribute(string_view name, TypeDesc type, const void* val)
 
 
 bool
+getattribute(string_view name, TypeDesc type, span<std::byte> value)
+{
+    if (value.size_bytes() != type.size()) {
+        OIIO::errorfmt(
+            "OIIO::getattribute given a {}-byte span as data for a {}-byte attribute {} {}",
+            value.size(), type.size(), type, name);
+        OIIO_DASSERT(value.size_bytes() == type.size());
+        return false;
+    }
+    return getattribute(name, type, value.data());
+}
+
+
+
+bool
 getattribute(string_view name, TypeDesc type, void* val)
 {
     using Strutil::fmt::format;
@@ -459,7 +506,7 @@ getattribute(string_view name, TypeDesc type, void* val)
     }
     if (Strutil::starts_with(name, "gpu:")
         || Strutil::starts_with(name, "cuda:")) {
-        return pvt::gpu_getattribute(name, type, val);
+        return OIIO::pvt::gpu_getattribute(name, type, val);
     }
 
     // Things below here need to buarded by the attrib_mutex
@@ -478,31 +525,31 @@ getattribute(string_view name, TypeDesc type, void* val)
     }
     if (name == "format_list" && type == TypeString) {
         if (format_list.empty())
-            pvt::catalog_all_plugins(plugin_searchpath.string());
+            OIIO::pvt::catalog_all_plugins(plugin_searchpath.string());
         *(ustring*)val = ustring(format_list);
         return true;
     }
     if (name == "input_format_list" && type == TypeString) {
         if (input_format_list.empty())
-            pvt::catalog_all_plugins(plugin_searchpath.string());
+            OIIO::pvt::catalog_all_plugins(plugin_searchpath.string());
         *(ustring*)val = ustring(input_format_list);
         return true;
     }
     if (name == "output_format_list" && type == TypeString) {
         if (output_format_list.empty())
-            pvt::catalog_all_plugins(plugin_searchpath.string());
+            OIIO::pvt::catalog_all_plugins(plugin_searchpath.string());
         *(ustring*)val = ustring(output_format_list);
         return true;
     }
     if (name == "extension_list" && type == TypeString) {
         if (extension_list.empty())
-            pvt::catalog_all_plugins(plugin_searchpath.string());
+            OIIO::pvt::catalog_all_plugins(plugin_searchpath.string());
         *(ustring*)val = ustring(extension_list);
         return true;
     }
     if (name == "library_list" && type == TypeString) {
         if (library_list.empty())
-            pvt::catalog_all_plugins(plugin_searchpath.string());
+            OIIO::pvt::catalog_all_plugins(plugin_searchpath.string());
         *(ustring*)val = ustring(library_list);
         return true;
     }
@@ -576,6 +623,10 @@ getattribute(string_view name, TypeDesc type, void* val)
     }
     if (name == "dds:bc5normal" && type == TypeInt) {
         *(int*)val = dds_bc5normal;
+        return true;
+    }
+    if (name == "enable_hwy" && type == TypeInt) {
+        *(int*)val = enable_hwy;
         return true;
     }
     if (name == "oiio:print_uncaught_errors" && type == TypeInt) {
@@ -683,7 +734,10 @@ getattribute(string_view name, TypeDesc type, void* val)
     return false;
 }
 
+OIIO_NAMESPACE_3_1_END
 
+
+OIIO_NAMESPACE_BEGIN
 
 namespace {
 
@@ -876,6 +930,10 @@ pvt::parallel_convert_from_float(const float* src, void* dst, size_t nvals,
     return dst;
 }
 
+OIIO_NAMESPACE_END
+
+
+OIIO_NAMESPACE_3_1_BEGIN
 
 
 bool
@@ -890,7 +948,7 @@ convert_pixel_values(TypeDesc src_type, const void* src, TypeDesc dst_type,
 
     if (dst_type == TypeFloat) {
         // Special case -- converting non-float to float
-        pvt::convert_to_float(src, (float*)dst, n, src_type);
+        OIIO::pvt::convert_to_float(src, (float*)dst, n, src_type);
         return true;
     }
 
@@ -906,7 +964,7 @@ convert_pixel_values(TypeDesc src_type, const void* src, TypeDesc dst_type,
             tmp.reset(new float[n]);  // Freed when tmp exists its scope
             buf = tmp.get();
         }
-        pvt::convert_to_float(src, buf, n, src_type);
+        OIIO::pvt::convert_to_float(src, buf, n, src_type);
     }
 
     // Convert float to 'dst_type'
@@ -1188,10 +1246,9 @@ add_bluenoise(int nchannels, int width, int height, int depth, float* data,
                     int channel = c + chorigin;
                     if (channel == alpha_channel || channel == z_channel)
                         continue;
-                    float dither
-                        = pvt::bluenoise_4chan_ptr(x + xorigin, y + yorigin,
-                                                   z + zorigin, channel & (~3),
-                                                   ditherseed)[channel & 3];
+                    float dither = OIIO::pvt::bluenoise_4chan_ptr(
+                        x + xorigin, y + yorigin, z + zorigin, channel & (~3),
+                        ditherseed)[channel & 3];
                     *val += ditheramplitude * (dither - 0.5f);
                 }
             }
@@ -1401,4 +1458,4 @@ image_span_within_span(const image_span<const std::byte>& ispan,
 }
 
 
-OIIO_NAMESPACE_END
+OIIO_NAMESPACE_3_1_END

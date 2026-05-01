@@ -98,8 +98,8 @@ static XMPtag xmptag[] = {
     { "tiff:Software", "Software", TypeDesc::STRING, TiffRedundant },
 
     { "exif:ColorSpace", "Exif:ColorSpace", TypeDesc::INT, ExifRedundant },
-    { "exif:PixelXDimension", "", TypeDesc::INT, ExifRedundant|TiffRedundant},
-    { "exif:PixelYDimension", "", TypeDesc::INT, ExifRedundant|TiffRedundant },
+    { "exif:PixelXDimension", "Exif:PixelXDimension", TypeDesc::INT, ExifRedundant|TiffRedundant},
+    { "exif:PixelYDimension", "Exif:PixelYDimension", TypeDesc::INT, ExifRedundant|TiffRedundant },
     { "exifEX:PhotographicSensitivity", "Exif:ISOSpeedRatings", TypeDesc::INT, ExifRedundant },
 
     { "xmp:CreateDate", "DateTime", TypeDesc::STRING, DateConversion|TiffRedundant },
@@ -228,9 +228,14 @@ public:
     XMPtagMap(const XMPtag* tag_table)
     {
         for (const XMPtag* t = &tag_table[0]; t->xmpname; ++t) {
-            std::string lower(t->xmpname);
-            Strutil::to_lower(lower);
-            m_tagmap[lower] = t;
+            std::string lower_xmp(t->xmpname);
+            Strutil::to_lower(lower_xmp);
+            m_tagmap[lower_xmp] = t;
+            if (t->oiioname && t->oiioname[0]) {
+                std::string lower_oiio(t->oiioname);
+                Strutil::to_lower(lower_oiio);
+                m_tagmap[lower_oiio] = t;
+            }
         }
     }
 
@@ -294,13 +299,14 @@ add_attrib(ImageSpec& spec, string_view xmlname, string_view xmlvalue,
 
     // See if it's in the xmp table, which will tell us something about the
     // proper type (everything in the xml itself just looks like a string).
-    if (const XMPtag* xt = xmp_tagmap_ref().find(xmlname)) {
-        if (!xt->oiioname || !xt->oiioname[0])
+    const XMPtag* xmptagptr = xmp_tagmap_ref().find(xmlname);
+    if (xmptagptr) {
+        if (!xmptagptr->oiioname || !xmptagptr->oiioname[0])
             return 0;  // ignore it purposefully
         // Found
-        oiioname = xt->oiioname;
-        oiiotype = xt->oiiotype;
-        special  = xt->special;
+        oiioname = xmptagptr->oiioname;
+        oiiotype = xmptagptr->oiiotype;
+        special  = xmptagptr->special;
     }
 
     // Also try looking it up to see if it's a known exif tag.
@@ -317,13 +323,28 @@ add_attrib(ImageSpec& spec, string_view xmlname, string_view xmlvalue,
                  && count == 1) {
             oiiotype = TypeDesc::FLOAT;
             special  = Rational;
-        } else if (tifftype == TIFF_ASCII)
+        } else if (tifftype == TIFF_ASCII || tifftype == EXIF_UTF8_TYPE)
             oiiotype = TypeDesc::STRING;
         else if (tifftype == TIFF_BYTE && count == 1)
             oiiotype = TypeDesc::INT;
         else if (tifftype == TIFF_NOTYPE)
             return 0;  // skip
     }
+
+    if (Strutil::istarts_with(xmlname, "tiff:")) {
+        if (!xmptagptr)  // Ignore any "tiff:" entry not in the table
+            return 0;
+        if (special & TiffRedundant)  // Ignore ones marked redundant
+            return 0;
+        // Ignore any TIFF related ones we already have set in the spec, don't
+        // let the XMP version overwrite what we gleaned directly from the
+        // file.
+        if (spec.find_attribute(oiioname))
+            return 0;
+    }
+
+    if (special & Suppress)
+        return 0;  // Marked as one to suppress
 
     // Guess the type if unknown
     if (oiiotype == TypeUnknown) {
@@ -406,25 +427,6 @@ add_attrib(ImageSpec& spec, string_view xmlname, string_view xmlvalue,
     return xmlvalue.size();
 }
 
-
-
-// Utility: Search str for the first substring in str (starting from
-// position pos) that starts with startmarker and ends with endmarker.
-// If not found, return false.  If found, return true, store the
-// beginning and ending indices in startpos and endpos.
-static bool
-extract_middle(string_view str, size_t pos, string_view startmarker,
-               string_view endmarker, size_t& startpos, size_t& endpos)
-{
-    startpos = str.find(startmarker, pos);
-    if (startpos == std::string::npos)
-        return false;  // start marker not found
-    endpos = str.find(endmarker, startpos);
-    if (endpos == std::string::npos)
-        return false;  // end marker not found
-    endpos += endmarker.size();
-    return true;
-}
 
 
 // Decode one XMP node and its children.
@@ -513,7 +515,10 @@ decode_xmp_node(pugi::xml_node node, ImageSpec& spec, int level = 1,
 
 }  // anonymous namespace
 
+OIIO_NAMESPACE_END
 
+
+OIIO_NAMESPACE_3_1_BEGIN
 
 bool
 decode_xmp(cspan<uint8_t> xml, ImageSpec& spec)
@@ -533,35 +538,35 @@ decode_xmp(string_view xml, ImageSpec& spec)
 #endif
     if (!xml.length())
         return true;
-    for (size_t startpos = 0, endpos = 0;
-         extract_middle(xml, endpos, "<rdf:Description", "</rdf:Description>",
-                        startpos, endpos);) {
-        // Turn that middle section into an XML document
-        string_view rdf = xml.substr(startpos, endpos - startpos);  // scooch in
+    // Some callers (e.g. JPEG APP1 markers) prepend a namespace URI before the
+    // actual XML. Skip any leading non-XML content.
+    auto xmlstart = xml.find('<');
+    if (xmlstart == string_view::npos)
+        return true;
+    xml = xml.substr(xmlstart);
+    pugi::xml_document doc;
+    pugi::xml_parse_result parse_result
+        = doc.load_buffer(xml.data(), xml.size(),
+                          pugi::parse_default | pugi::parse_fragment);
+    if (!parse_result) {
 #if DEBUG_XMP_READ
-        std::cerr << "RDF is:\n---\n" << rdf.substr(0, 4096) << "\n---\n";
+        std::cerr << "Error parsing XML @" << parse_result.offset << ": "
+                  << parse_result.description() << "\n";
 #endif
-        pugi::xml_document doc;
-        pugi::xml_parse_result parse_result
-            = doc.load_buffer(rdf.data(), rdf.size(),
-                              pugi::parse_default | pugi::parse_fragment);
-        if (!parse_result) {
-#if DEBUG_XMP_READ
-            std::cerr << "Error parsing XML @" << parse_result.offset << ": "
-                      << parse_result.description() << "\n";
-#endif
-            // Instead of returning early here if there were errors parsing
-            // the XML -- I have noticed that very minor XML malformations
-            // are common in XMP found in files -- hope for the best and
-            // go ahead and assume that maybe it managed to put something
-            // useful in the resulting document.
-#if 0
-            return true;
-#endif
-        }
-        // Decode the contents of the XML document (it will recurse)
-        decode_xmp_node(doc.first_child(), spec);
+        // Instead of returning early here if there were errors parsing
+        // the XML -- I have noticed that very minor XML malformations
+        // are common in XMP found in files -- hope for the best and
+        // go ahead and assume that maybe it managed to put something
+        // useful in the resulting document.
     }
+    // Find the first rdf:Description node anywhere in the document.
+    // decode_xmp_node() iterates siblings, so passing the first one processes
+    // all rdf:Description siblings (i.e. all blocks in the rdf:RDF container).
+    auto first_desc = doc.find_node([](pugi::xml_node n) {
+        return strcmp(n.name(), "rdf:Description") == 0;
+    });
+    if (first_desc)
+        decode_xmp_node(first_desc, spec);
 #if DEBUG_XMP_READ
     std::cerr << "XMP total parse time " << timer() << "\n";
 #endif
@@ -611,7 +616,8 @@ gather_xmp_attribs(const ImageSpec& spec,
         // name, where the xmp name is in the right category.
         const XMPtag* tag = xmp_tagmap_ref().find(p.name());
         if (tag) {
-            if (!Strutil::iequals(p.name(), tag->oiioname))
+            if (!Strutil::iequals(p.name(), tag->oiioname)
+                && !Strutil::iequals(p.name(), tag->xmpname))
                 continue;  // Name doesn't match
             if (tag->special & Suppress) {
                 break;  // Purposely suppressing
@@ -857,4 +863,4 @@ encode_xmp(const ImageSpec& spec, bool minimal)
 }
 
 
-OIIO_NAMESPACE_END
+OIIO_NAMESPACE_3_1_END

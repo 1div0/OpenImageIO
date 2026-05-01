@@ -24,7 +24,12 @@ command += oiiotool("-i:ch=R,G rgb64.exr -o rgonly.exr")
 # Test -i to read nonexistent channels
 command += oiiotool("-i:ch=Z rgb64.exr -d half -o ch-err.exr")
 # Test -i to read nonexistent channels in one subimage of a multi-subimage file
-command += oiiotool("-i:ch=R,G,B rgb-z-parts64.exr -d half -o ch-err2.exr")
+command += oiiotool("-i:ch=R,G,B rgb-z-parts64.exr -o ch-err2.exr")
+# Double check that the right data types propagated to the output even
+# without a `-d` -- this was fixed in PR 5056, look out for a regression.
+# Must do channels out of order to get into this edge case.
+command += oiiotool("-i:ch=R,G=B,B=G rgb64.exr -o chrbg.exr")
+command += info_command("chrbg.exr", verbose=False, hash=False)
 
 
 # test -d to change data formats
@@ -35,6 +40,25 @@ command += info_command ("allhalf.exr", safematch=1)
 # sure oiiotool will output per-channel formats.
 command += oiiotool ("src/rgbaz.exr -d half -d Z=float -o rgbahalf-zfloat.exr")
 command += info_command ("rgbahalf-zfloat.exr", safematch=1)
+
+# test -d SUBIMAGE.NAME=fmt to change data format of one subimage
+command += oiiotool ("--create 64x64 3 --attrib oiio:subimagename subimageA " +
+                     "--create 64x64 3 --attrib oiio:subimagename subimageB " +
+                     "--create 64x64 4 --attrib oiio:subimagename subimageC " +
+                     "--siappendall -d half -d subimageB.G=float -o sub-formats.exr")
+command += info_command ("sub-formats.exr", extraargs="--metamatch subimages")
+# test -d SUBIMAGE.*=fmt to change data format of one channel of one subimage
+command += oiiotool ("--create 64x64 3 --attrib oiio:subimagename subimageA " +
+                     "--create 64x64 3 --attrib oiio:subimagename subimageB " +
+                     "--create 64x64 4 --attrib oiio:subimagename subimageC " +
+                     "--siappendall -d half -d subimageB.*=float -o sub-formats2.exr")
+command += info_command ("sub-formats2.exr", extraargs="--metamatch subimages")
+# test -d SUBIMAGE.*=fmt to change data format of one channel of one subimage,
+# when no subimages are named (they wil be upon output) but it will still
+# recognize "subimage{:02}".
+command += oiiotool ("--create 64x64 3 --dup --dup " +
+                     "--siappendall -d half -d subimage01.*=float -o sub-formats3.exr")
+command += info_command ("sub-formats3.exr", extraargs="--metamatch subimages")
 
 
 # Some tests to verify that we are transferring data formats properly.

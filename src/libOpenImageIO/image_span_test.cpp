@@ -5,6 +5,7 @@
 
 #include <OpenImageIO/half.h>
 
+#include <OpenImageIO/argparse.h>
 #include <OpenImageIO/benchmark.h>
 #include <OpenImageIO/fmath.h>
 #include <OpenImageIO/imageio.h>
@@ -16,6 +17,17 @@
 #include <iostream>
 
 using namespace OIIO;
+
+static int ntrials    = 5;
+static int iterations = 0;
+
+#if defined(NDEBUG) || !defined(OIIO_CI)
+static const int big_xres = 2048, big_yres = 1536;
+#else
+// Only for debug builds that are part of OIIO's CI - reduce resolution to
+// make it run faster
+static const int big_xres = 2048 / 2, big_yres = 1536 / 2;
+#endif
 
 
 
@@ -152,7 +164,7 @@ template<typename T = float>
 void
 test_image_span_copy_image()
 {
-    const int xres = 2048, yres = 1536, nchans = 4;
+    const int xres = big_xres, yres = big_yres, nchans = 4;
     const size_t chansize = sizeof(T);
     print("\nTesting copy_image {} (total {} MB):\n", TypeDescFromC<T>::value(),
           xres * yres * nchans * chansize * 3 / 4 / 1024 / 1024);
@@ -195,6 +207,8 @@ test_image_span_copy_image()
 
         // Benchmark old (ptr) versus new (span) copy_image functions
         Benchmarker bench;
+        bench.trials(ntrials);
+        bench.iterations(iterations);
         bench.units(Benchmarker::Unit::us);
 
         bench(Strutil::format("    copy_image image_span {}", label),
@@ -217,7 +231,7 @@ test_image_span_contiguize()
     // Benchmark old (ptr) versus new (span) contiguize functions
     using pvt::contiguize;
 
-    const int xres = 2048, yres = 1536, nchans = 4;
+    const int xres = big_xres, yres = big_yres, nchans = 4;
     const size_t chansize = sizeof(T);
     print("\nTesting contiguize {} (total {} MB):\n", TypeDescFromC<T>::value(),
           xres * yres * nchans * chansize * 3 / 4 / 1024 / 1024);
@@ -266,6 +280,8 @@ test_image_span_contiguize()
 
         // Benchmark old (ptr) versus new (span) contiguize functions
         Benchmarker bench;
+        bench.trials(ntrials);
+        bench.iterations(iterations);
         bench.units(Benchmarker::Unit::us);
 
         bench(Strutil::format("    contiguize image_span {}", label), [&]() {
@@ -288,7 +304,7 @@ void
 test_image_span_convert_image()
 {
     // Benchmark old (ptr) versus new (span) convert_image functions
-    const int xres = 2048, yres = 1536, nchans = 4;
+    const int xres = big_xres, yres = big_yres, nchans = 4;
     const size_t schansize = sizeof(Stype);
     const size_t dchansize = sizeof(Dtype);
     print("\nTesting convert_image {} -> {} (total {}M values):\n",
@@ -332,6 +348,8 @@ test_image_span_convert_image()
 
         // Benchmark old (ptr) versus new (span) contiguize functions
         Benchmarker bench;
+        bench.trials(ntrials);
+        bench.iterations(iterations);
         bench.units(Benchmarker::Unit::ms);
 
         bench(Strutil::format("    convert_image image_span {}", label),
@@ -413,11 +431,13 @@ void
 benchmark_image_span_passing()
 {
     print("\nbenchmark_image_span_passing\n");
-    const int xres = 2048, yres = 1536, nchans = 4;
+    const int xres = big_xres, yres = big_yres, nchans = 4;
     std::vector<float> sbuf(xres * yres * nchans, 1.0f);
     image_span<const float> ispan(sbuf.data(), nchans, xres, yres, 1);
 
     Benchmarker bench;
+    bench.trials(ntrials);
+    bench.iterations(iterations);
     bench.units(Benchmarker::Unit::us);
     float sum = 0.0f;
 
@@ -442,6 +462,8 @@ benchmark_image_span_passing()
 
     // Do it all again for a SMALL image
     bench.units(Benchmarker::Unit::ns);
+    bench.trials(ntrials);
+    bench.iterations(iterations);
     int small = 16;
     image_span<const float> smispan(sbuf.data(), nchans, small, small, 1);
     bench("  pass by value     (small)",
@@ -544,9 +566,42 @@ test_image_span_within_span()
 
 
 
-int
-main(int /*argc*/, char* /*argv*/[])
+static void
+getargs(int argc, char* argv[])
 {
+    // clang-format off
+    ArgParse ap;
+    ap.intro("image_span_test -- unit test and benchmarks for OpenImageIO/image_span.h\n" OIIO_INTRO_STRING)
+      .usage("image_span_test [options]");
+
+    ap.arg("--iterations %d", &iterations)
+      .help(Strutil::format("Number of iterations (default: {})", iterations));
+    ap.arg("--trials %d", &ntrials).help("Number of trials");
+
+    ap.parse_args(argc, (const char**)argv);
+    // clang-format on
+}
+
+
+
+int
+main(int argc, char* argv[])
+{
+#if !defined(NDEBUG) || defined(OIIO_CI) || defined(OIIO_CODE_COVERAGE)
+    // For the sake of test time, reduce the default number of benchmark
+    // trials for DEBUG, CI, and code coverage builds. Explicit use of
+    // --trials or --iterations will override this, since it comes before the
+    // getargs() call.
+    ntrials = 1;
+#endif
+#if !defined(NDEBUG)
+    // For debug+CI combination runs, reduce to truly one iteration.
+    if (Strutil::stoi(Sysutil::getenv("OpenImageIO_CI")) != 0)
+        iterations = 1;
+#endif
+
+    getargs(argc, argv);
+
     test_image_span<float>();
     test_image_span<const float>();
     test_image_span<uint16_t>();

@@ -117,6 +117,10 @@ objects. These algorithms include simple operations like copying, resizing,
 and compositing images, as well as more complex operations like color
 conversions, resizing, filtering, etc.
 
+Some performance-critical `ImageBufAlgo` implementations have SIMD-accelerated
+paths using Google Highway. For implementation details and guidance for adding
+new kernels, see `docs/dev/ImageBufAlgo_Highway.md`.
+
 ## Image caching: TextureSystem and ImageCache
 
 There are situations where ImageBuf is still not the right abstraction,
@@ -197,3 +201,7 @@ image- and file-oriented classes described above. The most important ones are:
   sequence point to the same character memory. In addition to saving memory,
   this makes string assignment and equality comparison as inexpensive as
   integer operations.
+
+
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+<!-- Copyright Contributors to the OpenImageIO Project. -->

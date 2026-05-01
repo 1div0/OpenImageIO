@@ -12,8 +12,26 @@
 #include <OpenImageIO/typedesc.h>
 #include <OpenImageIO/ustring.h>
 
+// Preprocessor symbol to allow conditional compilation depending on
+// whether the ColorProcessor class is exposed (it was not prior to OIIO 1.9).
+#define OIIO_HAS_COLORPROCESSOR 1
 
-OIIO_NAMESPACE_BEGIN
+//
+// Some general color management information materials to have handy:
+//   - CIF recommendations for scene referred color spaces for rendering and
+//     textures:
+//     https://github.com/AcademySoftwareFoundation/ColorInterop/blob/main/Recommendations/01_TextureAssetColorSpaces/TextureAssetColorSpaces.md
+//   - CIF recommendations for display referred color spaces:
+//     https://docs.google.com/document/d/1MmBG4a3Dr6S6EO781WjK-xZW7QdHpuo-zd7wtMvG1Rs
+//
+
+
+// Preprocessor symbol to allow conditional compilation depending on
+// whether the ColorConfig returns ColorProcessor shared pointers or raw.
+#define OIIO_COLORCONFIG_USES_SHARED_PTR 1
+
+
+OIIO_NAMESPACE_3_1_BEGIN
 
 /// The ColorProcessor encapsulates a baked color transformation, suitable for
 /// application to raw pixels, or ImageBuf(s). These are generated using
@@ -40,17 +58,9 @@ public:
     }
 };
 
-// Preprocessor symbol to allow conditional compilation depending on
-// whether the ColorProcessor class is exposed (it was not prior to OIIO 1.9).
-#define OIIO_HAS_COLORPROCESSOR 1
 
 
-
-typedef std::shared_ptr<ColorProcessor> ColorProcessorHandle;
-
-// Preprocessor symbol to allow conditional compilation depending on
-// whether the ColorConfig returns ColorProcessor shared pointers or raw.
-#define OIIO_COLORCONFIG_USES_SHARED_PTR 1
+using ColorProcessorHandle = std::shared_ptr<ColorProcessor>;
 
 
 
@@ -111,11 +121,12 @@ public:
     int getColorSpaceIndex(string_view name) const;
 
     /// Get the name of the color space representing the named role,
-    /// or NULL if none could be identified.
+    /// or nullptr if none could be identified.
     const char* getColorSpaceNameByRole(string_view role) const;
 
     /// Get the data type that OCIO thinks this color space is. The name
-    /// may be either a color space name or a role.
+    /// may be either a color space name or a role. For an unknown space or
+    /// any error, return TypeUnknown.
     OIIO::TypeDesc getColorSpaceDataType(string_view name, int* bits) const;
 
     /// Retrieve the full list of known color space names, as a vector
@@ -123,13 +134,14 @@ public:
     std::vector<std::string> getColorSpaceNames() const;
 
     /// Get the name of the color space family of the named color space,
-    /// or NULL if none could be identified.
+    /// or nullptr if none could be identified.
     const char* getColorSpaceFamilyByName(string_view name) const;
 
     // Get the number of Roles defined in this configuration
     int getNumRoles() const;
 
-    /// Query the name of the specified Role.
+    /// Query the name of the specified Role, or return nullptr if there is no
+    /// role with that index.
     const char* getRoleByIndex(int index) const;
 
     /// Retrieve the full list of known Roles, as a vector of strings.
@@ -138,7 +150,8 @@ public:
     /// Get the number of Looks defined in this configuration
     int getNumLooks() const;
 
-    /// Query the name of the specified Look.
+    /// Query the name of the specified Look, or return nullptr if there is no
+    /// look with that index.
     const char* getLookNameByIndex(int index) const;
 
     /// Retrieve the full list of known look names, as a vector of strings.
@@ -147,7 +160,8 @@ public:
     /// Get the number of NamedTransforms defined in this configuration
     int getNumNamedTransforms() const;
 
-    /// Query the name of the specified NamedTransform.
+    /// Query the name of the specified NamedTransform, or nullptr if there is
+    /// no NamedTransform with that index.
     const char* getNamedTransformNameByIndex(int index) const;
 
     /// Retrieve the full list of known NamedTransforms, as a vector of strings
@@ -211,7 +225,8 @@ public:
     /// Get the number of displays defined in this configuration
     int getNumDisplays() const;
 
-    /// Query the name of the specified display.
+    /// Query the name of the specified display, or nullptr if there is no
+    /// display with that index.
     const char* getDisplayNameByIndex(int index) const;
 
     /// Retrieve the full list of known display names, as a vector of
@@ -226,7 +241,9 @@ public:
     /// display will be used.
     int getNumViews(string_view display = "") const;
 
-    /// Query the name of the specified view for the specified display
+    /// Query the name of the specified view for the specified display, or
+    /// nullptr if there is no view with that index or if the display is not
+    /// found.
     const char* getViewNameByIndex(string_view display, int index) const;
 
     /// Retrieve the full list of known view names for the display, as a
@@ -237,12 +254,14 @@ public:
     /// Query the name of the default view for the specified display. If the
     /// display is empty or not specified, the default display will be used.
     /// This version does not consider the input color space.
+    /// Returns nullptr for failure.
     const char* getDefaultViewName(string_view display = "") const;
 
     /// Query the name of the default view for the specified display, given
     /// the input color space. If `display` is "default" or an empty string,
     /// the default display will be used. The input color space is used to
     /// determine the most appropriate default view for the given display.
+    /// Returns nullptr for failure.
     const char* getDefaultViewName(string_view display,
                                    string_view inputColorSpace) const;
 
@@ -392,6 +411,24 @@ public:
     bool equivalent(string_view color_space,
                     string_view other_color_space) const;
 
+    /// Find CICP code corresponding to the colorspace.
+    /// Return a cspan of 4 ints, or an empty span if not found.
+    ///
+    /// @version 3.1
+    cspan<int> get_cicp(string_view colorspace) const;
+
+    /// Find color interop ID for the given colorspace.
+    /// Returns empty string if not found.
+    ///
+    /// @version 3.1
+    string_view get_color_interop_id(string_view colorspace) const;
+
+    /// Find color interop ID corresponding to the CICP code.
+    /// Returns empty string if not found.
+    ///
+    /// @version 3.1
+    string_view get_color_interop_id(const int cicp[4]) const;
+
     /// Return a filename or other identifier for the config we're using.
     std::string configname() const;
 
@@ -435,7 +472,18 @@ private:
     Impl* getImpl() const { return m_impl.get(); }
 };
 
+OIIO_NAMESPACE_3_1_END
 
+
+// Compatibility
+#ifndef OIIO_DOXYGEN
+OIIO_NAMESPACE_BEGIN
+using v3_1::ColorProcessorHandle;
+OIIO_NAMESPACE_END
+#endif
+
+
+OIIO_NAMESPACE_BEGIN
 
 /// Utility -- convert sRGB value to linear transfer function, without
 /// any change in color primaries.

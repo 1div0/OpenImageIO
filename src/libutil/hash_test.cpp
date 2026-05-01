@@ -11,6 +11,7 @@
 
 #include <OpenImageIO/argparse.h>
 #include <OpenImageIO/benchmark.h>
+#include <OpenImageIO/fmath.h>
 #include <OpenImageIO/hash.h>
 #include <OpenImageIO/strutil.h>
 #include <OpenImageIO/timer.h>
@@ -205,12 +206,17 @@ main(int argc, char* argv[])
     iterations /= 10;
     ntrials = 1;
 #endif
+#if !defined(NDEBUG)
+    // For debug+CI combination runs, reduce to truly one iteration.
+    if (Strutil::stoi(Sysutil::getenv("OpenImageIO_CI")) != 0)
+        iterations = 1;
+#endif
 
     getargs(argc, argv);
 
     // fill data with random values so we can hash it a bunch of different ways
     std::mt19937 rng(42);
-    data.resize(iterations / sizeof(data[0]), 0);
+    data.resize(round_to_multiple(iterations, 4) / sizeof(data[0]), 0);
     for (uint32_t& d : data)
         d = rng();
 

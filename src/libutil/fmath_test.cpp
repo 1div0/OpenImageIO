@@ -550,7 +550,7 @@ test_half_convert_accuracy()
             && Imath::finitef(H[i])) {
             ++nwrong;
             Strutil::print("wrong {} 0b{}  h={}, f={} {}\n", i, bin16(i), H[i],
-                           F[i], isnan(f) ? "(nan)" : "");
+                           F[i], std::isnan(f) ? "(nan)" : "");
         }
     }
 
@@ -724,6 +724,11 @@ main(int argc, char* argv[])
     // will override this, since it comes before the getargs() call.
     iterations /= 10;
     ntrials = 1;
+#endif
+#if !defined(NDEBUG)
+    // For debug+CI combination runs, reduce to truly one iteration.
+    if (Strutil::stoi(Sysutil::getenv("OpenImageIO_CI")) != 0)
+        iterations = 1;
 #endif
 
 #if OIIO_SIMD_SSE && !OIIO_F16C_ENABLED

@@ -22,8 +22,9 @@
 #include "imageio_pvt.h"
 
 
-OIIO_NAMESPACE_BEGIN
+OIIO_NAMESPACE_3_1_BEGIN
 using namespace pvt;
+using namespace OIIO::pvt;
 
 
 // store an error message per thread, for a specific ImageInput
@@ -35,7 +36,7 @@ class ImageInput::Impl {
 public:
     Impl()
         : m_id(++input_next_id)
-        , m_threads(pvt::oiio_threads)
+        , m_threads(OIIO::pvt::oiio_threads)
     {
     }
 
@@ -210,6 +211,40 @@ ImageInput::spec_dimensions(int subimage, int miplevel)
 
 
 
+// Utility: Make sure the provided data span is the right size for the
+// image described by spec and datatype. If they don't match, issue an
+// error and return false.
+static bool
+check_span_size(ImageInput* in, string_view caller, const ImageSpec& spec,
+                TypeDesc datatype, imagesize_t npixels, int chbegin, int chend,
+                const image_span<std::byte>& data)
+{
+    // One of two things must be correct: Either format is Unknown and the
+    // total byte size needs to match the "native" size, or the format is
+    // concrete and the number of value must match (it's ok if the size
+    // doesn't match, since a data type conversion will occur).
+    if (datatype.is_unknown()) {  // Unknown assumes native chan types
+        size_t sz = npixels * spec.pixel_bytes(chbegin, chend, true);
+        if (sz != data.size_bytes()) {
+            in->errorfmt(
+                "{}: image_span size is incorrect ({} bytes vs {} needed)",
+                caller, data.size_bytes(), sz);
+            return false;
+        }
+    } else {  // single concrete type
+        size_t nvals = npixels * size_t(chend - chbegin);
+        if (nvals != data.nvalues()) {
+            in->errorfmt(
+                "{}: image_span size is incorrect ({} values vs {} needed)",
+                caller, data.nvalues(), nvals);
+            return false;
+        }
+    }
+    return true;
+}
+
+
+
 bool
 ImageInput::read_scanline(int y, int z, TypeDesc format, void* data,
                           stride_t xstride)
@@ -299,16 +334,10 @@ ImageInput::read_scanlines(int subimage, int miplevel, int ybegin, int yend,
                  chend);
         return false;
     }
-    size_t isize = (format == TypeUnknown
-                        ? spec.pixel_bytes(chbegin, chend, true /*native*/)
-                        : format.size() * (chend - chbegin))
-                   * size_t(spec.width);
-    if (isize != data.size_bytes()) {
-        errorfmt(
-            "read_scanlines: Buffer size is incorrect ({} bytes vs {} needed)",
-            isize, data.size_bytes());
+    if (!check_span_size(this, "read_scanlines", m_spec, format,
+                         m_spec.width * size_t(yend - ybegin), chbegin, chend,
+                         data))
         return false;
-    }
 
     // Default implementation (for now): call the old pointer+stride
     return read_scanlines(subimage, miplevel, ybegin, yend, 0, chbegin, chend,
@@ -322,7 +351,7 @@ ImageInput::read_scanlines(int subimage, int miplevel, int ybegin, int yend,
                            int z, int chbegin, int chend, TypeDesc format,
                            void* data, stride_t xstride, stride_t ystride)
 {
-    pvt::LoggedTimer logtime("II::read_scanlines");
+    OIIO::pvt::LoggedTimer logtime("II::read_scanlines");
     ImageSpec spec;
     int rps = 0;
     {
@@ -520,7 +549,7 @@ bool
 ImageInput::read_native_scanlines(int subimage, int miplevel, int ybegin,
                                   int yend, span<std::byte> data)
 {
-    if (pvt::oiio_print_debug
+    if (OIIO::pvt::oiio_print_debug
 #ifndef NDEBUG
         || true
 #endif
@@ -544,7 +573,7 @@ ImageInput::read_native_scanlines(int subimage, int miplevel, int ybegin,
                                   int yend, int chbegin, int chend,
                                   span<std::byte> data)
 {
-    if (pvt::oiio_print_debug
+    if (OIIO::pvt::oiio_print_debug
 #ifndef NDEBUG
         || true
 #endif
@@ -655,16 +684,11 @@ ImageInput::read_tiles(int subimage, int miplevel, int xbegin, int xend,
         errorfmt("read_tiles: invalid channel range [{},{})", chbegin, chend);
         return false;
     }
-    size_t isize = (format == TypeUnknown
-                        ? spec.pixel_bytes(chbegin, chend, true /*native*/)
-                        : format.size() * (chend - chbegin))
-                   * size_t(xend - xbegin) * size_t(yend - ybegin)
-                   * size_t(zend - zbegin);
-    if (isize != data.size_bytes()) {
-        errorfmt("read_tiles: Buffer size is incorrect ({} bytes vs {} needed)",
-                 isize, data.size_bytes());
+    if (!check_span_size(this, "read_tiles", m_spec, format,
+                         size_t(xend - xbegin) * size_t(yend - ybegin)
+                             * size_t(zend - zbegin),
+                         chbegin, chend, data))
         return false;
-    }
 
     // Default implementation (for now): call the old pointer+stride
     return read_tiles(subimage, miplevel, ybegin, yend, xbegin, xend, zbegin,
@@ -967,7 +991,7 @@ bool
 ImageInput::read_native_tiles(int subimage, int miplevel, int xbegin, int xend,
                               int ybegin, int yend, span<std::byte> data)
 {
-    if (pvt::oiio_print_debug
+    if (OIIO::pvt::oiio_print_debug
 #ifndef NDEBUG
         || true
 #endif
@@ -991,7 +1015,7 @@ ImageInput::read_native_tiles(int subimage, int miplevel, int xbegin, int xend,
                               int ybegin, int yend, int chbegin, int chend,
                               span<std::byte> data)
 {
-    if (pvt::oiio_print_debug
+    if (OIIO::pvt::oiio_print_debug
 #ifndef NDEBUG
         || true
 #endif
@@ -1017,7 +1041,7 @@ ImageInput::read_native_volumetric_tiles(int subimage, int miplevel, int xbegin,
                                          int zbegin, int zend,
                                          span<std::byte> data)
 {
-    if (pvt::oiio_print_debug
+    if (OIIO::pvt::oiio_print_debug
 #ifndef NDEBUG
         || true
 #endif
@@ -1043,7 +1067,7 @@ ImageInput::read_native_volumetric_tiles(int subimage, int miplevel, int xbegin,
                                          int zbegin, int zend, int chbegin,
                                          int chend, span<std::byte> data)
 {
-    if (pvt::oiio_print_debug
+    if (OIIO::pvt::oiio_print_debug
 #ifndef NDEBUG
         || true
 #endif
@@ -1070,7 +1094,7 @@ ImageInput::read_image(int subimage, int miplevel, int chbegin, int chend,
                        ProgressCallback progress_callback,
                        void* progress_callback_data)
 {
-    pvt::LoggedTimer logtime("II::read_image");
+    OIIO::pvt::LoggedTimer logtime("II::read_image");
     ImageSpec spec;
     int rps = 0;
     {
@@ -1163,25 +1187,7 @@ bool
 ImageInput::read_image(int subimage, int miplevel, int chbegin, int chend,
                        TypeDesc format, const image_span<std::byte>& data)
 {
-#if 0
-    ImageSpec spec = spec_dimensions(subimage, miplevel);
-    if (chend < 0 || chend > spec.nchannels)
-        chend = spec.nchannels;
-    size_t isize = (format == TypeUnknown
-                        ? spec.pixel_bytes(chbegin, chend, true /*native*/)
-                        : format.size() * (chend - chbegin))
-                   * spec.image_pixels();
-    if (isize != data.size_bytes()) {
-        errorfmt("read_image: Buffer size is incorrect ({} bytes vs {} needed)",
-                 sz, data.size_bytes());
-        return false;
-    }
-
-    // Default implementation (for now): call the old pointer+stride
-    return read_image(subimage, miplevel, chbegin, chend, format, data.data(),
-                      data.xstride(), data.ystride(), data.zstride());
-#else
-    pvt::LoggedTimer logtime("II::read_image");
+    OIIO::pvt::LoggedTimer logtime("II::read_image");
     ImageSpec spec;
     int rps = 0;
     {
@@ -1209,16 +1215,9 @@ ImageInput::read_image(int subimage, int miplevel, int chbegin, int chend,
         errorfmt("read_image: invalid channel range [{},{})", chbegin, chend);
         return false;
     }
-    int nchans         = chend - chbegin;
-    bool native        = (format == TypeUnknown);
-    size_t pixel_bytes = native ? spec.pixel_bytes(chbegin, chend, native)
-                                : (format.size() * nchans);
-    size_t isize       = pixel_bytes * spec.image_pixels();
-    if (isize != data.size_bytes()) {
-        errorfmt("read_image: Buffer size is incorrect ({} bytes vs {} needed)",
-                 isize, data.size_bytes());
+    if (!check_span_size(this, "read_image", m_spec, format,
+                         spec.image_pixels(), chbegin, chend, data))
         return false;
-    }
 
     bool ok = true;
     if (spec.tile_width) {  // Tiled image -- rely on read_tiles
@@ -1258,7 +1257,6 @@ ImageInput::read_image(int subimage, int miplevel, int chbegin, int chend,
         }
     }
     return ok;
-#endif
 }
 
 
@@ -1541,31 +1539,30 @@ bool
 ImageInput::check_open(const ImageSpec& spec, ROI range, uint64_t /*flags*/)
 {
     // Check for sensible resolutions, etc.
-    if ((m_spec.width <= 0 || m_spec.height <= 0 || m_spec.depth <= 0
-         || m_spec.nchannels <= 0)
-        && !supports("noimage")) {
+    if (spec.width == 0 && spec.height == 0 && spec.nchannels == 0
+        && supports("noimage")) {
+        // ok!
+    } else if (spec.width <= 0 || spec.height <= 0 || spec.depth <= 0
+               || spec.nchannels <= 0) {
         errorfmt(
-            "{} image resolution must be at least 1x1, but the file specified {}x{}. Possible corrupt input?",
-            format_name(), m_spec.width, m_spec.height);
+            "{} image resolution must be at least 1x1, but the file specified {}x{}x{}, {} chans. Possible corrupt input?",
+            format_name(), spec.width, spec.height, spec.depth, spec.nchannels);
         return false;
     }
-    if (m_spec.depth > 1) {
-        if (m_spec.width > range.width() || m_spec.height > range.height()
-            || m_spec.depth > range.depth()) {
+    if (spec.width > range.width() || spec.height > range.height()
+        || spec.depth > range.depth()) {
+        if (spec.depth > 1) {
             errorfmt(
                 "{} image resolution may not exceed {}x{}x{}, but the file appears to be {}x{}x{}. Possible corrupt input?",
                 format_name(), range.width(), range.height(), range.depth(),
-                m_spec.width, m_spec.height, m_spec.depth);
-            return false;
-        }
-    } else {
-        if (m_spec.width > range.width() || m_spec.height > range.height()) {
+                spec.width, spec.height, spec.depth);
+        } else if (spec.width > range.width() || spec.height > range.height()) {
             errorfmt(
                 "{} image resolution may not exceed {}x{}, but the file appears to be {}x{}. Possible corrupt input?",
-                format_name(), range.width(), range.height(), m_spec.width,
-                m_spec.height);
-            return false;
+                format_name(), range.width(), range.height(), spec.width,
+                spec.height);
         }
+        return false;
     }
     if (spec.nchannels > range.nchannels()) {
         errorfmt(
@@ -1573,25 +1570,51 @@ ImageInput::check_open(const ImageSpec& spec, ROI range, uint64_t /*flags*/)
             format_name(), spec.nchannels);
         return false;
     }
-    if (pvt::limit_channels && spec.nchannels > pvt::limit_channels) {
+    if (OIIO::pvt::limit_channels
+        && spec.nchannels > OIIO::pvt::limit_channels) {
         errorfmt(
             "{} channels exceeds \"limits:channels\" = {}. Possible corrupt input?\nIf you're sure this is a valid file, raise the OIIO global attribute \"limits:channels\".",
-            spec.nchannels, pvt::limit_channels);
+            spec.nchannels, OIIO::pvt::limit_channels);
         return false;
     }
-    if (pvt::limit_imagesize_MB
+    if (OIIO::pvt::limit_imagesize_MB
         && spec.image_bytes(true)
-               > pvt::limit_imagesize_MB * imagesize_t(1024 * 1024)) {
+               > OIIO::pvt::limit_imagesize_MB * imagesize_t(1024 * 1024)) {
         errorfmt(
             "Uncompressed image size {:.1f} MB exceeds the {} MB limit.\n"
             "Image claimed to be {}x{}, {}-channel {}. Possible corrupt input?\n"
             "If this is a valid file, raise the OIIO attribute \"limits:imagesize_MB\".",
-            float(m_spec.image_bytes(true)) / float(1024 * 1024),
-            pvt::limit_imagesize_MB, m_spec.width, m_spec.height,
-            m_spec.nchannels, m_spec.format);
+            float(spec.image_bytes(true)) / float(1024 * 1024),
+            OIIO::pvt::limit_imagesize_MB, spec.width, spec.height,
+            spec.nchannels, spec.format);
         return false;
     }
 
+    // Check for invalid full_* values for sensibility
+    if (spec.full_width == 0 && spec.full_height == 0 && spec.full_depth == 0
+        && supports("noimage")) {
+        // ok!
+    } else if (spec.full_width <= 0 || spec.full_height <= 0
+               || spec.full_depth <= 0) {
+        errorfmt(
+            "{} image full/display resolution must be at least 1x1, but the file specified {}x{}x{}. Possible corrupt input?",
+            format_name(), spec.full_width, spec.full_height, spec.full_depth);
+        return false;
+    }
+    if (spec.full_width > range.width() || spec.full_height > range.height()
+        || spec.full_depth > range.depth()) {
+        if (spec.full_depth > 1)
+            errorfmt(
+                "{} image full/display resolution may not exceed {}x{}x{}, but the file appears to be {}x{}x{}. Possible corrupt input?",
+                format_name(), range.width(), range.height(), range.depth(),
+                spec.full_width, spec.full_height, spec.full_depth);
+        else
+            errorfmt(
+                "{} image full/display resolution may not exceed {}x{}, but the file appears to be {}x{}. Possible corrupt input?",
+                format_name(), range.width(), range.height(), spec.full_width,
+                spec.full_height);
+        return false;
+    }
     return true;  // all is ok
 }
 
@@ -1618,20 +1641,11 @@ ImageInput::valid_raw_span_size(cspan<std::byte> buf, const ImageSpec& spec,
 
 
 
-template<>
-inline size_t
-pvt::heapsize<ImageInput::Impl>(const ImageInput::Impl& impl)
-{
-    return impl.m_io_local ? sizeof(Filesystem::IOProxy) : 0;
-}
-
-
-
 size_t
 ImageInput::heapsize() const
 {
-    size_t size = pvt::heapsize(m_impl);
-    size += pvt::heapsize(m_spec);
+    size_t size = OIIO::pvt::heapsize(m_impl);
+    size += OIIO::pvt::heapsize(m_spec);
     return size;
 }
 
@@ -1641,6 +1655,15 @@ size_t
 ImageInput::footprint() const
 {
     return sizeof(ImageInput) + heapsize();
+}
+
+
+
+template<>
+inline size_t
+pvt::heapsize<ImageInput::Impl>(const ImageInput::Impl& impl)
+{
+    return impl.m_io_local ? sizeof(Filesystem::IOProxy) : 0;
 }
 
 
@@ -1661,6 +1684,4 @@ pvt::footprint<ImageInput>(const ImageInput& input)
     return input.footprint();
 }
 
-
-
-OIIO_NAMESPACE_END
+OIIO_NAMESPACE_3_1_END
