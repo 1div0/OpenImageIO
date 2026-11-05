@@ -3,14 +3,32 @@
 # https://github.com/AcademySoftwareFoundation/OpenImageIO
 
 
-set_cache (OpenEXR_BUILD_VERSION 3.3.5 "OpenEXR version for local builds")
-set (OpenEXR_GIT_REPOSITORY "https://github.com/AcademySoftwareFoundation/OpenEXR")
-set (OpenEXR_GIT_TAG "v${OpenEXR_BUILD_VERSION}")
-set (OpenEXR_GIT_COMMIT "6661cb40c6fa8d332f142e660e25ac96675c15bd")
+set_cache (OpenEXR_BUILD_VERSION 3.5.2 "OpenEXR version for local builds")
+set_cache (OpenEXR_GIT_REPOSITORY "https://github.com/AcademySoftwareFoundation/OpenEXR"
+           "Repo to use" ADVANCED)
+set_cache (OpenEXR_GIT_TAG "v${OpenEXR_BUILD_VERSION}"
+           "Specific git tag to build" ADVANCED)
+set_cache (OpenEXR_GIT_COMMIT "69b2604fc76e370615438bdc8d2cd95b9349c12e"
+           "Expected git commit hash corresponding to the tag" ADVANCED)
 set_cache (OpenEXR_BUILD_SHARED_LIBS ${LOCAL_BUILD_SHARED_LIBS_DEFAULT}
-           DOC "Should a local OpenEXR build, if necessary, build shared libraries" ADVANCED)
+           "Should a local OpenEXR build, if necessary, build shared libraries" ADVANCED)
 
 string (MAKE_C_IDENTIFIER ${OpenEXR_BUILD_VERSION} OpenEXR_VERSION_IDENT)
+
+# OpenEXR 3.5+ needs zstd. Hand it our zstd's CMake config. Otherwise it falls
+# back to pkg-config, and its exported targets then reference a
+# PkgConfig::libzstd target that its own config never defines.
+if (OpenEXR_BUILD_VERSION VERSION_GREATER_EQUAL 3.5)
+    checked_find_package (zstd REQUIRED CONFIG
+                          VERSION_MIN 1.5)
+    list (APPEND MORE_OpenEXR_CMAKE_ARGS -D zstd_DIR=${zstd_DIR})
+endif ()
+
+# Make OpenEXR use exactly the Imath we found (or built) ourselves. Otherwise
+# its own search could settle on a different Imath, or fetch yet another one.
+if (Imath_DIR)
+    list (APPEND MORE_OpenEXR_CMAKE_ARGS -D Imath_DIR=${Imath_DIR})
+endif ()
 
 build_dependency_with_cmake(OpenEXR
     VERSION         ${OpenEXR_BUILD_VERSION}
@@ -40,6 +58,7 @@ build_dependency_with_cmake(OpenEXR
         -D ILMTHREAD_INTERNAL_NAMESPACE=${PROJ_NAMESPACE_V}_IlmThread_${OpenEXR_VERSION_IDENT}
         -D Iex_INTERNAL_NAMESPACE=${PROJ_NAMESPACE_V}_Iex_${OpenEXR_VERSION_IDENT}
         -D OPENEXR_LIB_SUFFIX=_v${OpenEXR_VERSION_IDENT}_${PROJ_NAMESPACE_V}
+        ${MORE_OpenEXR_CMAKE_ARGS}
     )
 
 
@@ -53,3 +72,5 @@ if (OpenEXR_BUILD_SHARED_LIBS)
     install_local_dependency_libs (OpenEXR IlmThread)
     install_local_dependency_libs (OpenEXR Iex)
 endif ()
+
+unset (MORE_OpenEXR_CMAKE_ARGS)

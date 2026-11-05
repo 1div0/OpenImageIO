@@ -24,4 +24,18 @@ for f in files:
                            printinfo=False, output_filename=outfile)
     outputs += [ outfile ]
 
+command += run_app (pythonbin + " src/make-indexed-transparency-psds.py",
+                    silent=True)
+command += info_command ("indexed-transparency-0.psd", verbose=False,
+                         safematch=True)
+command += info_command ("indexed-transparency-255.psd", verbose=False,
+                         safematch=True)
+command += run_app ("(" + oiio_app("iconvert")
+                    + " indexed-transparency-256.psd "
+                    + "out.null > /dev/null 2>&1 "
+                    + "|| echo indexed-transparency-256-rejected)")
+
+# Regression test: bad colormode
+command += oiiotool ("--nostderr --info --iconfig oiio:RawColor 1 src/bad_colormode.psd", failureok=True)
+
 outputs += [ "out.txt" ]

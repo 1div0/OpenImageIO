@@ -86,7 +86,7 @@ typedef bool (*ProgressCallback)(void *opaque_data, float portion_done);
 
 
 /// ROI is a small helper struct describing a rectangular region of interest
-/// in an image. The region is [xbegin,xend) x [begin,yend) x [zbegin,zend),
+/// in an image. The region is [xbegin,xend) x [ybegin,yend) x [zbegin,zend),
 /// with the "end" designators signifying one past the last pixel in each
 /// dimension, a la STL style.
 ///
@@ -333,7 +333,7 @@ public:
     /// All other fields are set to the obvious defaults -- the image is an
     /// ordinary 2D image (not a volume), the image is not offset or a crop
     /// of a bigger image, the image is scanline-oriented (not tiled),
-    /// channel names are "R", "G", "B"' and "A" (up to and including 4
+    /// channel names are "R", "G", "B", and "A" (up to and including 4
     /// channels, beyond that they are named "channel *n*"), the fourth
     /// channel (if it exists) is assumed to be alpha.
     ImageSpec (int xres, int yres, int nchans, TypeDesc fmt = TypeUInt8) noexcept;
@@ -366,7 +366,10 @@ public:
     /// Sets the `channelnames` to reasonable defaults for the number of
     /// channels.  Specifically, channel names are set to "R", "G", "B,"
     /// and "A" (up to and including 4 channels, beyond that they are named
-    /// "channel*n*".
+    /// "channel*n*"). If `nchannels` is less than 1, `channelnames` is left
+    /// empty. If it exceeds the `limits:channels` attribute, only that many
+    /// channels are named, and the rest have no entry in `channelnames`
+    /// (`channel_name()` returns an empty string for them).
     void default_channel_names () noexcept;
 
     /// Returns the number of bytes comprising each channel of each pixel
@@ -456,7 +459,7 @@ public:
     /// whole image.  If this returns false, the image is much too big
     /// to allocate and read all at once, so client apps beware and check
     /// these routines for overflows!
-    bool size_t_safe() const noexcept {
+    OIIO_NODISCARD bool size_t_safe() const noexcept {
         const imagesize_t big = std::numeric_limits<size_t>::max();
         return image_bytes() < big && scanline_bytes() < big &&
             tile_bytes() < big;
@@ -773,30 +776,42 @@ public:
                                 int defaultqual = -1) const;
 
     /// Helper function to verify that the given pixel range exactly covers a
-    /// set of 2D tiles.  Also returns false if the spec indicates that the
-    /// image isn't tiled at all.
-    bool valid_tile_range (int xbegin, int xend, int ybegin, int yend) noexcept {
-        return (tile_width &&
-                ((xbegin-x) % tile_width)  == 0 &&
-                ((ybegin-y) % tile_height) == 0 &&
-                (((xend-x) % tile_width)  == 0 || (xend-x) == width) &&
-                (((yend-y) % tile_height) == 0 || (yend-y) == height));
+    /// set of 2D tiles: it must start on a tile boundary within the data
+    /// window, and end on a tile boundary or the edge of the data window.
+    /// Also returns false if the spec indicates that the image isn't tiled
+    /// at all.
+    OIIO_NODISCARD bool valid_tile_range (int xbegin, int xend, int ybegin, int yend) noexcept {
+        return (tile_width > 0 && tile_height > 0 &&
+                valid_tile_axis(xbegin, xend, x, width, tile_width) &&
+                valid_tile_axis(ybegin, yend, y, height, tile_height));
     }
 
     /// Helper function to verify that the given pixel range exactly covers a
-    /// set of 3D tiles.  Also returns false if the spec indicates that the
-    /// image isn't tiled at all.
-    bool valid_tile_range (int xbegin, int xend, int ybegin, int yend,
+    /// set of 3D tiles: it must start on a tile boundary within the data
+    /// window, and end on a tile boundary or the edge of the data window.
+    /// Also returns false if the spec indicates that the image isn't tiled
+    /// at all.
+    OIIO_NODISCARD bool valid_tile_range (int xbegin, int xend, int ybegin, int yend,
                            int zbegin, int zend) noexcept {
-        return (tile_width &&
-                ((xbegin-x) % tile_width)  == 0 &&
-                ((ybegin-y) % tile_height) == 0 &&
-                ((zbegin-z) % tile_depth)  == 0 &&
-                (((xend-x) % tile_width)  == 0 || (xend-x) == width) &&
-                (((yend-y) % tile_height) == 0 || (yend-y) == height) &&
-                (((zend-z) % tile_depth)  == 0 || (zend-z) == depth));
+        return (tile_width > 0 && tile_height > 0 && tile_depth > 0 &&
+                valid_tile_axis(xbegin, xend, x, width, tile_width) &&
+                valid_tile_axis(ybegin, yend, y, height, tile_height) &&
+                valid_tile_axis(zbegin, zend, z, depth, tile_depth));
     }
 
+private:
+    // One axis of valid_tile_range(). The end may reach past the data
+    // window only as far as the edge of the last (partial) tile. Done in
+    // 64 bits so that hostile coordinates can't overflow.
+    static constexpr bool valid_tile_axis (int begin, int end, int origin,
+                                           int size, int tilesize) noexcept {
+        int64_t b = int64_t(begin) - origin, e = int64_t(end) - origin;
+        return b >= 0 && b <= e && b % tilesize == 0 &&
+               (e % tilesize == 0 || e == size) &&
+               e <= (int64_t(size) + tilesize - 1) / tilesize * tilesize;
+    }
+
+public:
     /// Return the channelformat of the given channel. This is safe even
     /// if channelformats is not filled out.
     TypeDesc channelformat (int chan) const {
@@ -893,7 +908,8 @@ public:
     /// nothing about the color space if `name` is empty). The core operation
     /// is to set the "oiio:ColorSpace" attribute, but it also removes or
     /// alters several other attributes that may hint color space in ways that
-    /// might be contradictory or no longer true.
+    /// might be contradictory or no longer true. The default color config is
+    /// only loaded if it is needed.
     ///
     /// @version 2.5
     void set_colorspace(string_view name);
@@ -1094,6 +1110,10 @@ public:
     /// - `"cicp"` :
     ///       Does this format support embedding CICP metadata?
     ///
+    /// - `"mdcv"` :
+    ///       Does this format support embedding mastering display color
+    ///       volume metadata (the `mdcv_*` attributes)?
+    ///
     /// - `"ioproxy"` :
     ///       Does this format reader support reading from an `IOProxy`?
     ///
@@ -1180,6 +1200,11 @@ public:
     ///
     /// @returns
     ///         `true` if the file was found and opened successfully.
+    ///
+    /// If `open()` returns `false`, the ImageInput will be left in the same
+    /// state as a newly constructed, unopened ImageInput (as if `close()` had
+    /// been called). Callers may assume this and are not responsible for
+    /// calling `close()` after a failed `open()`.
     OIIO_NODISCARD_ERROR virtual bool open (const std::string& name,
                                             ImageSpec &newspec) = 0;
 
@@ -1208,6 +1233,9 @@ public:
     ///
     /// @returns
     ///         `true` if the file was found and opened successfully.
+    ///
+    /// Same close-on-failure contract as `open(name,newspec)`: a `false`
+    /// return must leave the ImageInput as if `close()` had been called.
     OIIO_NODISCARD_ERROR virtual bool open (const std::string& name,
                                             ImageSpec &newspec,
                                             const ImageSpec& config OIIO_MAYBE_UNUSED) {
@@ -2295,8 +2323,12 @@ protected:
     ///   implied by `range`.
     /// * Whether the channel count is within the `"limits:channels"` OIIO
     ///   attribute.
-    /// * The total uncompressed pixel data size is expected to be within the
-    ///   `"limits:imagesize_MB"` OIIO attribute.
+    /// * Whether any single dimension (width, height, depth) of the pixel
+    ///   data window, display window, or tile is within the
+    ///   `"limits:resolution"` OIIO attribute.
+    /// * The total uncompressed pixel data size, and the size of a single
+    ///   tile, are expected to be within the `"limits:imagesize_MB"` OIIO
+    ///   attribute.
     /// * The full_{width,height,depth} are valid and within the range.
     ///
     bool check_open (const ImageSpec &spec,
@@ -2308,6 +2340,56 @@ protected:
         Defaults = 0,
         // Reserved for future use
     };
+
+    /// Helper: guard against "decompression bomb" headers -- files that are
+    /// tiny on disk but declare an implausibly large uncompressed pixel data
+    /// size, whether due to corruption or malicious crafting. This is a
+    /// narrower, format-specific companion to check_open()'s absolute
+    /// `"limits:imagesize_MB"` check: a bogus resolution can easily land
+    /// under that absolute limit while still being wildly disproportionate to
+    /// the bytes actually available to produce it, and attempting to allocate
+    /// for or decode such a claim can hang or exhaust memory before any other
+    /// check has a chance to fire. Real compressed image data for any current
+    /// format does not approach these ratios, so genuine files are
+    /// unaffected.
+    ///
+    /// @param declared_bytes
+    ///     The uncompressed pixel data size implied by the file's header
+    ///     (for example, `spec.image_bytes(true)`).
+    ///
+    /// @param filesize
+    ///     The size in bytes of the input file or stream. If this is not
+    ///     known (i.e. is 0), no check is performed (this method returns
+    ///     `true`).
+    ///
+    /// @param max_ratio
+    ///     The largest declared:file size ratio considered plausible for
+    ///     this format. Callers should pick the smallest value that doesn't
+    ///     produce false positives for genuine files; 10000 is a reasonable
+    ///     default shared by most formats.
+    ///
+    /// @param min_declared_bytes
+    ///     Claims below this absolute size (default 1 GB) are never rejected,
+    ///     regardless of ratio -- small files are cheap to decode even if
+    ///     the ratio looks unusual, so there's no need to risk a false
+    ///     positive.
+    ///
+    /// @returns
+    ///     Return `true` if the claimed size is plausible (or can't be
+    ///     checked), otherwise return `false` and make an appropriate call
+    ///     to `this->errorfmt()` to record the error.
+    ///
+    bool check_compression_ratio(imagesize_t declared_bytes,
+                                 imagesize_t filesize,
+                                 imagesize_t max_ratio = 10000,
+                                 imagesize_t min_declared_bytes = (1ULL << 30));
+
+    /// Convenience overload of check_compression_ratio() that computes the
+    /// declared uncompressed size from an ImageSpec (via
+    /// `spec.image_bytes(true)`).
+    bool check_compression_ratio(const ImageSpec& spec, imagesize_t filesize,
+                                 imagesize_t max_ratio = 10000,
+                                 imagesize_t min_declared_bytes = (1ULL << 30));
 
     /// Helper method: Validate that a `[chbegin, chend)` X `[xbegin, xend)` X
     /// `[ybegin, yend)` X `[zbegin, zend)` slab of native channel data types
@@ -2544,6 +2626,10 @@ public:
     ///  - `"cicp"` :
     ///        Does this format support embedding CICP metadata?
     ///
+    ///  - `"mdcv"` :
+    ///        Does this format support embedding mastering display color
+    ///        volume metadata (the `mdcv_*` attributes)?
+    ///
     /// This list of queries may be extended in future releases. Since this
     /// can be done simply by recognizing new query strings, and does not
     /// require any new API entry points, addition of support for new
@@ -2572,11 +2658,11 @@ public:
     ///                     append another subimage (`AppendSubimage`), or
     ///                     append another MIP level (`AppendMIPLevel`).
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool open (const std::string &filename, const ImageSpec &newspec,
+    OIIO_NODISCARD_ERROR virtual bool open (const std::string &filename, const ImageSpec &newspec,
                        OpenMode mode=Create) = 0;
 
     /// Open an ImageOutput using a UTF-16 encoded wstring filename.
-    bool open (const std::wstring &filename, const ImageSpec &newspec,
+    OIIO_NODISCARD_ERROR bool open (const std::wstring &filename, const ImageSpec &newspec,
                OpenMode mode=Create) {
         return open(Strutil::utf16_to_utf8(filename), newspec, mode);
     }
@@ -2603,7 +2689,7 @@ public:
     ///                      Pointer to an array of `ImageSpec` objects
     ///                      describing each of the expected subimages.
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool open (const std::string &filename,
+    OIIO_NODISCARD_ERROR virtual bool open (const std::string &filename,
                        int subimages OIIO_MAYBE_UNUSED,
                        const ImageSpec *specs) {
         // Default implementation: just a regular open, assume that
@@ -2611,7 +2697,7 @@ public:
         return open (filename, specs[0]);
     }
 
-    bool open (const std::wstring &filename, int subimages OIIO_MAYBE_UNUSED,
+    OIIO_NODISCARD_ERROR bool open (const std::wstring &filename, int subimages OIIO_MAYBE_UNUSED,
                const ImageSpec *specs) {
         // Default implementation: just a regular open, assume that
         // appending will work.
@@ -2625,7 +2711,7 @@ public:
 
     /// Closes the currently open file associated with this ImageOutput and
     /// frees any memory or resources associated with it.
-    virtual bool close () = 0;
+    OIIO_NODISCARD_ERROR virtual bool close () = 0;
     /// @}
 
     // clang-format on
@@ -2687,13 +2773,14 @@ public:
     ///                     y, and z).
     /// @returns            `true` upon success, or `false` upon failure.
     ///
-    virtual bool write_image(TypeDesc format,
-                             const image_span<const std::byte>& data);
+    OIIO_NODISCARD_ERROR virtual bool
+    write_image(TypeDesc format, const image_span<const std::byte>& data);
 
     /// A version of `write_image()` taking an `image_span<T>`, where the type
     /// of the underlying data is `T`.  This is a convenience wrapper around
     /// the `write_image()` that takes an `image_span<const std::byte>`.
-    template<typename T> bool write_image(const image_span<T>& data)
+    template<typename T>
+    OIIO_NODISCARD_ERROR bool write_image(const image_span<T>& data)
     {
         return write_image(TypeDescFromC<T>::value(),
                            as_image_span_bytes(data));
@@ -2702,7 +2789,7 @@ public:
     /// A version of `write_image()` taking a `cspan<T>`, which assumes
     /// contiguous strides in all dimensions. This is a convenience wrapper
     /// around the `write_image()` that takes an `image_span<const T>`.
-    template<typename T> bool write_image(span<T> data)
+    template<typename T> OIIO_NODISCARD_ERROR bool write_image(span<T> data)
     {
         auto ispan = image_span<const T>(data.data(), m_spec.nchannels,
                                          m_spec.width, m_spec.height,
@@ -2734,14 +2821,16 @@ public:
     ///                     dimension (channel, x, y, z).
     /// @returns            `true` upon success, or `false` upon failure.
     ///
-    virtual bool write_scanline(int y, TypeDesc format,
-                                const image_span<const std::byte>& data);
+    OIIO_NODISCARD_ERROR virtual bool
+    write_scanline(int y, TypeDesc format,
+                   const image_span<const std::byte>& data);
 
     /// A version of `write_scanline()` taking an `image_span<T>`, where the
     /// type of the underlying data is `T`.  This is a convenience wrapper
     /// around the `write_scanline()` that takes an `image_span<const
     /// std::byte>`.
-    template<typename T> bool write_scanline(int y, const image_span<T>& data)
+    template<typename T>
+    OIIO_NODISCARD_ERROR bool write_scanline(int y, const image_span<T>& data)
     {
         // reduce to type + image_span<byte>
         return write_scanline(y, TypeDescFromC<T>::value(),
@@ -2751,7 +2840,8 @@ public:
     /// A version of `write_scanline()` taking a `cspan<T>`, which assumes
     /// contiguous strides in all dimensions. This is a convenience wrapper
     /// around the `write_scanline()` that takes an `image_span<const T>`.
-    template<typename T> bool write_scanline(int y, span<T> data)
+    template<typename T>
+    OIIO_NODISCARD_ERROR bool write_scanline(int y, span<T> data)
     {
         // reduce to type + image_span<byte>
         return write_scanline(y, image_span<T>(data.data(), m_spec.nchannels,
@@ -2783,8 +2873,9 @@ public:
     ///                     dimension (channel, x, y, z).
     /// @returns            `true` upon success, or `false` upon failure.
     ///
-    virtual bool write_scanlines(int ybegin, int yend, TypeDesc format,
-                                 const image_span<const std::byte>& data);
+    OIIO_NODISCARD_ERROR virtual bool
+    write_scanlines(int ybegin, int yend, TypeDesc format,
+                    const image_span<const std::byte>& data);
 
     /// A version of `write_scanlines()` taking an `image_span<T>`, where the
     /// type of the underlying data is `T`.  This is a convenience wrapper
@@ -2802,7 +2893,8 @@ public:
     /// contiguous strides in all dimensions. This is a convenience wrapper
     /// around the `write_scanlines()` that takes an `image_span<const T>`.
     template<typename T>
-    bool write_scanlines(int ybegin, int yend, span<T> data)
+    OIIO_NODISCARD_ERROR bool write_scanlines(int ybegin, int yend,
+                                              span<T> data)
     {
         auto ispan = image_span<T>(data.data(), m_spec.nchannels, m_spec.width,
                                    yend - ybegin, 1);
@@ -2839,14 +2931,16 @@ public:
     /// Added in OIIO 3.1, this is the "safe" preferred alternative to
     /// the version of write_tile that takes raw pointers.
     ///
-    virtual bool write_tile(int x, int y, int z, TypeDesc format,
-                            const image_span<const std::byte>& data);
+    OIIO_NODISCARD_ERROR virtual bool
+    write_tile(int x, int y, int z, TypeDesc format,
+               const image_span<const std::byte>& data);
 
     /// A version of `write_tile()` taking an `image_span<T>`, where the type
     /// of the underlying data is `T`.  This is a convenience wrapper around
     /// the `write_tile()` that takes an `image_span<const std::byte>`.
     template<typename T>
-    bool write_tile(int x, int y, int z, const image_span<T>& data)
+    OIIO_NODISCARD_ERROR bool write_tile(int x, int y, int z,
+                                         const image_span<T>& data)
     {
         return write_tile(x, y, z, TypeDescFromC<T>::value(),
                           as_image_span_bytes(data));
@@ -2855,7 +2949,8 @@ public:
     /// A version of `write_tile()` taking a `cspan<T>`, which assumes
     /// contiguous strides in all dimensions. This is a convenience wrapper
     /// around the `write_tile()` that takes an `image_span<const T>`.
-    template<typename T> bool write_tile(int x, int y, int z, span<T> data)
+    template<typename T>
+    OIIO_NODISCARD_ERROR bool write_tile(int x, int y, int z, span<T> data)
     {
         auto ispan = image_span<T>(data.data(), m_spec.nchannels,
                                    m_spec.tile_width, m_spec.tile_height,
@@ -2891,16 +2986,18 @@ public:
     ///                     dimension (channel, x, y, z).
     /// @returns            `true` upon success, or `false` upon failure.
     ///
-    virtual bool write_tiles(int xbegin, int xend, int ybegin, int yend,
-                             int zbegin, int zend, TypeDesc format,
-                             const image_span<const std::byte>& data);
+    OIIO_NODISCARD_ERROR virtual bool
+    write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
+                int zend, TypeDesc format,
+                const image_span<const std::byte>& data);
 
     /// A version of `write_tiles()` taking an `image_span<T>`, where the type
     /// of the underlying data is `T`.  This is a convenience wrapper around
     /// the `write_tiles()` that takes an `image_span<const std::byte>`.
     template<typename T>
-    bool write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
-                     int zend, const image_span<T>& data)
+    OIIO_NODISCARD_ERROR bool write_tiles(int xbegin, int xend, int ybegin,
+                                          int yend, int zbegin, int zend,
+                                          const image_span<T>& data)
     {
         return write_tiles(xbegin, xend, ybegin, yend, zbegin, zend,
                            TypeDescFromC<T>::value(),
@@ -2911,8 +3008,9 @@ public:
     /// contiguous strides in all dimensions. This is a convenience wrapper
     /// around the `write_tiles()` that takes an `image_span<const T>`.
     template<typename T>
-    bool write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
-                     int zend, span<T> data)
+    OIIO_NODISCARD_ERROR bool write_tiles(int xbegin, int xend, int ybegin,
+                                          int yend, int zbegin, int zend,
+                                          span<T> data)
     {
         auto ispan = image_span<T>(data.data(), m_spec.nchannels, xend - xbegin,
                                    yend - ybegin, zend - zbegin);
@@ -2946,17 +3044,19 @@ public:
     ///                     dimension (channel, x, y, z).
     /// @returns            `true` upon success, or `false` upon failure.
     ///
-    virtual bool write_rectangle(int xbegin, int xend, int ybegin, int yend,
-                                 int zbegin, int zend, TypeDesc format,
-                                 const image_span<const std::byte>& data);
+    OIIO_NODISCARD_ERROR virtual bool
+    write_rectangle(int xbegin, int xend, int ybegin, int yend, int zbegin,
+                    int zend, TypeDesc format,
+                    const image_span<const std::byte>& data);
 
     /// A version of `write_rectangle()` taking an `image_span<T>`, where the
     /// type of the underlying data is `T`.  This is a convenience wrapper
     /// around the `write_rectangle()` that takes an `image_span<const
     /// std::byte>`.
     template<typename T>
-    bool write_rectangle(int xbegin, int xend, int ybegin, int yend, int zbegin,
-                         int zend, const image_span<T>& data)
+    OIIO_NODISCARD_ERROR bool write_rectangle(int xbegin, int xend, int ybegin,
+                                              int yend, int zbegin, int zend,
+                                              const image_span<T>& data)
     {
         return write_rectangle(xbegin, xend, ybegin, yend, zbegin, zend,
                                TypeDescFromC<T>::value(),
@@ -2967,8 +3067,9 @@ public:
     /// contiguous strides in all dimensions. This is a convenience wrapper
     /// around the `write_rectangle()` that takes an `image_span<const T>`.
     template<typename T>
-    bool write_rectangle(int xbegin, int xend, int ybegin, int yend, int zbegin,
-                         int zend, span<T> data)
+    OIIO_NODISCARD_ERROR bool write_rectangle(int xbegin, int xend, int ybegin,
+                                              int yend, int zbegin, int zend,
+                                              span<T> data)
     {
         auto ispan = image_span<const T>(data.data(), m_spec.nchannels,
                                          xend - xbegin, yend - ybegin,
@@ -2989,7 +3090,7 @@ public:
     /// @param  deepdata    A `DeepData` object with the data for these
     ///                     scanlines.
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool write_deep_scanlines (int ybegin, int yend, int z,
+    OIIO_NODISCARD_ERROR virtual bool write_deep_scanlines (int ybegin, int yend, int z,
                                        const DeepData &deepdata);
 
     /// Write the block of deep tiles that include all pixels in
@@ -3012,7 +3113,7 @@ public:
     /// @note The call will fail if the image is not tiled, or if the pixel
     /// ranges do not fall along tile (or image) boundaries, or if it is not
     /// a valid tile range.
-    virtual bool write_deep_tiles (int xbegin, int xend, int ybegin, int yend,
+    OIIO_NODISCARD_ERROR virtual bool write_deep_tiles (int xbegin, int xend, int ybegin, int yend,
                                    int zbegin, int zend,
                                    const DeepData &deepdata);
 
@@ -3021,7 +3122,7 @@ public:
     ///
     /// @param  deepdata    A `DeepData` object with the data for the image.
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool write_deep_image (const DeepData &deepdata);
+    OIIO_NODISCARD_ERROR virtual bool write_deep_image (const DeepData &deepdata);
 
     /// Specify a reduced-resolution ("thumbnail") version of the image.
     /// Note that many image formats may require the thumbnail to be
@@ -3103,7 +3204,7 @@ public:
     /// @param  xstride     The distance in bytes between successive
     ///                     pixels in `data` (or `AutoStride`).
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool write_scanline (int y, int z, TypeDesc format,
+    OIIO_NODISCARD_ERROR virtual bool write_scanline (int y, int z, TypeDesc format,
                                  const void *data, stride_t xstride=AutoStride);
 
     /// Write multiple scanlines that include pixels (*,y,z) for all ybegin
@@ -3121,7 +3222,7 @@ public:
     ///                     The distance in bytes between successive pixels
     ///                     and scanlines (or `AutoStride`).
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool write_scanlines (int ybegin, int yend, int z,
+    OIIO_NODISCARD_ERROR virtual bool write_scanlines (int ybegin, int yend, int z,
                                   TypeDesc format, const void *data,
                                   stride_t xstride=AutoStride,
                                   stride_t ystride=AutoStride);
@@ -3147,7 +3248,7 @@ public:
     ///
     /// @note This call will fail if the image is not tiled, or if (x,y,z)
     /// is not the upper left corner coordinates of a tile.
-    virtual bool write_tile (int x, int y, int z, TypeDesc format,
+    OIIO_NODISCARD_ERROR virtual bool write_tile (int x, int y, int z, TypeDesc format,
                              const void *data, stride_t xstride=AutoStride,
                              stride_t ystride=AutoStride,
                              stride_t zstride=AutoStride);
@@ -3186,7 +3287,7 @@ public:
     /// @note The call will fail if the image is not tiled, or if the pixel
     /// ranges do not fall along tile (or image) boundaries, or if it is not
     /// a valid tile range.
-    virtual bool write_tiles (int xbegin, int xend, int ybegin, int yend,
+    OIIO_NODISCARD_ERROR virtual bool write_tiles (int xbegin, int xend, int ybegin, int yend,
                               int zbegin, int zend, TypeDesc format,
                               const void *data, stride_t xstride=AutoStride,
                               stride_t ystride=AutoStride,
@@ -3218,7 +3319,7 @@ public:
     ///
     /// @note The call will fail for a format plugin that does not return
     /// true for `supports("rectangles")`.
-    virtual bool write_rectangle (int xbegin, int xend, int ybegin, int yend,
+    OIIO_NODISCARD_ERROR virtual bool write_rectangle (int xbegin, int xend, int ybegin, int yend,
                                   int zbegin, int zend, TypeDesc format,
                                   const void *data, stride_t xstride=AutoStride,
                                   stride_t ystride=AutoStride,
@@ -3247,7 +3348,7 @@ public:
     /// @param  progress_callback/progress_callback_data
     ///                     Optional progress callback.
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool write_image (TypeDesc format, const void *data,
+    OIIO_NODISCARD_ERROR virtual bool write_image (TypeDesc format, const void *data,
                               stride_t xstride=AutoStride,
                               stride_t ystride=AutoStride,
                               stride_t zstride=AutoStride,
@@ -3283,7 +3384,7 @@ public:
     ///
     /// @param  in          A pointer to the open `ImageInput` to read from.
     /// @returns            `true` upon success, or `false` upon failure.
-    virtual bool copy_image (ImageInput *in);
+    OIIO_NODISCARD_ERROR virtual bool copy_image (ImageInput *in);
 
     // General message passing between client and image output server. This
     // is currently undefined and is reserved for future use.
@@ -3476,6 +3577,8 @@ protected:
     ///   be adjusted to 0.
     /// * Whether the `extra_attribs` contains a request to use an IOProxy,
     ///   but the format writer does not report `supports("ioproxy")`.
+    /// * If alpha_channel and z_channel are not within the actual channel
+    ///   count, they will be set to -1.
     bool check_open(OpenMode mode, const ImageSpec &spec,
                     ROI range = {0, 65535, 0, 65535, 0, 1, 0, 4},
                     uint64_t flags = 0);
@@ -3889,6 +3992,19 @@ OIIO_API std::string geterror(bool clear = true);
 ///    you should raise this limit. Setting the limit to 0 means having no
 ///    limit.
 ///
+/// - `int limits:resolution` (1048576)
+///
+///    When nonzero, the maximum number of pixels allowed along any single
+///    dimension (width, height, or depth) of an image, its display window, or
+///    its tiles. Images whose headers indicate a larger dimension might be
+///    assumed to be corrupted or malicious files. This complements
+///    `limits:imagesize_MB` by catching a header that is small in one
+///    dimension but absurdly large in another, which could otherwise slip
+///    under the total-size limit. The default is 1048576 (2^20). In
+///    situations when images with a larger single dimension are expected to
+///    be encountered, you should raise this limit. Setting the limit to 0
+///    means having no limit. (Added in version 3.2.)
+///
 /// - `int log_times` (0)
 ///
 ///    When the `"log_times"` attribute is nonzero, `ImageBufAlgo` functions
@@ -3917,7 +4033,7 @@ OIIO_API std::string geterror(bool clear = true);
 ///   But for less sophisticated applications (or users), this is very useful
 ///   for forcing display of error messages so that users can see relevant
 ///   errors even if they never check them explicitly, thus self-diagnose
-///   their troubles before asking the project dev deam for help. Advanced
+///   their troubles before asking the project dev team for help. Advanced
 ///   users who for some reason desire to neither retrieve errors themselves
 ///   nor have them printed in this manner can disable the behavior by setting
 ///   this attribute to 0.
@@ -3932,7 +4048,7 @@ OIIO_API std::string geterror(bool clear = true);
 ///   applications (or users), this is very useful for forcing display of
 ///   error messages so that users can see relevant errors even if they never
 ///   check them explicitly, thus self-diagnose their troubles before asking
-///   the project dev deam for help. Advanced users who for some reason desire
+///   the project dev team for help. Advanced users who for some reason desire
 ///   to neither retrieve errors themselves nor have them printed in this
 ///   manner can disable the behavior by setting this attribute to 0.
 ///
@@ -3952,6 +4068,16 @@ OIIO_API std::string geterror(bool clear = true);
 ///   further decode anything in the file. This may be a better choice to
 ///   enable globally in an environment where security is a higher priority
 ///   than being tolerant of partially broken image files.
+///
+/// - `ustring:cleanup` (int: 0)
+///
+///    If nonzero, upon exit, do a thorough (and possibly expensive) teardown
+///    of ustring internal resources to ensure that there are no apparent
+///    memory leaks. This is only desirable in certain debugging situations.
+///    Ordinarily, it is better to finish as quickly as possible, so the
+///    default of 0 skips a time consuming and pointless teardown of the
+///    ustring internal allocations when the app exits. Note that this can
+///    also be enabled with the `OIIO_USTRING_CLEANUP` environment variable.
 ///
 /// EXAMPLES:
 /// ```
@@ -4094,7 +4220,7 @@ inline bool attribute(string_view name, string_view value) {
 /// - int64_t IB_local_mem_peak
 ///
 ///   Current and peak size (in bytes) of how much memory was consumed by
-///   ImageBufs that owned their own allcoated local pixel buffers. (Added in
+///   ImageBufs that owned their own allocated local pixel buffers. (Added in
 ///   OpenImageIO 2.5.)
 ///
 /// - float IB_total_open_time
@@ -4103,12 +4229,12 @@ inline bool attribute(string_view name, string_view value) {
 ///   Total amount of time (in seconds) that ImageBufs spent opening
 ///   (including reading header information) and reading pixel data from files
 ///   that they opened and read themselves (that is, excluding I/O from IBs
-///   that were backed by ImageCach.  (Added in OpenImageIO 2.5.)
+///   that were backed by ImageCache).  (Added in OpenImageIO 2.5.)
 ///
 /// - `string opencolorio_version`
 ///
 ///   Returns the version (such as "2.2.0") of OpenColorIO that is used by
-///   OpenImageiO, or "0.0.0" if no OpenColorIO support has been enabled.
+///   OpenImageIO, or "0.0.0" if no OpenColorIO support has been enabled.
 ///   (Added in OpenImageIO 2.4.6)
 ///
 /// - `string hw:simd`
@@ -4134,7 +4260,7 @@ inline bool attribute(string_view name, string_view value) {
 ///
 /// - `string build:dependencies` (read-only)
 ///
-///   List of library dependencieis (where known) and versions, separatd by
+///   List of library dependencies (where known) and versions, separated by
 ///   semicolons. (Added in OpenImageIO 2.5.8.)
 ///
 /// - `int resident_memory_used_MB`
@@ -4284,9 +4410,36 @@ OIIO_API void set_colorspace(ImageSpec& spec, string_view name);
 /// but it also removes or alters several other attributes that may hint color
 /// space in ways that might be contradictory or no longer true. This uses the
 /// current default color config to adjudicate color space name equivalencies.
+/// The default color config is only loaded if it is needed.
 ///
 /// @version 3.0
 OIIO_API void set_colorspace_rec709_gamma(ImageSpec& spec, float gamma);
+
+/// Returns true if for the purpose of interop, the metadata of the `spec`
+/// specifies a color space that should be encoded as sRGB.
+///
+/// If `default_to_srgb` is true, the color space will be assumed to be sRGB
+/// if no color space was specified in the spec.
+///
+/// @version 3.2
+OIIO_API bool is_colorspace_srgb(const ImageSpec& spec,
+                                 bool default_to_srgb = true);
+
+/// Returns the ICC profile from the metadata of the `spec`, either from an
+/// "ICCProfile" attribute or from the color space if `from_colorspace` is
+/// true. Returns an empty vector if not found.
+///
+/// @version 3.2
+OIIO_API std::vector<uint8_t>
+get_colorspace_icc_profile(const ImageSpec& spec, bool from_colorspace = true);
+
+/// Returns the CICP code from the metadata of the `spec`, either from a
+/// "CICP" attribute or from the color space if `from_colorspace` is true.
+/// Returns a cspan of 4 ints, or an empty span if not found.
+///
+/// @version 3.2
+OIIO_API cspan<int> get_colorspace_cicp(const ImageSpec& spec,
+                                        bool from_colorspace = true);
 
 
 /// Are the two named color spaces equivalent, based on the default color
@@ -4585,15 +4738,9 @@ void debugfmt (const char* fmt, Args&&... args)
 }
 
 namespace pvt {
-// For internal use - use errorfmt() below for a nicer interface.
+// Only kept for ABI compatibility; will be removed in 4.0.
+[[deprecated("use errorfmt() instead (3.3)")]]
 OIIO_API void append_error(string_view message);
-}
-
-/// error logging (mostly for OIIO internals) with `std::format` conventions.
-template<typename... Args>
-inline void errorfmt(const char* fmt, Args&&... args)
-{
-    pvt::append_error(string_view(Strutil::fmt::format(fmt, args...)));
 }
 
 /// Internal function to log time recorded by an OIIO::timer(). It will only
@@ -4674,7 +4821,8 @@ using v3_1::debug;
 using v3_1::debugfmt;
 using v3_1::declare_imageio_format;
 using v3_1::equivalent_colorspace;
-using v3_1::errorfmt;
+using v3_1::get_colorspace_cicp;
+using v3_1::get_colorspace_icc_profile;
 using v3_1::get_extension_map;
 using v3_1::get_float_attribute;
 using v3_1::get_int_attribute;
@@ -4682,6 +4830,7 @@ using v3_1::get_string_attribute;
 using v3_1::getattribute;
 using v3_1::geterror;
 using v3_1::has_error;
+using v3_1::is_colorspace_srgb;
 using v3_1::is_imageio_format_name;
 using v3_1::log_time;
 using v3_1::openimageio_version;
@@ -4712,4 +4861,21 @@ OIIO_NAMESPACE_END
 FMT_BEGIN_NAMESPACE
 template<> struct formatter<OIIO::ROI> : ostream_formatter {};
 FMT_END_NAMESPACE
+#endif
+
+
+#ifdef OIIO_INTERNAL
+// A symbol is put in each namespace so that we can double check is in the
+// namespace we think it's in.
+OIIO_NAMESPACE_3_1_BEGIN
+extern OIIO_API const int oiio_3_1_namespace_canary;
+OIIO_NAMESPACE_3_1_END
+
+OIIO_NAMESPACE_3_2_BEGIN
+extern OIIO_API const int oiio_3_2_namespace_canary;
+OIIO_NAMESPACE_3_2_END
+
+OIIO_NAMESPACE_BEGIN
+extern OIIO_API const int oiio_current_namespace_canary;
+OIIO_NAMESPACE_END
 #endif

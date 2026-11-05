@@ -25,5 +25,28 @@ command += oiiotool("src/crash-3951.rla -o crash4.exr", failureok = True)
 command += oiiotool("src/crash-1.rla -o crash5.exr", failureok = True)
 command += oiiotool("src/crash-5152.rla -o crash6.exr", failureok = True)
 command += oiiotool("src/crash-5159.rla -o crash7.exr", failureok = True)
+command += oiiotool("src/crash-badrle.rla -o crash8.exr", failureok = True)
+
+# Malformed inputs built by src/make_malformed_rla.py.
+# A 1.2 KB file claiming a 6.8 GB image must be rejected before anything is
+# sized from the spec.
+command += oiiotool("--info -a -v src/bomb.rla", failureok = True)
+# A subimage whose NextOffset points at itself must not present an endless
+# supply of subimages; enumeration has to terminate.
+command += oiiotool("--info -a -v --hash src/subimage-loop.rla", failureok = True)
+# Field-rendered images halve the height, so the scanline offset table has
+# more entries than there are scanlines. Reading must stay in bounds.
+command += oiiotool("--info -v --hash src/field-rendered.rla", failureok = True)
+
+# Mixed per-channel formats: the writer's grouping of channels into color,
+# matte, and aux used to index past the end of channelformats.
+command += oiiotool("--pattern noise:type=uniform 8x8 5 -d R=uint8,G=uint8,B=uint8,A=uint16,Z=float -o mixed.rla")
+command += info_command("mixed.rla", hash=True, verbose=False)
+# Aux channels of differing types get promoted to one common type.
+command += oiiotool("--pattern noise:type=uniform 8x8 6 -d R=uint8,G=uint8,B=uint8,A=uint16,Z=float,X=uint8 --chnames R,G,B,A,Z,X -o mixedaux.rla")
+command += info_command("mixedaux.rla", hash=True, verbose=False)
+# uint16 aux with uint8 color/matte: aux must keep its 16 bits.
+command += oiiotool("--pattern noise:type=uniform 8x8 5 -d R=uint8,G=uint8,B=uint8,A=uint8,Z=uint16 --chnames R,G,B,A,Z -o mixed16.rla")
+command += oiiotool("mixed16.rla --printstats")
 
 outputs = [ "rlacrop.rla", 'out.txt' ]

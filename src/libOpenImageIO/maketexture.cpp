@@ -189,9 +189,9 @@ interppixel_NDC(const ImageBuf& buf, float x, float y, span<float> pixel,
         int ynext = OIIO::clamp(ytexel + 1, ymin, ymax);
         ytexel    = OIIO::clamp(ytexel, ymin, ymax);
         float w0  = (1.0f - yfrac)
-                   * sinf((float)M_PI * (ytexel + 0.5f) / (float)fh);
-        float w1 = yfrac * sinf((float)M_PI * (ynext + 0.5f) / (float)fh);
-        yfrac    = w1 / (w0 + w1);
+                    * sinf((float)M_PI * (ytexel + 0.5f) / (float)fh);
+        float w1  = yfrac * sinf((float)M_PI * (ynext + 0.5f) / (float)fh);
+        yfrac     = w1 / (w0 + w1);
     }
 
     // Bilinearly interpolate
@@ -792,7 +792,9 @@ write_mipmap(ImageBufAlgo::MakeTextureMode mode, std::shared_ptr<ImageBuf>& img,
         // ImageBuf::write transfers any errors from the ImageOutput to
         // the ImageBuf.
         errorfmt("Write failed: {}", img->geterror());
-        out->close();
+        if (!out->close()) {
+            errorfmt("Close failed: {}", out->geterror());
+        }
         return false;
     }
 
@@ -965,7 +967,9 @@ write_mipmap(ImageBufAlgo::MakeTextureMode mode, std::shared_ptr<ImageBuf>& img,
                 // ImageOutput to the ImageBuf.
                 errorfmt("Error writing \"{}\" : {}", outputfilename,
                          small->geterror());
-                out->close();
+                if (!out->close()) {
+                    errorfmt("Close failed: {}", out->geterror());
+                }
                 return false;
             }
             double wtime = writetimer();
@@ -1106,7 +1110,7 @@ make_texture_impl(ImageBufAlgo::MakeTextureMode mode, const ImageBuf* input,
     bool ignore_unassoc = configspec.get_int_attribute("maketx:ignore_unassoc");
     ImageSpec inconfig;
     if (ignore_unassoc)
-        inconfig.attribute("oiio::UnassociatedAlpha", 1);
+        inconfig.attribute("oiio:UnassociatedAlpha", 1);
 
     std::stringstream localstream;  // catch output when user doesn't want it
     std::ostream& outstream(outstream_ptr ? *outstream_ptr : localstream);
@@ -1237,7 +1241,7 @@ make_texture_impl(ImageBufAlgo::MakeTextureMode mode, const ImageBuf* input,
     int local_mb_thresh = configspec.get_int_attribute("maketx:read_local_MB",
                                                        1024);
     bool read_local     = (src->spec().image_bytes()
-                       < imagesize_t(local_mb_thresh * 1024 * 1024));
+                           < imagesize_t(local_mb_thresh * 1024 * 1024));
 
     bool verbose       = configspec.get_int_attribute("maketx:verbose") != 0;
     double misc_time_1 = alltime.lap();
@@ -1358,10 +1362,10 @@ make_texture_impl(ImageBufAlgo::MakeTextureMode mode, const ImageBuf* input,
             // the Gaussian inverse CDF to transform the uniform distribution
             // to Gaussian.
             for (uint64_t j = 0; j < bins; j++) {
-                float u = float(hist[j]) / hist[bins - 1];
-                float g = 0.5f
-                          + cdf_sigma * M_SQRT2
-                                * fast_ierf(c_sigma_inv * (2.0f * u - 1.0f));
+                float u   = float(hist[j]) / hist[bins - 1];
+                float g   = 0.5f
+                            + cdf_sigma * M_SQRT2
+                                  * fast_ierf(c_sigma_inv * (2.0f * u - 1.0f));
                 invCDF[j] = std::min(1.0f, std::max(0.0f, g));
             }
             configspec.attribute("invCDF_" + std::to_string(i),
@@ -1840,16 +1844,23 @@ make_texture_impl(ImageBufAlgo::MakeTextureMode mode, const ImageBuf* input,
                         "  Copying for format conversion from {} to {}\n",
                         src->spec().format, dstspec.format);
         toplevel.reset(new ImageBuf(dstspec));
-        toplevel->copy_pixels(*src);
+        if (toplevel->has_error() || !toplevel->copy_pixels(*src)) {
+            errorfmt("{}", toplevel->geterror());
+            return false;
+        }
     } else {
         // Resize
         if (verbose)
             OIIO::print(outstream, "  Resizing image to {} x {}\n",
                         dstspec.width, dstspec.height);
+        toplevel.reset(new ImageBuf(dstspec));
+        if (toplevel->has_error()) {
+            errorfmt("{}", toplevel->geterror());
+            return false;
+        }
         string_view resize_filter(filtername);
         if (Strutil::istarts_with(resize_filter, "unsharp-"))
             resize_filter = "lanczos3";
-        toplevel.reset(new ImageBuf(dstspec));
         if ((resize_filter == "box" || resize_filter == "triangle")
             && !orig_was_overscan) {
             ImageBufAlgo::parallel_image(get_roi(dstspec), nthreads,
@@ -1925,8 +1936,8 @@ make_texture_impl(ImageBufAlgo::MakeTextureMode mode, const ImageBuf* input,
     const int sha1_blocksize = 256;
     std::string hash_digest  = configspec.get_int_attribute("maketx:hash", 1)
                                    ? ImageBufAlgo::computePixelHashSHA1(
-                                      *toplevel, addlHashData.str(), ROI::All(),
-                                      sha1_blocksize, nthreads)
+                                         *toplevel, addlHashData.str(),
+                                         ROI::All(), sha1_blocksize, nthreads)
                                    : "";
     if (hash_digest.length()) {
         if (out->supports("arbitrary_metadata")) {

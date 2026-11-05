@@ -18,6 +18,8 @@
 #include <OpenImageIO/strutil.h>
 #include <OpenImageIO/typedesc.h>
 
+#include "imageio_pvt.h"
+
 OIIO_PLUGIN_NAMESPACE_BEGIN
 
 
@@ -97,7 +99,7 @@ private:
 
     /// Helper function - retrieve libdpx descriptor given nchannels and
     /// the channel names.
-    dpx::Descriptor get_image_descriptor();
+    dpx::Descriptor get_image_descriptor(const ImageSpec& spec);
 
     /// Helper function - set keycode values from int array
     ///
@@ -123,7 +125,10 @@ OIIO_PLUGIN_EXPORTS_END
 
 
 
-DPXOutput::DPXOutput() { init(); }
+DPXOutput::DPXOutput()
+{
+    init();
+}
 
 
 
@@ -143,6 +148,17 @@ DPXOutput::open(const std::string& name, int subimages, const ImageSpec* specs)
                  MAX_DPX_IMAGE_ELEMENTS);
         return false;
     };
+    // All DPX image elements share one image size.
+    for (int s = 1; s < subimages; ++s) {
+        if (specs[s].width != specs[0].width
+            || specs[s].height != specs[0].height) {
+            errorfmt(
+                "{} subimages must all have the same resolution (subimage 0 was {}x{}, versus subimage {} with {}x{})",
+                format_name(), specs[0].width, specs[0].height, s,
+                specs[s].width, specs[s].height);
+            return false;
+        }
+    }
     m_subimages_to_write = subimages;
     m_subimage_specs.clear();
     m_subimage_specs.insert(m_subimage_specs.begin(), specs, specs + subimages);
@@ -176,7 +192,7 @@ DPXOutput::open(const std::string& name, const ImageSpec& userspec,
     if (is_opened())
         close();  // Close any already-opened file
 
-    if (!check_open(mode, userspec, { 0, 1 << 20, 0, 1 << 20, 0, 1, 0, 256 }))
+    if (!check_open(mode, userspec, { 0, 1 << 30, 0, 1 << 30, 0, 1, 0, 256 }))
         return false;
 
     // From here out, all the heavy lifting is done for Create
@@ -236,7 +252,10 @@ DPXOutput::open(const std::string& name, const ImageSpec& userspec,
     m_dpx.SetImageInfo(spec0.width, spec0.height);
 
     for (int s = 0; s < m_subimages_to_write; ++s) {
-        prep_subimage(s, false);
+        if (!prep_subimage(s, false)) {
+            close();
+            return false;
+        }
         m_dpx.header.SetBitDepth(s, m_bitdepth);
         ImageSpec& spec(m_subimage_specs[s]);
         bool datasign = (spec.format == TypeDesc::INT8
@@ -249,8 +268,7 @@ DPXOutput::open(const std::string& name, const ImageSpec& userspec,
             spec.get_int_attribute("dpx:HighData", 0xFFFFFFFF),
             spec.get_float_attribute("dpx:HighQuantity",
                                      std::numeric_limits<float>::quiet_NaN()),
-            spec.get_int_attribute("dpx:EndOfLinePadding", 0),
-            spec.get_int_attribute("dpx:EndOfImagePadding", 0));
+            0, 0);
         std::string desc = spec.get_string_attribute("ImageDescription", "");
         m_dpx.header.SetDescription(s, desc.c_str());
         // TODO: Writing RLE compressed files seem to be broken.
@@ -424,21 +442,18 @@ DPXOutput::prep_subimage(int s, bool allocate)
     ImageSpec& spec_s(m_subimage_specs[s]);  // reference the spec
 
     // determine descriptor
-    m_desc = get_image_descriptor();
+    m_desc = get_image_descriptor(spec_s);
 
     // transfer function
-    const ColorConfig& colorconfig = ColorConfig::default_colorconfig();
-    std::string colorspace = spec_s.get_string_attribute("oiio:ColorSpace", "");
-    if (colorconfig.equivalent(colorspace, "lin_rec709_scene"))
-        m_transfer = dpx::kLinear;
-    else if (colorconfig.equivalent(colorspace, "srgb_rec709_scene"))
+    const float gamma = pvt::get_colorspace_rec709_gamma(spec_s);
+    if (is_colorspace_srgb(spec_s, false))
         m_transfer = dpx::kITUR709;
-    else if (colorconfig.equivalent(colorspace, "g22_rec709_scene")
-             || colorconfig.equivalent(colorspace, "g24_rec709_scene")
-             || colorconfig.equivalent(colorspace, "g18_rec709_scene")
-             || Strutil::istarts_with(colorspace, "Gamma"))
+    else if (gamma == 1.0f)
+        m_transfer = dpx::kLinear;
+    else if (gamma != 0.0f)
         m_transfer = dpx::kUserDefined;
-    else if (colorconfig.equivalent(colorspace, "KodakLog"))
+    else if (ColorConfig::default_colorconfig().equivalent(
+                 spec_s.get_string_attribute("oiio:ColorSpace"), "KodakLog"))
         m_transfer = dpx::kLogarithmic;
     else {
         std::string dpxtransfer = spec_s.get_string_attribute("dpx:Transfer",
@@ -525,7 +540,7 @@ DPXOutput::prep_subimage(int s, bool allocate)
         m_bytes    = spec_s.scanline_bytes();
         m_rawcolor = true;
     } else {
-        OIIO_ASSERT(0 && "Unsupported color space");
+        errorfmt("DPX writer does not support {} channels", spec_s.nchannels);
         return false;
 #if 0  /* NOT USED IN OIIO */
         m_bytes = dpx::QueryNativeBufferSize(m_desc, m_datasize, spec_s.width,
@@ -563,6 +578,17 @@ DPXOutput::write_buffer()
 
     bool ok = true;
     if (m_write_pending && m_buf.size()) {
+        // WriteElement takes the element size from the header, not m_buf
+        size_t needed
+            = size_t(m_dpx.header.Width()) * size_t(m_dpx.header.Height())
+              * size_t(m_dpx.header.ImageElementComponentCount(m_subimage))
+              * size_t((m_dpx.header.BitDepth(m_subimage) + 7) / 8);
+        if (m_buf.size() < needed) {
+            errorfmt("DPX subimage {} pixel data does not match the header",
+                     m_subimage);
+            m_write_pending = false;
+            return false;
+        }
         ok = m_dpx.WriteElement(m_subimage, m_buf.data(), m_datasize);
         if (!ok) {
             const char* err = strerror(errno);
@@ -664,16 +690,14 @@ DPXOutput::get_characteristic_from_string(const std::string& str)
 
 
 dpx::Descriptor
-DPXOutput::get_image_descriptor()
+DPXOutput::get_image_descriptor(const ImageSpec& spec)
 {
-    const ImageSpec& spec0(m_subimage_specs[0]);
-    switch (spec0.nchannels) {
+    switch (spec.nchannels) {
     case 1: {
-        std::string name = spec0.channelnames.size() ? spec0.channelnames[0]
-                                                     : "";
-        if (spec0.z_channel == 0 || name == "Z")
+        std::string name = spec.channelnames.size() ? spec.channelnames[0] : "";
+        if (spec.z_channel == 0 || name == "Z")
             return dpx::kDepth;
-        else if (spec0.alpha_channel == 0 || name == "A")
+        else if (spec.alpha_channel == 0 || name == "A")
             return dpx::kAlpha;
         else if (name == "R")
             return dpx::kRed;
@@ -687,9 +711,9 @@ DPXOutput::get_image_descriptor()
     case 3: return dpx::kRGB;
     case 4: return dpx::kRGBA;
     default:
-        if (spec0.nchannels <= 8)
+        if (spec.nchannels <= 8)
             return (dpx::Descriptor)((int)dpx::kUserDefined2Comp
-                                     + spec0.nchannels - 2);
+                                     + spec.nchannels - 2);
         return dpx::kUndefinedDescriptor;
     }
 }

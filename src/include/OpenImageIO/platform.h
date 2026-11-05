@@ -174,8 +174,10 @@
 // See https://en.cppreference.com/w/cpp/compiler_support
 //
 // OIIO_CPLUSPLUS_VERSION : which C++ standard is compiling (14, 17, ...)
-// OIIO_CONSTEXPR17 :
-// OIIO_CONSTEXPR20 : constexpr for C++ >= the designated version, otherwise
+// OIIO_CONSTEXPR17 : depreated, always `constexpr`
+// OIIO_CONSTEXPR20 :
+// OIIO_CONSTEXPR23 :
+// OIIO_CONSTEXPR26 : constexpr for C++ >= the designated version, otherwise
 //                    nothing (this is useful for things that can only be
 //                    constexpr for particular versions or greater).
 //
@@ -187,18 +189,26 @@
 // package is compiling against OIIO and using these headers (OIIO may be
 // C++17 but the client package may be newer, or vice versa -- use these two
 // symbols to differentiate these cases, when important).
-#if (__cplusplus >= 202302L)
+#if (__cplusplus >= 202603L)
+#    define OIIO_CPLUSPLUS_VERSION 26
+#    define OIIO_CONSTEXPR20 constexpr
+#    define OIIO_CONSTEXPR23 constexpr
+#    define OIIO_CONSTEXPR26 constexpr
+#elif (__cplusplus >= 202302L)
 #    define OIIO_CPLUSPLUS_VERSION 23
 #    define OIIO_CONSTEXPR20 constexpr
 #    define OIIO_CONSTEXPR23 constexpr
+#    define OIIO_CONSTEXPR26 /* not constexpr before C++26 */
 #elif (__cplusplus >= 202001L)
 #    define OIIO_CPLUSPLUS_VERSION 20
 #    define OIIO_CONSTEXPR20 constexpr
 #    define OIIO_CONSTEXPR23 /* not constexpr before C++23 */
+#    define OIIO_CONSTEXPR26 /* not constexpr before C++26 */
 #elif (__cplusplus >= 201703L) || (defined(_MSC_VER) && _MSC_VER >= 1914)
 #    define OIIO_CPLUSPLUS_VERSION 17
 #    define OIIO_CONSTEXPR20 /* not constexpr before C++20 */
 #    define OIIO_CONSTEXPR23 /* not constexpr before C++23 */
+#    define OIIO_CONSTEXPR26 /* not constexpr before C++26 */
 #else
 #    error "This version of OIIO is meant to work only with C++17 and above"
 #endif
@@ -389,6 +399,19 @@
 #    define OIIO_FORCEINLINE __forceinline
 #else
 #    define OIIO_FORCEINLINE inline
+#endif
+
+// OIIO_NOINLINE is a function attribute that asks the compiler never to
+// inline the function. Put this attribute before the function return type,
+// just like you would use 'inline'.
+#if defined(__CUDACC__)
+#    define OIIO_NOINLINE __noinline__
+#elif defined(__GNUC__) || defined(__clang__) || __has_attribute(noinline)
+#    define OIIO_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#    define OIIO_NOINLINE __declspec(noinline)
+#else
+#    define OIIO_NOINLINE
 #endif
 
 // OIIO_PURE_FUNC is a function attribute that assures the compiler that the
@@ -640,6 +663,18 @@ inline bool cpu_has_avx512cd() {int i[4]; cpuid(i,7,0); return (i[1] & (1<<28)) 
 inline bool cpu_has_avx512bw() {int i[4]; cpuid(i,7,0); return (i[1] & (1<<30)) != 0; }
 inline bool cpu_has_avx512vl() {int i[4]; cpuid(i,7,0); return (i[1] & (0x80000000 /*1<<31*/)) != 0; }
 
+/// Is NEON (ARM AdvSIMD) available? Note that unlike the x86 queries above,
+/// this needs no runtime check: NEON is architecturally mandatory on
+/// ARMv8-A, so it is simply always present on any aarch64 target.
+inline bool cpu_has_neon() {
+#if defined(__ARM_NEON__) || defined(__ARM_NEON) || defined(__aarch64__) \
+    || defined(__aarch64) || defined(_M_ARM64) || defined(_M_ARM64EC)
+    return true;
+#else
+    return false;
+#endif
+}
+
 // portable aligned malloc
 OIIO_UTIL_API void* aligned_malloc(std::size_t size, std::size_t align);
 OIIO_UTIL_API void  aligned_free(void* ptr);
@@ -706,5 +741,6 @@ using v3_1::cpu_has_avx512er;
 using v3_1::cpu_has_avx512cd;
 using v3_1::cpu_has_avx512bw;
 using v3_1::cpu_has_avx512vl;
+using v3_1::cpu_has_neon;
 #endif
 OIIO_NAMESPACE_END

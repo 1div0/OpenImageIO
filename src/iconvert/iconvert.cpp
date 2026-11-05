@@ -28,6 +28,7 @@ static float gammaval             = 1.0f;
 static bool verbose = false;
 static int nthreads = 0;  // default: use #cores threads if available
 static std::vector<std::string> filenames;
+static std::string out_filename;
 static int tile[3]   = { 0, 0, 1 };
 static bool scanline = false;
 //static bool zfile = false;
@@ -69,10 +70,12 @@ getargs(int argc, char* argv[])
     ap.options ("iconvert -- copy images with format conversions and other alterations\n"
                 OIIO_INTRO_STRING "\n"
                 "Usage:  iconvert [options] inputfile outputfile\n"
+                "   or:  iconvert [options] inputfile -o outputfile\n"
                 "   or:  iconvert --inplace [options] file...\n",
                 "%*", parse_files, "",
                 "--help", &help, "Print help message",
                 "-v", &verbose, "Verbose status messages",
+                "-o %s:FILENAME", &out_filename, "Output filename",
                 "--threads %d:NTHREADS", &nthreads, "Number of threads (default 0 = #cores)",
                 "-d %s:TYPE", &dataformatname, "Set the output data format to one of:"
                         "uint8, sint8, uint10, uint12, uint16, sint16, half, float, double",
@@ -115,6 +118,17 @@ getargs(int argc, char* argv[])
         return;
     }
 
+    if (!out_filename.empty() && filenames.size() == 1) {
+        // -o mode: one positional arg is input, -o specifies output
+        filenames.push_back(out_filename);
+    } else if (!out_filename.empty() && filenames.size() != 1) {
+        OIIO::print(stderr,
+                    "iconvert: -o requires exactly one input filename.\n");
+        ap.usage();
+        ap.abort();
+        return_code = EXIT_FAILURE;
+        return;
+    }
     if (filenames.size() != 2 && !inplace) {
         OIIO::print(
             stderr,
@@ -358,7 +372,7 @@ convert_file(const std::string& in_filename, const std::string& out_filename)
     // subimage appending, we gather them all first.
     std::vector<ImageSpec> subimagespecs;
     if (out->supports("multiimage") && !out->supports("appendsubimage")) {
-        auto imagecache = ImageCache::create();
+        auto imagecache = ImageCache::create(false);
         int nsubimages  = 0;
         ustring ufilename(in_filename);
         imagecache->get_image_info(ufilename, 0, 0, ustring("subimages"),
@@ -459,16 +473,37 @@ convert_file(const std::string& in_filename, const std::string& out_filename)
                         "iconvert ERROR copying \"{}\" to \"{}\" :\n\t{}\n",
                         in_filename, out_filename, out->geterror());
             } else {
-                // Need to do it by hand for some reason.  Future expansion in which
-                // only a subset of channels are copied, or some such.
-                std::vector<char> pixels((size_t)outspec.image_bytes(true));
+                // Need to do it by hand for some reason. A format of UNKNOWN
+                // requests a per-channel native copy to preserve mixed
+                // per-channel formats. That is only valid if the output
+                // actually stores each channel in the input's native format.
+                // If it remaps any channel (e.g. OpenEXR promoting
+                // uint16/uint8 to half), copy through the output's stored
+                // format so integer values are rescaled rather than
+                // bit-reinterpreted.
+                TypeDesc xferformat = outspec.format;
+                if (xferformat == TypeDesc::UNKNOWN) {
+                    const ImageSpec& storedspec(out->spec());
+                    for (int c = 0; c < outspec.nchannels; ++c)
+                        if (inspec.channelformat(c)
+                            != storedspec.channelformat(c)) {
+                            xferformat = storedspec.format;
+                            break;
+                        }
+                }
+                size_t bufbytes = (xferformat == TypeDesc::UNKNOWN)
+                                      ? (size_t)outspec.image_bytes(true)
+                                      : (size_t)outspec.image_pixels()
+                                            * outspec.nchannels
+                                            * xferformat.size();
+                std::vector<char> pixels(bufbytes);
                 ok = in->read_image(subimage, miplevel, 0, outspec.nchannels,
-                                    outspec.format, &pixels[0]);
+                                    xferformat, &pixels[0]);
                 if (!ok) {
                     OIIO::print(stderr, "iconvert ERROR reading \"{}\": {}\n",
                                 in_filename, in->geterror());
                 } else {
-                    ok = out->write_image(outspec.format, &pixels[0]);
+                    ok = out->write_image(xferformat, &pixels[0]);
                     if (!ok)
                         OIIO::print(stderr,
                                     "iconvert ERROR writing \"{}\": {}\n",
@@ -480,7 +515,10 @@ convert_file(const std::string& in_filename, const std::string& out_filename)
         } while (ok && in->seek_subimage(subimage, miplevel));
     }
 
-    out->close();
+    if (!out->close()) {
+        errorfmt("Error closing \"{}\" : {}", out_filename, out->geterror());
+        ok = false;
+    }
     in->close();
 
     // Figure out a time for the input file -- either one supplied by

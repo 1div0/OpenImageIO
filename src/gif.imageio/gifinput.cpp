@@ -3,10 +3,17 @@
 // https://github.com/AcademySoftwareFoundation/OpenImageIO
 
 #include <fcntl.h>
+#include <limits>
 #include <memory>
 #include <vector>
 
+// Prevent a conflict between gif_lib.h's reallocarray declaration (no
+// exception spec) and glibc's stdlib.h version (noexcept/__THROW). Clang
+// treats the mismatch as a hard error in C++ mode. We rename it away here
+// since gifinput.cpp never calls reallocarray directly.
+#define reallocarray giflib_reallocarray_private_
 #include <gif_lib.h>
+#undef reallocarray
 
 #include <OpenImageIO/filesystem.h>
 #include <OpenImageIO/imageio.h>
@@ -66,7 +73,11 @@ private:
     std::string m_filename;          ///< Stash the filename
     GifFileType* m_gif_file;         ///< GIFLIB handle
     int m_transparent_color;         ///< Transparent color index
-    int m_subimage;                  ///< Current subimage index
+    int m_subimage;                  ///< Current subimage index, or -1 if we
+                                     ///  aren't positioned on a valid one.
+    int m_stream_subimage;           ///< Subimage the giflib stream is next
+                                     ///  positioned to read, or -1 if the
+                                     ///  position is unknown.
     int m_disposal_method;           ///< Disposal method of current subimage.
                                      ///  Indicates what to do with canvas
                                      ///  before drawing the _next_ subimage.
@@ -85,9 +96,14 @@ private:
     ///
     bool read_subimage_metadata(ImageSpec& newspec);
 
-    /// Read current subimage data (ie. draw it on canvas).
-    ///
-    bool read_subimage_data(void);
+    // Read the header of the subimage the stream is positioned at: its
+    // metadata, the canvas dimensions, and the validity checks.
+    bool read_subimage_header(ImageSpec& newspec);
+
+    // Read the data of the subimage the stream is positioned at (ie. draw it
+    // on canvas). `subimage` is its index, which says whether it starts from
+    // a blank canvas.
+    bool read_subimage_data(int subimage);
 
     /// Helper: read gif extension.
     ///
@@ -143,7 +159,9 @@ OIIO_PLUGIN_EXPORTS_END
 void
 GIFInput::init(void)
 {
-    m_gif_file = nullptr;
+    m_gif_file        = nullptr;
+    m_subimage        = -1;
+    m_stream_subimage = -1;
     ioproxy_clear();
 }
 
@@ -152,8 +170,9 @@ GIFInput::init(void)
 bool
 GIFInput::open(const std::string& name, ImageSpec& newspec)
 {
-    m_filename = name;
-    m_subimage = -1;
+    m_filename        = name;
+    m_subimage        = -1;
+    m_stream_subimage = -1;
     m_canvas.clear();
 
     if (seek_subimage(0, 0)) {
@@ -203,11 +222,16 @@ GIFInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
     if (!seek_subimage(subimage, miplevel))
         return false;
 
-    if (y < 0 || y > m_spec.height || !m_canvas.size())
+    if (y < 0 || y >= m_spec.height || m_canvas.empty())
         return false;
 
-    memcpy(data, &m_canvas[y * m_spec.width * m_spec.nchannels],
-           m_spec.width * m_spec.nchannels);
+    size_t scanline_bytes = m_spec.scanline_bytes();
+    size_t offset         = size_t(y) * scanline_bytes;
+    if (scanline_bytes > m_canvas.size()
+        || offset > m_canvas.size() - scanline_bytes)
+        return false;
+
+    memcpy(data, m_canvas.data() + offset, scanline_bytes);
 
     return true;
 }
@@ -220,6 +244,12 @@ GIFInput::read_gif_extension(int ext_code, GifByteType* ext, ImageSpec& newspec)
     if (ext_code == GRAPHICS_EXT_FUNC_CODE) {
         // read background color index, disposal method and delay time between frames
         // http://giflib.sourceforge.net/whatsinagif/bits_and_bytes.html#graphics_control_extension_block
+
+        // ext[0] is the sub-block byte count; a well-formed graphics control
+        // block is 4 bytes. A corrupt file can declare fewer, so bail before
+        // reading ext[1..4] out of the giflib-provided buffer.
+        if (ext[0] < 4)
+            return;
 
         if (ext[1] & 0x01) {
             m_transparent_color = (int)ext[4];
@@ -320,7 +350,28 @@ GIFInput::read_subimage_metadata(ImageSpec& newspec)
 
 
 bool
-GIFInput::read_subimage_data()
+GIFInput::read_subimage_header(ImageSpec& newspec)
+{
+    if (!read_subimage_metadata(newspec))
+        return false;
+
+    // Subimages are drawn on a shared canvas, so they all have the dimensions
+    // the file declares for that canvas.
+    newspec.width       = m_gif_file->SWidth;
+    newspec.height      = m_gif_file->SHeight;
+    newspec.depth       = 1;
+    newspec.full_width  = newspec.width;
+    newspec.full_height = newspec.height;
+    newspec.full_depth  = newspec.depth;
+
+    return check_open(newspec, { 0, 32768, 0, 32768, 0, 1, 0, 4 })
+           && check_compression_ratio(newspec, ioproxy()->size());
+}
+
+
+
+bool
+GIFInput::read_subimage_data(int subimage)
 {
     GifColorType* colormap = NULL;
     int colormap_count;
@@ -335,9 +386,15 @@ GIFInput::read_subimage_data()
         return false;
     }
 
-    if (m_subimage == 0 || m_previous_disposal_method == DISPOSE_BACKGROUND) {
+    if (subimage == 0 || m_previous_disposal_method == DISPOSE_BACKGROUND) {
         // make whole canvas transparent
-        std::fill(m_canvas.begin(), m_canvas.end(), 0x00);
+        size_t canvas_pixels = m_spec.image_pixels();
+        if (canvas_pixels > std::numeric_limits<int>::max() / size_t(4)) {
+            errorfmt("GIF image canvas is too large");
+            return false;
+        }
+        m_canvas.clear();
+        m_canvas.resize(canvas_pixels * size_t(4), 0x00);
     }
 
     // decode scanline index if image is interlaced
@@ -364,14 +421,22 @@ GIFInput::read_subimage_data()
                         fscanline[wx], wx, y, colormap_count);
                     return false;
                 }
-                int x   = window_left + wx;
-                int idx = m_spec.nchannels * (y * m_spec.width + x);
-                if (0 <= x && x < m_spec.width
-                    && fscanline[wx] != m_transparent_color) {
+                int x = window_left + wx;
+                if (0 <= x && x < m_spec.width) {
+                    size_t nchannels = size_t(m_spec.nchannels);
+                    size_t row       = size_t(y) * size_t(m_spec.width);
+                    size_t idx       = (row + size_t(x)) * nchannels;
+                    if (idx > m_canvas.size()
+                        || nchannels > m_canvas.size() - idx) {
+                        errorfmt("GIF pixel index is outside the canvas");
+                        return false;
+                    }
                     m_canvas[idx]     = colormap[fscanline[wx]].Red;
                     m_canvas[idx + 1] = colormap[fscanline[wx]].Green;
                     m_canvas[idx + 2] = colormap[fscanline[wx]].Blue;
-                    m_canvas[idx + 3] = 0xff;
+                    m_canvas[idx + 3] = (fscanline[wx] != m_transparent_color)
+                                            ? 0xff
+                                            : 0x00;
                 }
             }
         }
@@ -393,9 +458,18 @@ GIFInput::seek_subimage(int subimage, int miplevel)
         return true;
     }
 
-    if (m_subimage > subimage) {
-        // requested subimage is located before the current one
-        // file needs to be reopened
+    // We're about to overwrite m_spec and the canvas, and possibly to close
+    // the file, so give up the current subimage before anything below can
+    // fail. Every failure then leaves us on no subimage, rather than on one
+    // whose spec and canvas no longer describe what the reader holds.
+    m_subimage = -1;
+    m_spec     = ImageSpec();
+
+    if (m_stream_subimage < 0 || m_stream_subimage > subimage) {
+        // The requested subimage is behind the stream position, or we don't
+        // know where the stream is. giflib only reads forward, so the file
+        // needs to be reopened.
+        m_stream_subimage = -1;
         if (m_gif_file && !close()) {
             return false;
         }
@@ -410,37 +484,39 @@ GIFInput::seek_subimage(int subimage, int miplevel)
             errorfmt("{}", GifErrorString(giflib_error));
             return false;
         }
-        m_subimage = -1;
-        m_canvas.resize(m_gif_file->SWidth * m_gif_file->SHeight * 4);
+        m_stream_subimage = 0;
     }
 
-    // skip subimages preceding the requested one
-    if (m_subimage < subimage) {
-        for (m_subimage += 1; m_subimage < subimage; m_subimage++) {
-            if (!read_subimage_metadata(m_spec) || !read_subimage_data()) {
-                return false;
-            }
+    // Reading forward through the stream from here invalidates the position
+    // we recorded, so forget it too: a failure partway then makes the next
+    // seek reopen the file rather than trust a half-read stream.
+    int pos           = m_stream_subimage;
+    m_stream_subimage = -1;
+
+    // skip subimages preceding the requested one. Every failure from here
+    // on clears m_spec: read_subimage_header() parses into it before the
+    // limit checks, so a refused frame must not be left for spec() to
+    // report or for read_scanline() to size its buffer from.
+    for (; pos < subimage; ++pos) {
+        if (!read_subimage_header(m_spec) || !read_subimage_data(pos)) {
+            m_spec = ImageSpec();
+            return false;
         }
     }
 
-    // read metadata of current subimage
-    if (!read_subimage_metadata(m_spec)) {
+    if (!read_subimage_header(m_spec)) {
+        m_spec = ImageSpec();
         return false;
     }
-
-    m_spec.width       = m_gif_file->SWidth;
-    m_spec.height      = m_gif_file->SHeight;
-    m_spec.depth       = 1;
-    m_spec.full_height = m_spec.height;
-    m_spec.full_width  = m_spec.width;
-    m_spec.full_depth  = m_spec.depth;
-
-    m_subimage = subimage;
 
     // draw subimage on canvas
-    if (!read_subimage_data()) {
+    if (!read_subimage_data(subimage)) {
+        m_spec = ImageSpec();
         return false;
     }
+
+    m_subimage        = subimage;
+    m_stream_subimage = subimage + 1;
 
     return true;
 }
@@ -452,7 +528,8 @@ GIFInput::report_last_error(void)
 {
     // GIFLIB_MAJOR >= 5 looks properly thread-safe, in that the error is
     // guaranteed to be specific to this open file.
-    errorfmt("{}", GifErrorString(m_gif_file->Error));
+    const char* err = GifErrorString(m_gif_file->Error);
+    errorfmt("{}", (err && err[0]) ? err : "unknown error");
 }
 
 

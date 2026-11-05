@@ -12,10 +12,8 @@ namespace PyOpenImageIO {
 
 // Declare the OIIO ColorConfig class to Python
 void
-declare_colorconfig(py::module& m)
+declare_colorconfig(py_module& m)
 {
-    using namespace pybind11::literals;
-
     py::class_<ColorConfig>(m, "ColorConfig")
 
         .def(py::init<>())
@@ -124,6 +122,24 @@ declare_colorconfig(py::module& m)
                  return self.getNamedTransformAliases(named_transform);
              })
         .def(
+            "isColorSpaceLinear",
+            [](const ColorConfig& self, const std::string& name) {
+                return self.isColorSpaceLinear(name);
+            },
+            "name"_a)
+        .def(
+            "isData",
+            [](const ColorConfig& self, const std::string& name) {
+                return self.isData(name);
+            },
+            "name"_a)
+        .def(
+            "isColorSpaceActive",
+            [](const ColorConfig& self, const std::string& name) {
+                return self.isColorSpaceActive(name);
+            },
+            "name"_a)
+        .def(
             "getColorSpaceFromFilepath",
             [](const ColorConfig& self, const std::string& filepath) {
                 return std::string(self.getColorSpaceFromFilepath(filepath));
@@ -179,10 +195,31 @@ declare_colorconfig(py::module& m)
                  }
                  return std::nullopt;
              })
+        .def(
+            "get_chromaticities",
+            [](const ColorConfig& self, const std::string& colorspace)
+                -> std::optional<std::array<float, 8>> {
+                cspan<float> xy = self.get_chromaticities(colorspace);
+                if (xy.empty())
+                    return std::nullopt;
+                std::array<float, 8> result;
+                std::copy(xy.begin(), xy.end(), result.begin());
+                return result;
+            },
+            "colorspace"_a)
+        .def(
+            "get_transfer_function_gamma",
+            [](const ColorConfig& self, const std::string& colorspace) {
+                return self.get_transfer_function_gamma(colorspace);
+            },
+            "colorspace"_a)
         .def("configname", &ColorConfig::configname)
-        .def_static("default_colorconfig", []() -> const ColorConfig& {
-            return ColorConfig::default_colorconfig();
-        });
+        .def_static(
+            "default_colorconfig",
+            []() -> const ColorConfig& {
+                return ColorConfig::default_colorconfig();
+            },
+            oiio_py::ref);
 
     m.attr("supportsOpenColorIO")     = ColorConfig::supportsOpenColorIO();
     m.attr("OpenColorIO_version_hex") = ColorConfig::OpenColorIO_version_hex();

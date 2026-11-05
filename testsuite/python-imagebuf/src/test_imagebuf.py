@@ -222,6 +222,14 @@ def test_outofrange_subimage_miplevel() :
         print(" ", f, "subimage 0 mip 1:", ok, buf.geterror())
 
 
+# Test for the number of MIP levels.
+def test_nmiplevels():
+    print("\nTesting the number of miplevels")
+    for f in ["../common/bayer.png", "../common/grid-small.exr",
+              "../common/textures/grid.tx", "../common/tahoe-tiny.tif"]:
+        buf = oiio.ImageBuf(f, 0, 0)
+        print(" ", f, "nmiplevels:", buf.nmiplevels)
+
 
 ######################################################################
 # main test starts here
@@ -234,6 +242,15 @@ try:
     print ("Resetting to be a writable 640x480,3 Float:")
     b.reset (oiio.ImageSpec(640,480,3,oiio.FLOAT))
     print_imagespec (b.spec())
+
+    # Cover ImageBuf(spec, zero) placement-new constructor (both backends).
+    print ("Constructing with ImageBuf(spec, zero):")
+    b = oiio.ImageBuf(oiio.ImageSpec(2, 2, 3, oiio.FLOAT), True)
+    print ("  zero=True pixel (0,0):", ftupstr(b.getpixel(0, 0)))
+    b = oiio.ImageBuf(oiio.ImageSpec(2, 2, 3, oiio.FLOAT), False)
+    b.setpixel(0, 0, (0.25, 0.5, 0.75))
+    print ("  zero=False then setpixel (0,0):", ftupstr(b.getpixel(0, 0)))
+    print ("")
 
     print ("Constructing from a bare numpy array:")
     b = oiio.ImageBuf(numpy.array([[[0.1,0.0,0.9,1.0], [0.2,0.0,0.7,1.0]],
@@ -256,6 +273,12 @@ try:
                                    [[0.5,0.0,0.7,1.0], [0.6,0.0,0.5,1.0]]]], dtype="f"))
     print (" from 4D, shape is", b.spec().format, b.roi)
     print ("")
+
+    # Regression test: 0-d numpy arrays must not crash ImageBuf construction.
+    # Without the ndim > 0 guard, strides[ndim - 1] was out-of-bounds UB.
+    b = oiio.ImageBuf(numpy.array(1.0, dtype="f"))
+    print (" from 0-d array has_error:", b.has_error)
+    b.geterror()  # clear pending error so destruction is quiet
 
     # Test reading from disk
     print ("Testing read of ../common/textures/grid.tx:")
@@ -334,6 +357,7 @@ try:
     test_copy_metadata ()
     test_repr_png ()
     test_outofrange_subimage_miplevel ()
+    test_nmiplevels()
 
     print ("\nDone.")
 except Exception as detail:

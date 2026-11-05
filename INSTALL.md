@@ -14,79 +14,83 @@ NEW or CHANGED MINIMUM dependencies since the last major release are **bold**.
 
 ### Required dependencies -- OIIO will not build at all without these
 
- * C++17 or higher (also builds with C++20 and C++23)
+ * C++17 or higher (also builds with C++20, C++23, and C++26)
      * The default build mode is C++17. This can be controlled by via the
        CMake configuration flag: `-DCMAKE_CXX_STANDARD=20`, etc.
- * Compilers: gcc 9.3 - 15.2, clang 10 - 22, MSVS 2017 - 2026 (v19.14
+     * Note that no matter which version you compile with internally,
+       OIIO's public APIs only require C++17 features.
+ * Compilers: gcc 9.3 - 16, clang 10 - 22, MSVS 2017 - 2026 (v19.14
    and up), Intel OneAPI C++ compiler 2022+.
- * CMake >= 3.18.2 (tested through 4.3)
+ * CMake >= 3.23.0 (tested through 4.4)
  * Imath >= 3.1 (tested through 3.2 and main)
- * OpenEXR >= 3.1 (tested through 3.4 and main)
- * libTIFF >= 4.0 (tested through 4.7 and master)
- * OpenColorIO >= 2.3 (tested through 2.5 and main)
- * libjpeg >= 8 (tested through jpeg9e), or libjpeg-turbo >= 2.1 (tested
-   through 3.1)
+ * OpenEXR >= 3.1 (tested through 3.5 and main)
+ * libTIFF >= 4.1 (tested through 4.7 and master)
+ * OpenColorIO >= 2.3 (tested through 2.6 and main)
+ * libjpeg >= 9 (tested through jpeg-10), or libjpeg-turbo >= 2.1 (tested
+   through 3.2 and main)
  * zlib >= 1.2.7 (tested through 1.3.2)
- * **[fmtlib](https://github.com/fmtlib/fmt) >= 9.0** (tested through 12.1 and master).
+ * [fmtlib](https://github.com/fmtlib/fmt) >= 9.0 (tested through 12.2 and master).
    If not found at build time, this will be automatically downloaded and built.
- * [Robin-map](https://github.com/Tessil/robin-map) (unknown minimum, tested
-   through 1.4, which is the recommended version). If not found at build time,
-   this will be automatically downloaded and built.
+ * [Robin-map](https://github.com/Tessil/robin-map) >= 1.3 (tested through
+   1.4, which is the recommended version). If not found at build time, this
+   will be automatically downloaded and built.
 
 ### Optional dependencies -- features may be disabled if not found
  * If you are building the `iv` viewer (which will be disabled if any of
    these are not found):
-     * Qt5 >= 5.6 (tested through 5.15) or Qt6 (tested through 6.11)
+     * Qt5 >= 5.6 (tested through 5.15) or Qt6 (tested through 6.12)
      * OpenGL
  * If you are building the Python bindings or running the testsuite:
-     * Python >= 3.9 (tested through 3.13).
-     * pybind11 >= 2.7 (tested through 3.0)
-     * NumPy (tested through 2.4.4)
-     * If you enable the optional nanobind (WIP) backend for source/CMake
-       builds (`OIIO_PYTHON_BINDINGS_BACKEND` is `nanobind` or `both`):
-         * nanobind discoverable by CMake, or installed in the active Python
-           environment so `python -m nanobind --cmake_dir` works
+     * Python >= 3.9 (tested through 3.14).
+     * [nanobind](https://github.com/wjakob/nanobind) >= 2.8 (tested through 3.1 and master),
+       if you are building with `OIIO_PYTHON_BINDINGS_BACKEND` set to either
+       `nanobind` or `both`.  If not found at build time, nanobind will be
+       automatically downloaded and built.
+     * [pybind11](https://github.com/pybind/pybind11) >= 2.7 (tested through
+       3.1 and master), if you are building with `OIIO_PYTHON_BINDINGS_BACKEND` set to
+       either `pybind11` or `both`.
+     * NumPy (tested through 2.5.4)
  * If you want support for PNG files:
-     * libPNG >= 1.6.0 (tested though 1.6.56)
+     * libPNG >= 1.6.0 (tested though 1.6.59 and master)
  * If you want support for camera "RAW" formats:
-     * LibRaw >= 0.20 (tested though 0.22.0 and master)
+     * LibRaw >= 0.21.0 (tested though 0.22.2 and master; minimum of 0.21.3 recommended for security reasons)
  * If you want support for a wide variety of video formats:
-     * ffmpeg >= 4.0 (tested through 8.1)
+     * ffmpeg >= 4.0 (tested through 9.0)
  * If you want support for jpeg 2000 images:
-     * OpenJpeg >= 2.0 (tested through 2.5.4; we recommend 2.4 or higher
+     * OpenJpeg >= 2.0 (tested through 2.5.4 and master; we recommend 2.4 or higher
        for multithreading support)
  * If you want support for OpenVDB files:
-     * OpenVDB >= 9.0 (tested through 13.0).
+     * OpenVDB >= 9.0 (tested through 13.1).
  * If you want to use TBB as the thread pool:
-     * TBB >= 2018 (tested through 2021 and OneTBB)
+     * TBB >= 2018 (tested through 2021 and OneTBB 2023.1)
  * If you want support for converting to and from OpenCV data structures,
    or for capturing images from a camera:
-     * OpenCV 4.x (tested through 4.13)
+     * OpenCV 4.x or 5.x (tested through 5.0)
  * If you want support for GIF images:
-     * giflib >= 5.0 (tested through 6.1.2)
+     * giflib >= 5.0 (tested through 6.1.3)
  * If you want support for HEIF/HEIC or AVIF images:
      * libheif >= 1.11 (1.16 required for correct orientation support and
-       1.17 required for monochrome HEIC support; tested through 1.21.2)
+       1.17 required for monochrome HEIC support; tested through 1.23.6)
      * libheif must be built with an AV1 encoder/decoder for AVIF support.
  * If you want support for DICOM medical image files:
-     * DCMTK >= 3.6.1 (tested through 3.7.0)
+     * DCMTK >= 3.6.2 (tested through 3.7.0)
  * If you want support for WebP images:
-     * WebP >= 1.1 (tested through 1.6)
+     * WebP >= 1.1 (tested through 1.6 and main)
  * If you want support for Ptex:
-     * Ptex >= 2.3.1 (probably works for older; tested through 2.5)
+     * Ptex >= 2.3.1 (probably works for older; tested through 2.5 and main)
  * If you want to be able to do font rendering into images:
-     * Freetype >= 2.10.0 (tested through 2.14)
+     * Freetype >= 2.10.0 (tested through 2.15 and master)
  * If you want to be able to read "ultra-HDR" embedded in JPEG files:
-     * libultrahdr >= 1.3 (tested through 1.4)
+     * libultrahdr >= 1.3 (tested through 2.0.2 and main)
  * If you want support for JPEG XL images:
-     * libjxl >= 0.10.1 (tested through 0.11.2)
+     * libjxl >= 0.10.1 (tested through 0.12.0)
  * If you want support for j2c files:
-     * OpenJPH >= 0.21.2 (tested through 0.26)
+     * OpenJPH >= 0.21.2 (tested through 0.32)
  * We use PugiXML for XML parsing. There is a version embedded in the OIIO
    tree, but if you want to use an external, system-installed version (as
    may be required by some software distributions with policies against
    embedding other projects), then just build with `-DUSE_EXTERNAL_PUGIXML=1`.
-   Any PugiXML >= 1.8 should be fine (we have tested through 1.15).
+   Any PugiXML >= 1.11 should be fine (we have tested through 1.16 and master).
 
 
 
@@ -116,7 +120,7 @@ build options), maybe one of these packages managers will do it for you:
 
 * vcpkg (https://github.com/Microsoft/vcpkg)
     * https://github.com/Microsoft/vcpkg/tree/master/ports/openimageio
-    * `vcpkg install openimageio [tools]`
+    * `vcpkg install openimageio[tools]`
     * For a full list of supported build features: `vcpkg search openimageio`
     * Instructions for building a Python wheel on Windows: 
       https://github.com/Correct-Syntax/py-oiio
@@ -161,11 +165,9 @@ Make wrapper (`make PkgName_ROOT=...`).
 
 `USE_PYTHON=0` : Omits building the Python bindings.
 
-`OIIO_PYTHON_BINDINGS_BACKEND=pybind11|nanobind|both` : Select which Python
-binding backend(s) to configure for source/CMake builds. `both` keeps the
-existing pybind11 module and also builds the nanobind (WIP) module. The
-Python packaging path driven by `pyproject.toml` still targets the production
-pybind11 bindings today.
+`OIIO_PYTHON_BINDINGS_BACKEND=nanobind|pybind11|both` : Select which Python
+binding backend(s) to configure for source/CMake builds.  The Python packaging
+path driven by `pyproject.toml` targets the nanobind bindings.
 
 `OIIO_BUILD_TESTS=0` : Omits building tests (you probably don't need them
 unless you are a developer of OIIO or want to verify that your build
@@ -187,6 +189,44 @@ FFmpeg, OpenVDB, Webp, etc.) -- even if the dependency is found on the
 system. This will obviously disable any functionality that requires the
 dependency. This works both as a CMake variable and
 also as an environment variable.
+
+**Selecting the SIMD instruction set**
+
+`USE_SIMD=...` : A comma-separated list of the ISA features to generate code
+for, for example `USE_SIMD=avx2,f16c`. It works as a CMake variable, an
+environment variable, or a Make wrapper setting (`make USE_SIMD=avx2,f16c`).
+
+**The default** is `x86-64-v2` on x86_64 (SSE4.2 + POPCNT + CMPXCHG16B; every
+x86-64 CPU since ~2009) and empty elsewhere (the compiler's own default,
+which already includes NEON on ARMv8-A). Most people want the default. Set
+`USE_SIMD=0` to disable SIMD, `sse2` to run on pre-2009 x86_64, or a higher
+level if you know your target hardware:
+
+| value | needs a CPU from | adds over the default |
+|-------|------------------|-----------------------|
+| `x86-64-v3` | ~2013 (Haswell / Zen) | AVX, AVX2, FMA, F16C, BMI, BMI2, LZCNT, MOVBE |
+| `x86-64-v4` | ~2017 (Skylake-X / Zen 4) | everything in `x86-64-v3`, plus AVX-512 (F, BW, CD, DQ, VL) |
+
+Each `x86-64-vN` is shorthand for a fixed set of feature tokens, and also
+passes `-march=x86-64-vN` when the compiler supports it. Because no CPU ships
+one of these features without the rest of its level, a bare `avx` is promoted
+to `x86-64-v2` and `avx2` to `x86-64-v3`, so you can't accidentally
+under-specify. (`avx512*` promotes only to `x86-64-v3`; AVX-512 CPUs vary in
+which subsets they carry, so request `x86-64-v4` explicitly if you want it.)
+
+Individual tokens are also accepted: `sse2`, `sse3`, `ssse3`, `sse4.1`,
+`sse4.2`, `popcnt`, `cx16`, `avx`, `avx2`, `avx512f` (and other `avx512*`),
+`f16c`, `fma`, `bmi`, `bmi2`, `lzcnt`, `movbe`, `aes`; on ARM, `neon`, an
+arch name like `armv8.2-a+fp16`, or a CPU name like `apple-m1`. Tokens for
+the wrong CPU family are ignored, so passing `avx2,f16c` on an ARM machine is
+harmless rather than fatal.
+
+Beware that the resulting binaries will not run on a CPU that lacks the
+instructions you asked for. Also note that this only controls how OIIO itself
+is compiled. Because `simd.h` is a public header and gcc/clang only make the
+SSE4/AVX intrinsics available when the corresponding `-m` flag is present,
+downstream code that includes `simd.h` gets the SSE4 code paths only if it is
+compiled with `-msse4.2` (or better) itself.
 
 
 
@@ -257,7 +297,7 @@ Additionally, a few helpful modifiers alter some build-time options:
 | make USE_QT=0 ...             |  Skip anything that needs Qt                                              |
 | make MYCC=xx MYCXX=yy ...     |  Use custom compilers                                                     |
 | make USE_PYTHON=0 ...         |  Don't build the Python binding                                           |
-| make OIIO_PYTHON_BINDINGS_BACKEND=both ... | For source/CMake builds, build the existing pybind11 bindings and the nanobind (WIP) module |
+| make OIIO_PYTHON_BINDINGS_BACKEND=both ... | For source/CMake builds, choosing nanobind (current), pybind11 (legacy) or both modules. |
 | make BUILD_SHARED_LIBS=0      |  Build static library instead of shared                                   |
 | make IGNORE_HOMEBREWED_DEPS=1 |  Ignore homebrew-managed dependencies                                     |
 | make LINKSTATIC=1 ...         |  Link with static external libraries when possible                        |
@@ -300,6 +340,9 @@ areas so CMake will find them, the OpenImageIO build will find those pre-built
 packages and use them. If you don't have them build, or are unsure, the
 `OpenImageIO_BUILD_MISSING_DEPS=all` CMake option will cause the build process
 to download the sources of those dependencies, build them, and use them.
+It also accepts a list of specific packages (comma- or semicolon-separated),
+as does `OpenImageIO_BUILD_LOCAL_DEPS`, which forces local builds of the named
+packages even if they are found on the system.
 
 To build OpenImageIO, you first need to clone the OIIO repository
 and check out the desired branch or tag:
@@ -357,7 +400,8 @@ On the other hand, if you would prefer to open the generated Visual Studio
 solution, the "cmake configure" will have produced
 `{OIIO_ROOT}/build/OpenImageIO.sln` that can be opened in Visual Studio IDE.
 Note that the solution will be only for the Intel x64 architecture only; and
-will only target "min-spec" (SSE2) SIMD instruction set.
+will target the default SIMD level (`x86-64-v2`, i.e. SSE4.2 + POPCNT +
+CMPXCHG16B; see `USE_SIMD` above if you want something else).
 
 Optional packages that OIIO can use (e.g. libpng, Qt) can be build and pointed to OIIO build process in a similar way.
 
@@ -415,25 +459,21 @@ the headers, and the CLI tools to a platform-specific, Python-specific location.
 See the [scikit-build-core docs](https://scikit-build-core.readthedocs.io/en/latest/configuration.html#configuring-cmake-arguments-and-defines)
 for more information on customizing and overriding build-tool options and CMake arguments.
 
-This repo contains python type stubs which are generated from `pybind11` signatures.
-The workflow for releasing new stubs is as follows:
+This repo contains python type stubs which are generated from the `nanobind`
+binding signatures. The workflow for releasing new stubs is as follows:
 
-- Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/) and `docker`
-- Run `make pystubs` locally to generate updated stubs in `src/python/stubs/__init__.pyi`
+- Run `make pystubs` locally to generate updated stubs in
+  `src/python/stubs/OpenImageIO/__init__.pyi`. This runs nanobind's stub
+  generator on the freshly built python module directly from the build tree,
+  so neither `docker` nor `uv` are required. The signature overrides that
+  shape the generated stubs live in the pattern file
+  `src/python/stubs/OpenImageIO_patterns.pyi`.
 - Run `make test-pystubs` locally to use mypy to test the stubs against the code in 
   the python testsuite.
 - Commit the new stubs and push to Github
-- In CI, the stubs will be included in the wheels built by `cibuildwheel`, as defined in `.github/wheel.yml`
-- In CI, one of the `cibuildwheel` Github actions will rebuild the stubs to a 
-  temp location and verify that they match what has been committed to the repo.  
-  This step ensures that if changes to the C++ source code and bindings results 
-  in a change to the stubs, developers are notified of the need to regenerate 
-  the stubs, so that changes can be reviewed and the rules in `generate_stubs.py` 
-  can be updated, if necessary.
 
-Note that if you can't (or don't want to) build the stubs locally, you can 
-download an artifact containing the wheel and `__init__.pyi` file from any job 
-that fails the stub validation.
+Note that the stubs are only generated for the `nanobind` python bindings
+backend; the `pystubs` target is not available for `pybind11` builds.
 
 Test Images
 -----------

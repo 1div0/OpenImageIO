@@ -468,8 +468,7 @@ private:
 class ImageRec {
 public:
     ImageRec(const std::string& name, std::shared_ptr<ImageCache> imagecache)
-        : m_name(name)
-        , m_imagecache(imagecache)
+        : m_name(name), m_imagecache(imagecache)
     {
     }
 
@@ -668,18 +667,15 @@ private:
 // totalsize.  The return value will be true if everything is ok, or false
 // if there is an error(in which case the error message will be stored in
 // `error`).
-bool
-print_info(std::ostream& out, Oiiotool& ot, const std::string& filename,
-           const pvt::print_info_options& opt, std::string& error);
-bool
-print_info(std::ostream& out, Oiiotool& ot, ImageRec* img,
-           const pvt::print_info_options& opt, std::string& error);
+bool print_info(std::ostream& out, Oiiotool& ot, const std::string& filename,
+                const pvt::print_info_options& opt, std::string& error);
+bool print_info(std::ostream& out, Oiiotool& ot, ImageRec* img,
+                const pvt::print_info_options& opt, std::string& error);
 
 // Print the stats into output stream `out`.
-void
-print_stats(std::ostream& out, Oiiotool& ot, const std::string& filename,
-            int subimage = 0, int miplevel = 0, string_view indent = "",
-            ROI roi = {});
+void print_stats(std::ostream& out, Oiiotool& ot, const std::string& filename,
+                 int subimage = 0, int miplevel = 0, string_view indent = "",
+                 ROI roi = {});
 
 
 inline bool
@@ -700,11 +696,10 @@ enum DiffErrors {
     DiffErrLast
 };
 
-bool
-decode_channel_set(const ImageSpec& spec, string_view chanlist,
-                   std::vector<std::string>& newchannelnames,
-                   std::vector<int>& channels, std::vector<float>& values,
-                   ErrorHandler& eh);
+bool decode_channel_set(const ImageSpec& spec, string_view chanlist,
+                        std::vector<std::string>& newchannelnames,
+                        std::vector<int>& channels, std::vector<float>& values,
+                        ErrorHandler& eh);
 
 
 
@@ -743,9 +738,7 @@ public:
     // Enter scope: start the timer if ot.enable_function_timing is
     // true. Remember the Ot and the name of the function we're timing.
     OTScopedTimer(Oiiotool& ot, string_view name)
-        : m_timer(false)
-        , m_ot(ot)
-        , m_name(name)
+        : m_timer(false), m_ot(ot), m_name(name)
     {
         if (m_ot.enable_function_timing)
             start();

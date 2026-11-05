@@ -38,6 +38,8 @@
 
 
 #include <algorithm>
+#include <cstdint>
+
 #include "BaseTypeConverter.h"
 
 
@@ -62,7 +64,7 @@ namespace dpx
 
 	// this function is called when the DataSize is 10 bit and the packing method is kFilledMethodA or kFilledMethodB
 	template<typename BUF, int PADDINGBITS>
-	void Unfill10bitFilled(U32 *readBuf, const int x, BUF *data, int count, int bufoff, const int numberOfComponents)
+	void Unfill10bitFilled(U32 *readBuf, const int x, BUF *data, int count, int64_t bufoff, const int numberOfComponents)
 	{
 		// unpack the words in the buffer
 		BUF *obuf = data + bufoff;
@@ -143,13 +145,13 @@ namespace dpx
 			int actline = line + block.y1;
 
 			// first get line offset
-			long offset = actline * lineLength;
+			int64_t offset = int64_t(actline) * lineLength;
 
 			// add in eoln padding
-			offset += line * eolnPad;
-			
+			offset += int64_t(line) * eolnPad;
+
 			// add in offset within the current line, rounding down so to catch any components within the word
-			offset += block.x1 * numberOfComponents / 3 * 4;
+			offset += int64_t(block.x1) * numberOfComponents / 3 * 4;
 			
 			
 			// get the read count in bytes, round to the 32-bit boundary
@@ -158,9 +160,10 @@ namespace dpx
 			readSize = readSize / 3 * 4;
 			
 			// determine buffer offset
-			int bufoff = line * datums;
+			int64_t bufoff = int64_t(line) * datums;
 	
-			fd->Read(dpxHeader, element, offset, readBuf, readSize);
+			if (!fd->Read(dpxHeader, element, offset, readBuf, readSize))
+				return false;
 	
 			// unpack the words in the buffer
 #if RLE_WORKING			
@@ -170,7 +173,8 @@ namespace dpx
 			BUF *obuf = data + bufoff;
 			int index = (block.x1 * sizeof(U32)) % numberOfComponents;
 
-			for (int count = (block.x2 - block.x1 + 1) * numberOfComponents - 1; count >= 0; count--)
+			const int total = (block.x2 - block.x1 + 1) * numberOfComponents;
+			for (int count = total - 1; count >= 0; count--)
 			{
 				// unpacking the buffer backwards
 				U16 d1 = U16(readBuf[(count + index) / 3] >> ((2 - (count + index) % 3) * 10 + PADDINGBITS) & 0x3ff);
@@ -179,7 +183,10 @@ namespace dpx
 				BaseTypeConverter(d1, obuf[count]);
 
 				// work-around for 1-channel DPX images - to swap the outlying pixels, otherwise the columns are in the wrong order
-				if (numberOfComponents == 1 && count % 3 == 0)
+				// Only when a full group of 3 remains in bounds -- a short trailing
+				// group (when total isn't a multiple of 3) has no third datum to
+				// swap with, and obuf[count + 2] would be out of bounds.
+				if (numberOfComponents == 1 && count % 3 == 0 && count + 2 < total)
 					std::swap(obuf[count], obuf[count + 2]);
 			}
 #endif		
@@ -207,12 +214,12 @@ namespace dpx
 	// 10 bit, packed data
 	// 12 bit, packed data
 	template <typename BUF, U32 MASK, int MULTIPLIER, int REMAIN, int REVERSE>
-	void UnPackPacked(U32 *readBuf, const int bitDepth, BUF *data, int count, int bufoff)
+	void UnPackPacked(U32 *readBuf, const int bitDepth, BUF *data, int64_t count, int64_t bufoff)
 	{
 		// unpack the words in the buffer
 		BUF *obuf = data + bufoff;
 				
-		for (int i = count - 1; i >= 0; i--)
+		for (int64_t i = count - 1; i >= 0; i--)
 		{
 			// unpacking the buffer backwards
 			// find the byte that the data starts in, read in as a 16 bits then shift and mask
@@ -231,10 +238,12 @@ namespace dpx
 			//      the pattern repeats every 96 bits
 			
 			// first determine the word that the data element completely resides in
-			U16 *d1 = reinterpret_cast<U16 *>(reinterpret_cast<U8 *>(readBuf)+((i * bitDepth) / 8 /*bits*/));
-			
-			// place the component in the MSB and mask it for both 10-bit and 12-bit
-			U16 d2 = (*d1 << (REVERSE - ((i % REMAIN) * MULTIPLIER))) & MASK;
+			U8 *d1 = reinterpret_cast<U8 *>(readBuf)+((i * bitDepth) / 8 /*bits*/);
+			U16 d2;
+			memcpy(&d2, d1, sizeof(U16));  // Use memcpy to launder any misalignment
+
+			// place the component in the MSB and mask it for both 10-bit and 12-bit.
+			d2 = (d2 << (REVERSE - ((i % REMAIN) * MULTIPLIER))) & MASK;
 			
 			// For the 10/12 bit cases, specialize the 16-bit conversion by
 			// repacking into the LSB and using a specialized conversion
@@ -270,27 +279,28 @@ namespace dpx
 		const int dataSize = dpxHeader.BitDepth(element);
 
 		// number of bytes 
-		const int lineSize = (dpxHeader.Width() * numberOfComponents * dataSize + 31) / 32;
+		const int64_t lineSize = (int64_t(dpxHeader.Width()) * numberOfComponents * dataSize + 31) / 32;
 
 		// read in each line at a time directly into the user memory space
-		for (int line = 0; line < height; line++)
+		for (int64_t line = 0; line < height; line++)
 		{
 			// determine offset into image element
-			long offset = (line + block.y1) * (lineSize * sizeof(U32)) +
-						(block.x1 * numberOfComponents * dataSize / 32 * sizeof(U32)) + (line * eolnPad);
+			int64_t offset = (line + block.y1) * (lineSize * sizeof(U32)) +
+						(int64_t(block.x1) * numberOfComponents * dataSize / 32 * sizeof(U32)) + line * eolnPad;
 	
 			// calculate read size
-			int readSize = ((block.x2 - block.x1 + 1) * numberOfComponents * dataSize);
-			readSize += (block.x1 * numberOfComponents * dataSize % 32);			// add the bits left over from the beginning of the line
+			int64_t readSize = (int64_t(block.x2 - block.x1 + 1) * numberOfComponents * dataSize);
+			readSize += (int64_t(block.x1) * numberOfComponents * dataSize % 32);			// add the bits left over from the beginning of the line
 			readSize = ((readSize + 31) / 32) * sizeof(U32);
 
 			// calculate buffer offset
-			int bufoff = line * dpxHeader.Width() * numberOfComponents;
-	
-			fd->Read(dpxHeader, element, offset, readBuf, readSize);
+			int64_t bufoff = int64_t(line) * dpxHeader.Width() * numberOfComponents;
+
+			if (!fd->Read(dpxHeader, element, offset, readBuf, readSize))
+				return false;
 
 			// unpack the words in the buffer
-			int count = (block.x2 - block.x1 + 1) * numberOfComponents;
+			int64_t count = int64_t(block.x2 - block.x1 + 1) * numberOfComponents;
 			UnPackPacked<BUF, MASK, MULTIPLIER, REMAIN, REVERSE>(readBuf, dataSize, data, count, bufoff);
 		}
 
@@ -338,20 +348,22 @@ namespace dpx
 		{
 			
 			// determine offset into image element
-			long offset = (line + block.y1) * imageWidth * numberOfComponents * bytes +
-						block.x1 * numberOfComponents * bytes + (line * eolnPad);
+			int64_t offset = int64_t(line + block.y1) * imageWidth * numberOfComponents * bytes +
+						int64_t(block.x1) * numberOfComponents * bytes + int64_t(line) * eolnPad;
 						
 			if (BUFTYPE == SRCTYPE)
 			{
-				fd->ReadDirect(dpxHeader, element, offset, reinterpret_cast<unsigned char *>(data + (width*line)), width*bytes);
+				if (!fd->ReadDirect(dpxHeader, element, offset, reinterpret_cast<unsigned char *>(data + int64_t(width)*line), int64_t(width)*bytes))
+					return false;
 			}
 			else
 			{
-				fd->Read(dpxHeader, element, offset, readBuf, width*bytes);
-							
-				// convert data		
+				if (!fd->Read(dpxHeader, element, offset, readBuf, int64_t(width)*bytes))
+					return false;
+
+				// convert data
 				for (int i = 0; i < width; i++)
-					BaseTypeConverter(readBuf[i], data[width*line+i]);
+					BaseTypeConverter(readBuf[i], data[int64_t(width)*line+i]);
 			}
 	
 		}
@@ -382,17 +394,18 @@ namespace dpx
 		for (int line = 0; line < height; line++)
 		{
 			// determine offset into image element
-			long offset = (line + block.y1) * imageWidth * numberOfComponents * 2 +
-						block.x1 * numberOfComponents * 2 + (line * eolnPad);
+			int64_t offset = int64_t(line + block.y1) * imageWidth * numberOfComponents * 2 +
+						int64_t(block.x1) * numberOfComponents * 2 + int64_t(line) * eolnPad;
 	
-			fd->Read(dpxHeader, element, offset, readBuf, width*2);
-				
-			// convert data		
+			if (!fd->Read(dpxHeader, element, offset, readBuf, int64_t(width)*2))
+				return false;
+
+			// convert data
 			for (int i = 0; i < width; i++)
 			{
 				U16 d1 = readBuf[i];
 				BaseTypeConvertU12ToU16(d1, d1);
-				BaseTypeConverter(d1, data[width*line+i]);
+				BaseTypeConverter(d1, data[int64_t(width)*line+i]);
 			}
 		}
 
@@ -528,7 +541,7 @@ namespace dpx
 			{
 				for (nc = 0; nc < numberOfComponents; nc++)
 				{
-					SRC d1 = src[(y * width * numberOfComponents) + (x * numberOfComponents) + nc];
+					SRC d1 = src[int64_t(y) * width * numberOfComponents + int64_t(x) * numberOfComponents + nc];
 					BaseTypeConverter(d1, dst[dstoff+((x-block.x1)*numberOfComponents) + nc]);
 				}	
 			}

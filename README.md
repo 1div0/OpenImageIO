@@ -88,7 +88,7 @@ licenses](THIRD-PARTY.md).
 The OpenImageIO project is part of the [Academy Software
 Foundation](https://www.aswf.io/), a part of the Linux Foundation formed in
 collaboration with the Academy of Motion Picture Arts and Sciences. The
-[Technical Charter](aswf/Technical-Charter.md) and [Project
+[technical charter](https://github.com/AcademySoftwareFoundation/foundation/blob/main/project_charters/openimageio_charter.pdf) and [Project
 Governance](GOVERNANCE.md) explain how the project is run, who makes
 decisions, etc. Please be aware of our [Code of Conduct](CODE_OF_CONDUCT.md).
 
@@ -105,6 +105,7 @@ Additional resources:
 
 - [User quick start](docs/QuickStart.md) is a quick example of using
   OpenImageIO in Python, C++, and the command line.
+- [Releases](https://github.com/AcademySoftwareFoundation/OpenImageIO/releases) -- see this for the latest release notes, also found in the [CHANGES.md](CHANGES.md) file.
 
 
 👷 Building and installing OpenImageIO
@@ -133,8 +134,8 @@ be discussed publicly until a patch is ready, please file a GitHub [security
 advisory](https://github.com/AcademySoftwareFoundation/OpenImageIO/security/advisories/new).
 
 If confidentiality precludes a public question or issue, you may contact us
-privately at [info@openimageio.org](info@openimageio.org), or for
-security-related issues [security@openimageio.org](security@openimageio.org).
+privately at [info@openimageio.org](mailto:info@openimageio.org), or for
+security-related issues [security@openimageio.org](mailto:security@openimageio.org).
 
 
 🔧 Contributing and developer documentation
@@ -151,8 +152,7 @@ pull request (PR) mechanism.
 * [AI Policy](docs/dev/AI_Policy.md) decribes our policies on AI coding
   assistance tools.
 * [ROADMAP](docs/ROADMAP.md) is a high-level overview of the current
-  development priorities for the next annual release, expected in September,
-  2024.
+  development priorities for the next annual release.
 * [RELEASING](docs/dev/RELEASING.md) explains our policies and procedures for
   making releases. We have a major, possibly-compatibility-breaking, release
   annually in September/October, and minor bug fix and safe feature addition

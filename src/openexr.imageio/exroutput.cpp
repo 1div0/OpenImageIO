@@ -76,8 +76,7 @@ OIIO_PLUGIN_NAMESPACE_BEGIN
 class OpenEXROutputStream final : public Imf::OStream {
 public:
     OpenEXROutputStream(const char* filename, Filesystem::IOProxy* io)
-        : Imf::OStream(filename)
-        , m_io(io)
+        : Imf::OStream(filename), m_io(io)
     {
         if (!io || io->mode() != Filesystem::IOProxy::Write)
             throw Iex::IoExc("File output failed.");
@@ -97,6 +96,63 @@ public:
 private:
     Filesystem::IOProxy* m_io = nullptr;
 };
+
+
+
+// OpenJPH before 0.27 lazily initializes its block encoder tables without
+// any synchronization, and both encoding and decoding run that setup
+// (zeroing the tables before filling them). When OpenEXR compresses or
+// decompresses several HTJ2K chunks in parallel, the first operations in
+// the process can race and write corrupt data. Encode one tiny single-chunk
+// image, on one thread, before any real HTJ2K I/O so the initialization is
+// complete before it matters. OpenEXR records the OpenJPH version it was
+// built against, so skip this entirely when that is new enough.
+#if defined(IMF_HTJ2K256_COMPRESSION)                      \
+    && (OPENEXR_OPENJPH_VERSION_MAJOR + 0) * 10000         \
+               + (OPENEXR_OPENJPH_VERSION_MINOR + 0) * 100 \
+           < 2700
+#    define OIIO_EXR_PRIME_HTJ2K 1
+#endif
+
+namespace pvt {
+
+void
+prime_htj2k_if_needed(int compression)
+{
+#ifdef OIIO_EXR_PRIME_HTJ2K
+    if (compression != Imf::HTJ2K256_COMPRESSION
+#    ifdef IMF_HTJ2K32_COMPRESSION
+        && compression != Imf::HTJ2K32_COMPRESSION
+#    endif
+#    ifdef IMF_LJ2K_COMPRESSION
+        && compression != Imf::LJ2K_COMPRESSION
+#    endif
+    )
+        return;
+    static std::once_flag primed;
+    std::call_once(primed, []() {
+        try {
+            Filesystem::IOVecOutput io;
+            OpenEXROutputStream stream("htj2k-prime", &io);
+            Imf::Header header(8, 8);
+            header.compression() = Imf::HTJ2K256_COMPRESSION;
+            header.channels().insert("Y", Imf::Channel(Imf::HALF));
+            half pixels[8 * 8] = {};
+            Imf::FrameBuffer fb;
+            fb.insert("Y", Imf::Slice(Imf::HALF, (char*)pixels, sizeof(half),
+                                      8 * sizeof(half)));
+            Imf::OutputFile out(stream, header, 0 /* no threads */);
+            out.setFrameBuffer(fb);
+            out.writePixels(8);
+        } catch (...) {
+        }
+    });
+#else
+    (void)compression;
+#endif
+}
+
+}  // namespace pvt
 
 
 
@@ -187,6 +243,9 @@ private:
     // spec a bit.
     bool spec_to_header(ImageSpec& spec, int subimage, Imf::Header& header);
 
+    // Validate color interop IDs if openexr:ColorInteropIDPolicy is set.
+    bool validate_color_interop_ids();
+
     // Compute an OpenEXR PixelType from an OIIO TypeDesc
     Imf::PixelType imfpixeltype(TypeDesc type);
 
@@ -207,11 +266,10 @@ private:
 
     bool copy_and_check_spec(const ImageSpec& srcspec, ImageSpec& dstspec)
     {
-        // Arbitrarily limit res to 1M x 1M and 4k channels, assuming anything
-        // beyond that is more likely to be a mistake than a legit request. We
-        // may have to come back to this if these assumptions are wrong.
+        // Limit channels to 4k; actual per-dimension resolution limits are
+        // enforced separately via the "limits:resolution" attribute.
         if (!check_open(Create, srcspec,
-                        { 0, 1 << 20, 0, 1 << 20, 0, 1, 0, 1 << 12 }))
+                        { 0, 1 << 30, 0, 1 << 30, 0, 1, 0, 1 << 12 }))
             return false;
         if (&dstspec != &m_spec)
             dstspec = m_spec;
@@ -425,10 +483,10 @@ is_aces_container_compliant(const OIIO::ImageSpec& spec, std::string& reason)
 
     // Check chromaticities
     float chromaticities[8] = { 0., 0., 0., 0., 0., 0., 0., 0. };
-    bool chroms_found
-        = spec.getattribute("chromaticities",
-                            OIIO::TypeDesc(OIIO::TypeDesc::FLOAT, 8),
-                            chromaticities);
+    bool chroms_found = spec.getattribute("chromaticities",
+                                          OIIO::TypeDesc(OIIO::TypeDesc::FLOAT,
+                                                         8),
+                                          chromaticities);
     bool chroms_equal = std::equal(std::begin(chromaticities),
                                    std::end(chromaticities),
                                    std::begin(ACES_AP0_chromaticities));
@@ -594,6 +652,7 @@ OpenEXROutput::open(const std::string& name, const ImageSpec& userspec,
                          e.size() ? e : std::string("unknown error"));
                 return false;
             }
+            pvt::prime_htj2k_if_needed(m_headers[m_subimage].compression());
             m_output_stream.reset(new OpenEXROutputStream(name.c_str(), m_io));
             if (m_spec.tile_width) {
                 m_output_tiled.reset(
@@ -711,6 +770,51 @@ OpenEXROutput::open(const std::string& name, const ImageSpec& userspec,
 }
 
 
+bool
+OpenEXROutput::validate_color_interop_ids()
+{
+    string_view policy = m_subimagespecs[0].get_string_attribute(
+        "openexr:ColorInteropIDPolicy", "none");
+    if (policy == "none")
+        return true;
+
+    if (policy != "strict") {
+        errorfmt("Unknown openexr:ColorInteropIDPolicy \"{}\"", policy);
+        return false;
+    }
+
+    // Follow the color interop forum recommendation, where the colorInteropID
+    // of later parts must match the first part, except when "data" or missing.
+    //
+    // In the future, checkColorMetadata added in OpenEXR 3.5 can replace this.
+    string_view file_interop_id;
+
+    for (size_t s = 0; s < m_headers.size(); ++s) {
+        const Imf::StringAttribute* attr
+            = m_headers[s].findTypedAttribute<Imf::StringAttribute>(
+                "colorInteropID");
+        string_view interop_id = attr ? string_view(attr->value())
+                                      : string_view();
+
+        if (s == 0) {
+            file_interop_id = interop_id;
+            continue;
+        }
+
+        if (interop_id.empty() || interop_id == "data"
+            || interop_id == file_interop_id)
+            continue;
+
+        errorfmt(
+            "OpenEXR subimage {} has color space \"{}\", different from \"{}\" in the first subimage",
+            s, interop_id, file_interop_id);
+        return false;
+    }
+
+    return true;
+}
+
+
 
 bool
 OpenEXROutput::open(const std::string& name, int subimages,
@@ -759,6 +863,9 @@ OpenEXROutput::open(const std::string& name, int subimages,
         }
     }
 
+    if (!validate_color_interop_ids())
+        return false;
+
     m_spec = m_subimagespecs[0];
     sanity_check_channelnames();
     compute_pixeltypes(m_spec);
@@ -777,6 +884,8 @@ OpenEXROutput::open(const std::string& name, int subimages,
                      e.size() ? e : std::string("unknown error"));
             return false;
         }
+        for (int s = 0; s < subimages; ++s)
+            pvt::prime_htj2k_if_needed(m_headers[s].compression());
         m_output_stream.reset(new OpenEXROutputStream(name.c_str(), m_io));
         m_output_multipart.reset(new Imf::MultiPartOutputFile(*m_output_stream,
                                                               &m_headers[0],
@@ -866,14 +975,28 @@ bool
 OpenEXROutput::spec_to_header(ImageSpec& spec, int subimage,
                               Imf::Header& header)
 {
-    // Force use of one of the three data types that OpenEXR supports
-    switch (spec.format.basetype) {
-    case TypeDesc::UINT: spec.format = TypeDesc::UINT; break;
-    case TypeDesc::FLOAT:
-    case TypeDesc::DOUBLE: spec.format = TypeDesc::FLOAT; break;
-    default:
-        // Everything else defaults to half
-        spec.format = TypeDesc::HALF;
+    // OpenEXR only stores three data types (half, float, uint); map anything
+    // else onto them. Do this for the overall format and, so the spec stays
+    // consistent with what is actually stored, for any per-channel formats.
+    auto exr_stored_format = [](TypeDesc t) -> TypeDesc {
+        switch (t.basetype) {
+        case TypeDesc::UINT: return TypeDesc::UINT;
+        case TypeDesc::FLOAT:
+        case TypeDesc::DOUBLE: return TypeDesc::FLOAT;
+        default: return TypeDesc::HALF;  // everything else defaults to half
+        }
+    };
+    spec.format = exr_stored_format(spec.format);
+    if (spec.channelformats.size() == size_t(spec.nchannels)) {
+        bool allsame = true;
+        for (int c = 0; c < spec.nchannels; ++c) {
+            spec.channelformats[c] = exr_stored_format(spec.channelformats[c]);
+            allsame &= (spec.channelformats[c] == spec.channelformats[0]);
+        }
+        // If every channel ended up the same, the per-channel list is
+        // redundant -- drop it so the spec advertises a single format.
+        if (allsame)
+            spec.channelformats.clear();
     }
 
     Imath::Box2i dataWindow(Imath::V2i(spec.x, spec.y),
@@ -955,6 +1078,22 @@ OpenEXROutput::spec_to_header(ImageSpec& spec, int subimage,
         spec.erase_attribute("openexr:dwaCompressionLevel");
     }
 
+#if OPENEXR_CODED_VERSION >= 30500
+    // OpenEXR 3.5.0 added the support for LJ2K, the lossy variant of HTJ2K256.
+    // Value from 97 to 150 are OpenEXR specific of the normal range of 1 till
+    // 97. This extended range is available to achieve higher quality needed
+    // for 32-bit float images. Values between 90 and 110 are recommended for
+    // a balance of quality and size.
+    if (Strutil::istarts_with(comp, "lj2k")) {
+        header.lossyHTJ2KQuality() = (qual >= 1 && qual <= 150) ? qual : 110;
+    }
+
+    // OpenEXR 3.5.0 added an API for setting the zstd compression/quality
+    // level in the Header object. Default value is 5.
+    if (Strutil::istarts_with(comp, "zstd")) {
+        header.zstdCompressionLevel() = (qual >= 1 && qual <= 22) ? qual : 5;
+    }
+#endif
     // Default to increasingY line order
     if (!spec.find_attribute("openexr:lineOrder"))
         spec.attribute("openexr:lineOrder", "increasingY");
@@ -1040,6 +1179,19 @@ OpenEXROutput::spec_to_header(ImageSpec& spec, int subimage,
     for (const auto& p : spec.extra_attribs)
         put_parameter(p.name().string(), p.type(), p.data(), header);
 
+    // Now that the header's compression is settled, say how many scanlines
+    // are packed into each of the chunks we are about to write, so that
+    // ImageOutput::write_image can hand us whole chunks. A value carried in
+    // from some other file says nothing about this one, so erase it either
+    // way. This has to come after the loop above -- that is what would have
+    // written it into the file, and this is only a hint to our own caller.
+    spec.erase_attribute("oiio:RowsPerChunk");
+    if (spec.tile_width == 0) {
+        int scansperchunk = exr_scanlines_per_chunk(header.compression());
+        if (scansperchunk > 1)
+            spec.attribute("oiio:RowsPerChunk", scansperchunk);
+    }
+
     // Multi-part EXR files required to have a name. Make one up if not
     // supplied.
     if (m_nsubimages > 1 && !header.hasName()) {
@@ -1102,9 +1254,7 @@ struct ExrMeta {
 
     ExrMeta(const char* oiioname = NULL, const char* exrname = NULL,
             TypeDesc exrtype = TypeDesc::UNKNOWN)
-        : oiioname(oiioname)
-        , exrname(exrname)
-        , exrtype(exrtype)
+        : oiioname(oiioname), exrname(exrname), exrtype(exrtype)
     {
     }
 };
@@ -1132,7 +1282,7 @@ static ExrMeta exr_meta_translation[] = {
     // user or from a file we read.
     ExrMeta("YResolution"), ExrMeta("planarconfig"), ExrMeta("type"),
     ExrMeta("tiles"), ExrMeta("chunkCount"), ExrMeta("maxSamplesPerPixel"),
-    ExrMeta("openexr:roundingmode")
+    ExrMeta("openexr:roundingmode"), ExrMeta("openexr:ColorInteropIDPolicy")
 };
 
 
@@ -1191,6 +1341,14 @@ OpenEXROutput::put_parameter(const std::string& name, TypeDesc type,
 #ifdef IMF_HTJ2K32_COMPRESSION
             else if (Strutil::iequals(str, "htj2k32"))
                 header.compression() = Imf::HTJ2K32_COMPRESSION;
+#endif
+#ifdef IMF_LJ2K_COMPRESSION
+            else if (Strutil::iequals(str, "lj2k"))
+                header.compression() = Imf::LJ2K_COMPRESSION;
+#endif
+#ifdef IMF_ZSTD_COMPRESSION
+            else if (Strutil::iequals(str, "zstd"))
+                header.compression() = Imf::ZSTD_COMPRESSION;
 #endif
         }
         return true;
@@ -1654,7 +1812,7 @@ OpenEXROutput::write_scanline(int y, int z, TypeDesc format, const void* data,
     // image.
     imagesize_t scanlinebytes = m_spec.scanline_bytes(native);
     char* buf                 = (char*)data - ptrdiff_t(m_spec.x * pixel_bytes)
-                - ptrdiff_t(y * scanlinebytes);
+                                - ptrdiff_t(y * scanlinebytes);
 
     try {
         Imf::FrameBuffer frameBuffer;
@@ -1768,15 +1926,15 @@ OpenEXROutput::write_scanlines(int ybegin, int yend, int z, TypeDesc format,
 
     const imagesize_t limit = 16 * 1024
                               * 1024;  // Allocate 16 MB, or 1 scanline
-    int chunk = std::max(1, int(limit / scanlinebytes));
+    int chunk               = std::max(1, int(limit / scanlinebytes));
 
     bool ok                  = true;
     const bool isDecreasingY = m_spec.get_string_attribute("openexr:lineOrder")
                                == "decreasingY";
     const int nAvailableScanLines = yend - ybegin;
-    const int numChunks           = nAvailableScanLines > 0
-                                        ? 1 + ((nAvailableScanLines - 1) / chunk)
-                                        : 0;
+    const int numChunks  = nAvailableScanLines > 0
+                               ? 1 + ((nAvailableScanLines - 1) / chunk)
+                               : 0;
     const int yLoopStart = isDecreasingY ? ybegin + (numChunks - 1) * chunk
                                          : ybegin;
     const int yDelta     = isDecreasingY ? -chunk : chunk;
@@ -2094,9 +2252,9 @@ OpenEXROutput::write_deep_tiles(int xbegin, int xend, int ybegin, int yend,
         int firstxtile = (xbegin - m_spec.x) / m_spec.tile_width;
         int firstytile = (ybegin - m_spec.y) / m_spec.tile_height;
         int xtiles     = round_to_multiple(xend - xbegin, m_spec.tile_width)
-                     / m_spec.tile_width;
-        int ytiles = round_to_multiple(yend - ybegin, m_spec.tile_height)
-                     / m_spec.tile_height;
+                         / m_spec.tile_width;
+        int ytiles     = round_to_multiple(yend - ybegin, m_spec.tile_height)
+                         / m_spec.tile_height;
 
         // Write the pixels
         m_deep_tiled_output_part->writeTiles(firstxtile,

@@ -21,6 +21,9 @@
 // ago and are probably the sole maintainers of this code, and just allow
 // ourselves to diverge from the original.
 
+// DPX is documented in these SMPTE documents: https://pub.smpte.org/doc/268/
+// (now free!)
+
 #include "libdpx/DPX.h"
 #include "libdpx/DPXColorConverter.h"
 #include "libdpx/DPXHeader.h"
@@ -57,9 +60,10 @@ private:
     int m_subimage;
     InStream* m_stream = nullptr;
     dpx::Reader m_dpx;
-    std::vector<unsigned char> m_userBuf;
+    default_init_vector<unsigned char> m_userBuf;
+    default_init_vector<unsigned char> m_decodebuf;  // temporary decode buffer
+    size_t m_filesize = 0;
     bool m_rawcolor;
-    std::vector<unsigned char> m_decodebuf;  // temporary decode buffer
 
     /// Reset everything to initial state
     ///
@@ -137,9 +141,11 @@ DPXInput::open(const std::string& name, ImageSpec& newspec)
     if (!ioproxy_use_or_open(name))
         return false;
 
-    m_stream = new InStream(ioproxy());
+    m_filesize = ioproxy()->size();
+    m_stream   = new InStream(ioproxy());
     if (!m_stream) {
         errorfmt("Could not open file \"{}\"", name);
+        close();
         return false;
     }
 
@@ -179,12 +185,12 @@ DPXInput::seek_subimage(int subimage, int miplevel)
 {
     if (miplevel != 0)
         return false;
-    if (subimage == m_subimage)
-        return true;
+    // Range check before the "already there" early out, so that the -1 we
+    // leave behind on a rejected seek can't satisfy it.
     if (subimage < 0 || subimage >= m_dpx.header.ImageElementCount())
         return false;
-
-    m_subimage = subimage;
+    if (subimage == m_subimage)
+        return true;
 
     // create imagespec
     TypeDesc typedesc;
@@ -205,16 +211,52 @@ DPXInput::seek_subimage(int subimage, int miplevel)
     case dpx::kDouble: typedesc = TypeDesc::DOUBLE; break;
     default: errorfmt("Invalid component data size"); return false;
     }
-    m_spec = ImageSpec(m_dpx.header.Width(), m_dpx.header.Height(),
-                       m_dpx.header.ImageElementComponentCount(subimage),
-                       typedesc);
+    // We're about to overwrite m_spec, so give up the current element first.
+    // Every failure below then leaves us on none, rather than on one whose
+    // spec describes a different element -- the early out above would hand
+    // that spec back on a repeat of this same seek.
+    m_subimage = -1;
+    m_spec     = ImageSpec(m_dpx.header.Width(), m_dpx.header.Height(),
+                           m_dpx.header.ImageElementComponentCount(subimage),
+                           typedesc);
 
     // xOffset/yOffset are defined as unsigned 32-bit integers, but m_spec.x/y are signed
-    // avoid casts that would result in negative values
+    // avoid casts that would result in negative values. Set the origin before
+    // check_open() so it can reject a data window (origin + size) that would
+    // overflow the int scanline coordinates used by the read path.
     if (m_dpx.header.xOffset <= (unsigned int)std::numeric_limits<int>::max())
         m_spec.x = m_dpx.header.xOffset;
     if (m_dpx.header.yOffset <= (unsigned int)std::numeric_limits<int>::max())
         m_spec.y = m_dpx.header.yOffset;
+
+    if (!check_open(m_spec, { 0, 1 << 30, 0, 1 << 30, 0, 1 << 16, 0, 8 })
+        || !check_compression_ratio(m_spec, m_filesize)) {
+        m_spec = ImageSpec();
+        return false;
+    }
+
+    // The libdpx code we use is not really 32 bit overflow safe in its
+    // allocations or offsets when reading and decoding individual scanlines.
+    // We'll never see a DPX file that big anyway, so just consider it an
+    // error rather than track down every possible problem in libdpx.
+    if (m_spec.scanline_bytes()
+        > imagesize_t(std::numeric_limits<int32_t>::max())) {
+        errorfmt("Unsupported DPX with scanlines exceeding {} bytes",
+                 std::numeric_limits<int>::max());
+        m_spec = ImageSpec();
+        return false;
+    }
+
+    // The readers hold end-of-line padding in an int, so a larger value
+    // would go negative and step rows backward through the file.
+    if (m_dpx.header.EndOfLinePadding(subimage)
+        > (unsigned int)std::numeric_limits<int>::max()) {
+        errorfmt("Invalid DPX end-of-line padding {}",
+                 m_dpx.header.EndOfLinePadding(subimage));
+        m_spec = ImageSpec();
+        return false;
+    }
+
     if ((int)m_dpx.header.xOriginalSize > 0)
         m_spec.full_width = m_dpx.header.xOriginalSize;
     if ((int)m_dpx.header.yOriginalSize > 0)
@@ -381,7 +423,7 @@ DPXInput::seek_subimage(int subimage, int miplevel)
     // save some typing by using macros
     // "internal" macros
 #define DPX_SET_ATTRIB_S(x, n, s) m_spec.attribute(s, m_dpx.header.x(n))
-#define DPX_SET_ATTRIB(x, n) DPX_SET_ATTRIB_S(x, n, "dpx:" #x)
+#define DPX_SET_ATTRIB(x, n)      DPX_SET_ATTRIB_S(x, n, "dpx:" #x)
     // set without checking for bogus attributes
 #define DPX_SET_ATTRIB_N(x) DPX_SET_ATTRIB(x, subimage)
     // set with checking for bogus attributes
@@ -545,12 +587,30 @@ DPXInput::seek_subimage(int subimage, int miplevel)
     // data is per-file, not per-element)
     if (m_userBuf.empty() && m_dpx.header.UserSize() != 0
         && m_dpx.header.UserSize() != 0xFFFFFFFF) {
+        // The user data block starts after the generic and industry headers,
+        // so that offset counts against the file size too.
+        const uint64_t userdata_offset = sizeof(dpx::GenericHeader)
+                                         + sizeof(dpx::IndustryHeader);
+        if (userdata_offset + uint64_t(m_dpx.header.UserSize()) > m_filesize) {
+            errorfmt(
+                "Corrupt userbuf: {} bytes of user data at offset {} run past the {} byte file",
+                m_dpx.header.UserSize(), userdata_offset, m_filesize);
+            m_spec = ImageSpec();
+            return false;
+        }
         m_userBuf.resize(m_dpx.header.UserSize());
-        m_dpx.ReadUserData(&m_userBuf[0]);
+        if (!m_dpx.ReadUserData(&m_userBuf[0])) {
+            // A short read leaves part of m_userBuf uninitialized, and it is
+            // about to be handed out as metadata. Don't let that escape.
+            errorfmt("Corrupt userbuf: could not read {} bytes of user data",
+                     m_dpx.header.UserSize());
+            m_spec = ImageSpec();
+            return false;
+        }
     }
     if (!m_userBuf.empty())
         m_spec.attribute("dpx:UserData",
-                         TypeDesc(TypeDesc::UCHAR, m_dpx.header.UserSize()),
+                         TypeDesc(TypeDesc::UCHAR, int(m_userBuf.size())),
                          &m_userBuf[0]);
 
     // All of the 1-channel encoding options also behave like "rawcolor",
@@ -558,6 +618,7 @@ DPXInput::seek_subimage(int subimage, int miplevel)
     if (m_spec.nchannels == 1)
         m_rawcolor = true;
 
+    m_subimage = subimage;
     return true;
 }
 
@@ -594,19 +655,24 @@ DPXInput::read_native_scanlines(int subimage, int miplevel, int ybegin,
 
     if (m_rawcolor) {
         // fast path - just read the scanline in
-        if (!m_dpx.ReadBlock(subimage, (unsigned char*)data, block))
+        if (!m_dpx.ReadBlock(subimage, (unsigned char*)data, block)) {
+            errorfmt("Failed to read scanlines {}-{}", ybegin, yend - 1);
             return false;
+        }
     } else {
         // read the scanline and convert to RGB
         unsigned char* ptr = (unsigned char*)data;
-        int bufsize = dpx::QueryRGBBufferSize(m_dpx.header, subimage, block);
+        int64_t bufsize    = dpx::QueryRGBBufferSize(m_dpx.header, subimage,
+                                                     block);
         if (bufsize > 0) {
             m_decodebuf.resize(bufsize);
             ptr = m_decodebuf.data();
         }
 
-        if (!m_dpx.ReadBlock(subimage, ptr, block))
+        if (!m_dpx.ReadBlock(subimage, ptr, block)) {
+            errorfmt("Failed to read scanlines {}-{}", ybegin, yend - 1);
             return false;
+        }
         if (!dpx::ConvertToRGB(m_dpx.header, subimage, ptr, data, block))
             return false;
     }

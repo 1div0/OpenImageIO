@@ -68,18 +68,22 @@ following your instructions. Please quote the exact error message you
 received. If you are having trouble building, please post the full cmake
 output of a fresh VERBOSE=1 build.
 
-Suspected security vulnerabilities should be reported by the same process.
-
-If confidentiality precludes a public question or issue for any reason, you
-may contact us privately at [security@openimageio.org](security@openimageio.org).
+[SECURITY.md](SECURITY.md) details our security policies and lists prior security advisories. True exploitable security vulnerabilities
+that should be fixed before disclosure should be reported by filing a GitHub
+[security advisory](https://github.com/AcademySoftwareFoundation/OpenImageIO/security/advisories/new).
+If that is not possible, it is also fine to email your report to
+security@openimageio.org. Only the project administrators have access to these
+reports. For problems that you don't think are really exploitable
+vulnerabilities, you are encouraged to just file a regular issue, as described
+above.
 
 
 Policy on AI Tools
 ------------------
 
 Please read our [Policy on AI Coding Assistants](docs/dev/AI_Policy.md)
-before contributing or particpating in the project in any way mediated by "AI"
-assistants.
+before contributing or participating in the project in any way mediated by
+"AI" assistants.
 
 High-level summary:
 - Human must always be in the loop, and is the responsible party for
@@ -92,6 +96,16 @@ High-level summary:
 
 Please do read the whole [Policy on AI Coding Assistants](docs/dev/AI_Policy.md)
 for all the details.
+
+The repository supports several AI coding assistants (Claude Code, Cursor,
+GitHub Copilot, OpenAI Codex, Opencode). After cloning, run the setup script
+for whichever tool(s) you use:
+
+```
+.agents/setup-agent claude      # or: cursor, codex, opencode, copilot, all
+```
+
+See [docs/dev/Agentic_Coding.md](docs/dev/Agentic_Coding.md) for details.
 
 
 Contributor License Agreement (CLA) and Intellectual Property
@@ -232,7 +246,7 @@ It is also encouraged, when it makes sense to do so, to put a subcategory in
 parenthesis after the prefix, like `fix(exr):` or `feat(IBA):`. It's ok to use
 obvious abbreviations for major classes or subsections: IB=ImageBuf,
 IBA=ImageBufAlgo, IC=ImageCache, TS=TextureSystem, etc. If there is no clear
-single format or class that is the man focus of the patch, then you can omit
+single format or class that is the main focus of the patch, then you can omit
 the subcategory.
 
 API or ABI-breaking changes should additionally be marked with an exclamation

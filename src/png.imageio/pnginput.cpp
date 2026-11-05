@@ -25,6 +25,9 @@ public:
 #ifdef PNG_cICP_SUPPORTED
                 || feature == "cicp"
 #endif
+#ifdef OIIO_PNG_MDCV_SUPPORTED
+                || feature == "mdcv"
+#endif
         );
     }
     bool valid_file(Filesystem::IOProxy* ioproxy) const override;
@@ -92,7 +95,13 @@ private:
         OIIO_DASSERT(pnginput);
         if (!pnginput->ioread(data, length)) {
             pnginput->m_err = true;
-            png_chunk_error(png_ptr, pnginput->geterror(false).c_str());
+            // png_chunk_error() does not return -- it longjmps back to
+            // libpng's setjmp point, which skips C++ destructors. Copy the
+            // message into a plain stack buffer so no heap-allocated
+            // std::string is left alive (and leaked) across the longjmp.
+            char msg[256];
+            Strutil::safe_strcpy(msg, pnginput->geterror(false), sizeof(msg));
+            png_chunk_error(png_ptr, msg);
         }
     }
 
@@ -154,6 +163,7 @@ PNGInput::open(const std::string& name, ImageSpec& newspec)
         || png_sig_cmp(sig, 0, 8)) {
         if (!has_error())
             errorfmt("Not a PNG file");
+        close();
         return false;  // Read failed
     }
 
@@ -172,27 +182,34 @@ PNGInput::open(const std::string& name, ImageSpec& newspec)
                                  m_interlace_type, m_bg, m_spec,
                                  m_keep_unassociated_alpha);
     if (!ok || m_err
-        || !check_open(m_spec, { 0, 1 << 20, 0, 1 << 20, 0, 1, 0, 4 })) {
+        || !check_open(m_spec, { 0, 1 << 30, 0, 1 << 30, 0, 1, 0, 4 })) {
         close();
         return false;
     }
 
-    string_view colorspace = m_spec.get_string_attribute("oiio:ColorSpace",
-                                                         "srgb_rec709_scene");
-    const ColorConfig& colorconfig(ColorConfig::default_colorconfig());
-    m_srgb = false;
-    if (colorconfig.equivalent(colorspace, "srgb_rec709_scene")) {
+    // check_open's size cap still admits dimensions that are absurd for a tiny
+    // compressed file, so also bound the declared-vs-compressed ratio.
+    imagesize_t filesize = ioproxy() ? ioproxy()->size()
+                                     : Filesystem::file_size(m_filename);
+    if (!check_compression_ratio(m_spec, filesize)) {
+        close();
+        return false;
+    }
+
+    // Only premultiplying in linear space needs the transfer function, and
+    // deciding it can load the color config, so don't unless we must.
+    if (!m_linear_premult) {
+        m_srgb  = false;
+        m_gamma = 1.0f;
+    } else if (is_colorspace_srgb(m_spec)) {
         m_srgb  = true;
         m_gamma = 1.0f;
-    } else if (colorconfig.equivalent(colorspace, "g22_rec709_scene")) {
-        m_gamma = 2.2f;
-    } else if (colorconfig.equivalent(colorspace, "g24_rec709_scene")) {
-        m_gamma = 2.4f;
-    } else if (colorconfig.equivalent(colorspace, "g18_rec709_scene")) {
-        m_gamma = 1.8f;
     } else {
-        m_gamma = m_spec.get_float_attribute("oiio:Gamma", 1.0f);
-        // obsolete "oiio:Gamma" attrib for back compatibility
+        m_srgb  = false;
+        m_gamma = pvt::get_colorspace_rec709_gamma(m_spec);
+        if (m_gamma == 0.0f) {
+            m_gamma = 1.0f;
+        }
     }
 
     newspec         = spec();

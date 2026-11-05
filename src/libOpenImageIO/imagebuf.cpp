@@ -3,6 +3,7 @@
 // https://github.com/AcademySoftwareFoundation/OpenImageIO
 
 
+#include <atomic>
 #include <iostream>
 #include <memory>
 #include <regex>
@@ -151,10 +152,10 @@ public:
                      stride_t zstride = AutoStride)
     {
         auto formatsize = m_spec.format.size();
-        m_bufspan       = image_span(reinterpret_cast<std::byte*>(data),
-                                     m_spec.nchannels, m_spec.width, m_spec.height,
-                                     m_spec.depth, formatsize, xstride, ystride,
-                                     zstride, formatsize);
+        m_bufspan = image_span(reinterpret_cast<std::byte*>(data),
+                               m_spec.nchannels, m_spec.width, m_spec.height,
+                               m_spec.depth, formatsize, xstride, ystride,
+                               zstride, formatsize);
         eval_contiguous();
     }
 
@@ -320,9 +321,9 @@ public:
 
     void eval_contiguous()
     {
-        bool in_memory = m_bufspan.data() != nullptr
-                         && (m_storage == ImageBuf::LOCALBUFFER
-                             || m_storage == ImageBuf::APPBUFFER);
+        bool in_memory        = m_bufspan.data() != nullptr
+                                && (m_storage == ImageBuf::LOCALBUFFER
+                                    || m_storage == ImageBuf::APPBUFFER);
         m_contiguous          = in_memory && m_bufspan.is_contiguous();
         m_contiguous_scanline = in_memory && m_bufspan.is_contiguous_scanline();
     }
@@ -348,10 +349,13 @@ private:
     image_span<std::byte> m_bufspan;   // Bounded buffer for local pixels
     typedef std::recursive_mutex mutex_t;
     typedef std::unique_lock<mutex_t> lock_t;
-    mutable mutex_t m_mutex;              // Thread safety for this ImageBuf
-    mutable bool m_spec_valid   = false;  // Is the spec valid
-    mutable bool m_pixels_valid = false;  // Image is valid
-    mutable bool m_pixels_read = false;  // Is file already in the local pixels?
+    mutable mutex_t m_mutex;  // Thread safety for this ImageBuf
+    // N.B. These three flags are atomic because each is read lock-free by
+    // some caller. The atomicity guarantees that a thread seeing `true` also
+    // sees all the data (spec fields, pixel buffer) correctly.
+    mutable std::atomic<bool> m_spec_valid   = false;  // spec is valid?
+    mutable std::atomic<bool> m_pixels_valid = false;  // Image is valid?
+    mutable std::atomic<bool> m_pixels_read  = false;  // local pixels loaded?
     bool m_readonly            = true;   // The bufspan is read-only
     bool m_badfile             = false;  // File not found
     float m_pixelaspect        = 1.0f;   // Pixel aspect ratio of the image
@@ -529,9 +533,9 @@ ImageBufImpl::ImageBufImpl(const ImageBufImpl& src)
 // NO -- copy ctr does not transfer proxy   , m_rioproxy(src.m_rioproxy)
 // NO -- copy ctr does not transfer proxy   , m_wioproxy(src.m_wioproxy)
 {
-    m_spec_valid   = src.m_spec_valid;
-    m_pixels_valid = src.m_pixels_valid;
-    m_pixels_read  = src.m_pixels_read;
+    m_spec_valid   = src.m_spec_valid.load();
+    m_pixels_valid = src.m_pixels_valid.load();
+    m_pixels_read  = src.m_pixels_read.load();
     if (src.localpixels()) {
         // Source had the image fully in memory (no cache)
         if (m_storage == ImageBuf::APPBUFFER) {
@@ -543,9 +547,13 @@ ImageBufImpl::ImageBufImpl(const ImageBufImpl& src)
             // N.B. new_pixels will set m_bufspan
         }
     } else {
-        // Source was cache-based or deep
-        // nothing else to do
-        m_bufspan = {};
+        // Source was cache-based or deep. There are no local pixels to copy,
+        // but for a cache-backed source we must preserve src's bufspan, which
+        // carries null data but valid (pixel_bytes) strides. retile() relies
+        // on m_bufspan.xstride() to address pixels within a cache tile; a
+        // default-constructed (zeroed-stride) bufspan would make every pixel
+        // resolve to tile offset 0 and read back as a constant color.
+        m_bufspan = src.m_bufspan;
     }
     if (localpixels() || m_spec.deep) {
         // A copied ImageBuf is no longer a direct file reference, so clear
@@ -557,6 +565,8 @@ ImageBufImpl::ImageBufImpl(const ImageBufImpl& src)
         m_nmiplevels       = 0;
         m_spec.erase_attribute("oiio:subimages");
         m_nativespec.erase_attribute("oiio:subimages");
+        m_spec.erase_attribute("oiio:miplevels");
+        m_nativespec.erase_attribute("oiio:miplevels");
         m_pixels_read = true;
     }
     if (src.m_configspec)
@@ -576,7 +586,7 @@ ImageBufImpl::~ImageBufImpl()
 
     // Upon destruction, print uncaught errors to help users who don't know
     // how to properly check for errors.
-    if (!m_err.empty() /* Note: safe becausethis is the dtr */
+    if (!m_err.empty() /* Note: safe because this is the dtr */
         && OIIO::pvt::imagebuf_print_uncaught_errors) {
         try {
             OIIO::print(
@@ -617,7 +627,7 @@ ImageBuf::ImageBuf(const ImageSpec& spec, InitializePixels zero)
 {
     m_impl->alloc(spec);
     // N.B. alloc will set m_bufspan
-    if (zero == InitializePixels::Yes && !deep())
+    if (zero == InitializePixels::Yes && !deep() && localpixels())
         ImageBufAlgo::zero(*this);
 }
 
@@ -690,14 +700,15 @@ ImageBuf::ImageBuf(const ImageBuf& src)
 
 
 
-ImageBuf::ImageBuf(ImageBuf&& src)
-    : m_impl(std::move(src.m_impl))
+ImageBuf::ImageBuf(ImageBuf&& src) : m_impl(std::move(src.m_impl))
 {
 }
 
 
 
-ImageBuf::~ImageBuf() {}
+ImageBuf::~ImageBuf()
+{
+}
 
 
 
@@ -861,6 +872,7 @@ ImageBufImpl::clear()
     m_name.clear();
     m_fileformat.clear();
     m_nsubimages       = 0;
+    m_nmiplevels       = 0;
     m_current_subimage = -1;
     m_current_miplevel = -1;
     m_spec             = ImageSpec();
@@ -986,7 +998,7 @@ void
 ImageBuf::reset(const ImageSpec& spec, InitializePixels zero)
 {
     m_impl->reset("", spec);
-    if (zero == InitializePixels::Yes && !deep())
+    if (zero == InitializePixels::Yes && !deep() && localpixels())
         ImageBufAlgo::zero(*this);
 }
 
@@ -1065,8 +1077,10 @@ ImageBufImpl::realloc()
                         0);
     // NB make it big enough for SSE
     if (m_allocated_size) {
-        m_pixels_valid = true;
-        m_storage      = ImageBuf::LOCALBUFFER;
+        // Don't set m_pixels_valid yet -- the buffer is allocated but not
+        // necessarily populated yet (e.g. a pending read() will fill it). The
+        // caller sets m_pixels_valid once the pixel data is actually ready.
+        m_storage = ImageBuf::LOCALBUFFER;
     }
     if (m_spec.deep) {
         m_deepdata.init(m_spec);
@@ -1099,6 +1113,8 @@ ImageBufImpl::alloc(const ImageSpec& spec, const ImageSpec* nativespec)
     realloc();
     // N.B. realloc sets m_bufspan
     m_spec_valid = true;
+    if (m_allocated_size)
+        m_pixels_valid = true;  // no pending read; buffer is ready as-is
 }
 
 
@@ -1180,8 +1196,8 @@ ImageBufImpl::init_spec(string_view filename, int subimage, int miplevel,
                                                  miplevel);
         if (!ok || m_nativespec.format == TypeUnknown) {
             std::string cacheerr = m_imagecache->geterror();
-            error("Unable to find subimage={}, miplevel={}{}{}",
-                  cacheerr.size() ? ": " : "", cacheerr);
+            error("Unable to find subimage={}, miplevel={}{}{}", subimage,
+                  miplevel, cacheerr.size() ? ": " : "", cacheerr);
             return false;
         }
 
@@ -1195,8 +1211,11 @@ ImageBufImpl::init_spec(string_view filename, int subimage, int miplevel,
         if (m_spec["thumbnail_width"].get<int>()
             && m_spec["thumbnail_height"].get<int>()) {
             m_thumbnail.reset(new ImageBuf);
-            m_imagecache->get_thumbnail(m_name, *m_thumbnail, subimage);
-            m_has_thumbnail = true;
+            m_has_thumbnail = m_imagecache->get_thumbnail(m_name, *m_thumbnail,
+                                                          subimage);
+            // Don't keep a thumbnail buffer we failed to fill in.
+            if (!m_has_thumbnail)
+                m_thumbnail.reset();
         }
 
         // Subtlety: m_nativespec will have the true formats of the file, but
@@ -1241,7 +1260,6 @@ ImageBufImpl::init_spec(string_view filename, int subimage, int miplevel,
         m_pixels_read      = false;
         m_nsubimages       = 0;
         m_nmiplevels       = 0;
-        m_badfile          = false;
         m_current_subimage = -1;
         m_current_miplevel = -1;
         auto input = ImageInput::open(filename, m_configspec.get(), m_rioproxy);
@@ -1264,8 +1282,8 @@ ImageBufImpl::init_spec(string_view filename, int subimage, int miplevel,
             return false;
         }
         m_badfile    = false;
-        m_spec_valid = true;
         m_fileformat = ustring(input->format_name());
+        OIIO::pvt::set_source_provenance(m_spec, m_fileformat, filename);
         m_nativespec = m_spec;
         set_bufspan(nullptr);
         m_blackpixel.resize(
@@ -1281,12 +1299,18 @@ ImageBufImpl::init_spec(string_view filename, int subimage, int miplevel,
             m_thumbnail.reset(new ImageBuf);
             m_has_thumbnail = input->get_thumbnail(*m_thumbnail.get(),
                                                    subimage);
+            // Don't keep a thumbnail buffer we failed to fill in.
+            if (!m_has_thumbnail)
+                m_thumbnail.reset();
         }
 
         m_current_subimage = subimage;
         m_current_miplevel = miplevel;
         m_pixelaspect = m_spec.get_float_attribute("pixelaspectratio", 1.0f);
         atomic_fetch_add(OIIO::pvt::IB_total_open_time, float(timer()));
+        // Set last, after every field above is written -- see the comment
+        // on m_spec_valid's declaration.
+        m_spec_valid = true;
     }
     return !m_badfile;
 }
@@ -1660,9 +1684,9 @@ ImageBuf::write(ImageOutput* out, ProgressCallback progress_callback,
                                        && outspec.get_string_attribute(
                                               "openexr:lineOrder")
                                               == "decreasingY";
-            const int numChunks  = outspec.height > 0
-                                       ? 1 + ((outspec.height - 1) / chunk)
-                                       : 0;
+            const int numChunks      = outspec.height > 0
+                                           ? 1 + ((outspec.height - 1) / chunk)
+                                           : 0;
             const int yLoopStart = isDecreasingY ? (numChunks - 1) * chunk : 0;
             const int yDelta     = isDecreasingY ? -chunk : chunk;
             const int yLoopEnd   = yLoopStart + numChunks * yDelta;
@@ -1811,7 +1835,10 @@ ImageBuf::write(string_view _filename, TypeDesc dtype, string_view _fileformat,
     }
     if (!write(out.get(), progress_callback, progress_callback_data))
         return false;
-    out->close();
+    if (!out->close()) {
+        error(out->geterror());
+        return false;
+    }
     if (progress_callback)
         progress_callback(progress_callback_data, 0);
     return true;
@@ -1976,6 +2003,10 @@ ImageBufImpl::set_thumbnail(const ImageBuf& thumb, DoLock do_lock)
     clear_thumbnail(DoLock(false) /* we already hold the lock */);
     if (thumb.initialized()) {
         m_thumbnail.reset(new ImageBuf(thumb));
+        m_spec.attribute("thumbnail_width", thumb.spec().width);
+        m_spec.attribute("thumbnail_height", thumb.spec().height);
+        m_spec.attribute("thumbnail_nchannels", thumb.spec().nchannels);
+        m_has_thumbnail = true;
     }
 }
 
@@ -2081,7 +2112,18 @@ ImageBuf::miplevel() const
 int
 ImageBuf::nmiplevels() const
 {
-    m_impl->validate_spec();
+    if (!m_impl->validate_spec()) {
+        // Spec is invalid. Unnamed means no file to refer to (for example,
+        // default-constructed), so 1 as documented. Named means the file
+        // failed, so 0.
+        m_impl->m_nmiplevels = m_impl->m_name.empty() ? 1 : 0;
+    } else if (m_impl->m_name.empty() || m_impl->m_fileformat.empty()) {
+        // No direct reference to a file, so 1 as documented.
+        m_impl->m_nmiplevels = 1;
+    } else if (m_impl->m_nmiplevels == 0) {
+        m_impl->m_nmiplevels
+            = m_impl->m_spec.get_int_attribute("oiio:miplevels", 1);
+    }
     return m_impl->m_nmiplevels;
 }
 
@@ -2097,7 +2139,6 @@ ImageBuf::nchannels() const
 int
 ImageBuf::orientation() const
 {
-    m_impl->validate_spec();
     return m_impl->spec().get_int_attribute("Orientation", 1);
 }
 
@@ -2362,9 +2403,11 @@ ImageBuf::copy_pixels(const ImageBuf& src)
     m_impl->m_nsubimages       = 1;
     m_impl->m_current_subimage = 0;
     m_impl->m_current_miplevel = 0;
-    m_impl->m_nmiplevels       = 0;
+    m_impl->m_nmiplevels       = 1;
     m_impl->m_spec.erase_attribute("oiio:subimages");
     m_impl->m_nativespec.erase_attribute("oiio:subimages");
+    m_impl->m_spec.erase_attribute("oiio:miplevels");
+    m_impl->m_nativespec.erase_attribute("oiio:miplevels");
 
     return ok;
 }
@@ -2386,7 +2429,7 @@ ImageBuf::copy(const ImageBuf& src, TypeDesc format)
         m_impl->m_deepdata = src.m_impl->m_deepdata;
         return true;
     }
-    if (format.basetype == TypeDesc::UNKNOWN || src.deep())
+    if (format.basetype == TypeDesc::UNKNOWN)
         m_impl->reset(src.name(), src.spec(), &src.nativespec());
     else {
         ImageSpec newspec(src.spec());
@@ -2658,7 +2701,7 @@ get_pixels_(const ImageBuf& buf, const ImageBuf& /*dummy*/, ROI whole_roi,
                 imagesize_t offset = (p.z() - whole_roi.zbegin) * zstride
                                      + (p.y() - whole_roi.ybegin) * ystride
                                      + (p.x() - whole_roi.xbegin) * xstride;
-                D* rc = (D*)((char*)r + offset);
+                D* rc              = (D*)((char*)r + offset);
                 for (int c = 0; c < nchans; ++c)
                     rc[c] = p[c + roi.chbegin];
             }
@@ -2752,7 +2795,7 @@ set_pixels_(ImageBuf& buf, ROI roi, const void* data_, stride_t xstride,
         imagesize_t offset = (p.z() - roi.zbegin) * zstride
                              + (p.y() - roi.ybegin) * ystride
                              + (p.x() - roi.xbegin) * xstride;
-        const S* src = (const S*)((const char*)data + offset);
+        const S* src       = (const S*)((const char*)data + offset);
         for (int c = 0; c < nchans; ++c)
             p[c + roi.chbegin] = src[c];
     }

@@ -103,9 +103,20 @@ macro (oiio_add_tests)
             set (_test_disabled TRUE)
         endif ()
     endforeach ()
-    # For OCIO 2.2+, have the testsuite use the default built-in config
+    # Default PYTHONPATH (see oiio_add_all_tests), placed first so that a
+    # PYTHONPATH in the caller's ENVIRONMENT overrides it.
+    if (NOT "${_pybind_tests_pythonpath}" STREQUAL "")
+        list (PREPEND _ats_ENVIRONMENT "${_pybind_tests_pythonpath}")
+    endif ()
+    # Things we add to the environment for tests:
+    # - For OCIO 2.2+, have the testsuite use the default built-in config.
+    # - Some tests (e.g. cmake-consumer) configure their own child cmake
+    #   project that does find_package(OpenImageIO). Point them at this
+    #   build's install location so that works out of the box, without users
+    #   needing to set OpenImageIO_ROOT in their environment themselves.
     list (APPEND _ats_ENVIRONMENT "OCIO=ocio://default"
-                                  "OIIO_TESTSUITE_OCIOCONFIG=ocio://default")
+                                  "OIIO_TESTSUITE_OCIOCONFIG=ocio://default"
+                                  "OpenImageIO_ROOT=${CMAKE_INSTALL_PREFIX}")
     if (_test_disabled)
         message (STATUS "Skipping test(s) ${_ats_UNPARSED_ARGUMENTS} because of disabled ${_ats_ENABLEVAR}")
     elseif (_test_notfound)
@@ -165,17 +176,53 @@ endmacro ()
 #
 macro (oiio_add_all_tests)
 
+    # PYTHONPATH entries pointing at this build's Python bindings.
+    # oiio_add_tests gives every test the pybind11 one by default, so any
+    # test that runs Python uses this build rather than whatever is in the
+    # ambient environment. Backend-specific tests override it with their
+    # own ENVIRONMENT entry. Empty where the Python tests can't run (see
+    # below for why sanitizer builds are excluded).
+    set (_pybind_tests_pythonpath "")
+    set (_nanobind_tests_pythonpath "")
+    if (USE_PYTHON AND NOT BUILD_OIIOUTIL_ONLY AND NOT SANITIZE)
+        if (WIN32)
+            # On Windows CI we run the install target before tests. Use the
+            # installed package path to avoid multi-config output layout quirks.
+            set (_installed_python_site_packages
+                "${CMAKE_INSTALL_PREFIX}/${PYTHON_SITE_ROOT_DIR}")
+            oiio_tests_pythonpath_env_entry (_pybind_tests_pythonpath
+                "${_installed_python_site_packages}")
+        else ()
+            oiio_tests_pythonpath_env_entry (_pybind_tests_pythonpath
+                "${CMAKE_BINARY_DIR}/lib/python/site-packages")
+        endif ()
+        if (OIIO_PYTHON_BINDINGS_BACKEND STREQUAL "both")
+            # In "both" mode, the nanobind module is kept isolated under its
+            # own build-tree location so it doesn't clobber the pybind11
+            # module that also lives in lib/python/site-packages.
+            oiio_tests_pythonpath_env_entry (_nanobind_tests_pythonpath
+                "${CMAKE_BINARY_DIR}/lib/python/nanobind")
+        else ()
+            # nanobind-only builds install the module to the same location
+            # pybind11 would have used (see setup_python_module_nanobind()
+            # in pythonutils.cmake).
+            set (_nanobind_tests_pythonpath "${_pybind_tests_pythonpath}")
+        endif ()
+    endif ()
+
     # Freestanding tests:
     oiio_add_tests (
                     cmake-consumer
                     cryptomatte
                     docs-examples-cpp
+                    texture-device
                     iinfo igrep
                     nonwhole-tiles
                     oiiotool
                     oiiotool-composite
                     oiiotool-control
                     oiiotool-copy
+                    oiiotool-decorrstretch
                     oiiotool-demosaic
                     oiiotool-fixnan
                     oiiotool-layers
@@ -183,6 +230,7 @@ macro (oiio_add_all_tests)
                     oiiotool-readerror
                     oiiotool-subimage
                     oiiotool-text
+                    oiiotool-thumbnail-get
                     oiiotool-xform
                     diff
                     flip
@@ -233,6 +281,7 @@ macro (oiio_add_all_tests)
 
     # Tests that require oiio-images:
     oiio_add_tests (gpsread
+                    jpeg-thumbnail
                     oiiotool-attribs
                     texture-filtersize
                     texture-filtersize-stochastic
@@ -246,26 +295,27 @@ macro (oiio_add_all_tests)
     # Python interpreter itself won't be linked with the right asan
     # libraries to run correctly.
     if (USE_PYTHON AND NOT BUILD_OIIOUTIL_ONLY AND NOT SANITIZE)
-        if (WIN32)
-            # On Windows CI we run the install target before tests. Use the
-            # installed package path to avoid multi-config output layout quirks.
-            set (_installed_python_site_packages
-                "${CMAKE_INSTALL_PREFIX}/${PYTHON_SITE_ROOT_DIR}")
-            oiio_tests_pythonpath_env_entry (_pybind_tests_pythonpath
-                "${_installed_python_site_packages}")
-            oiio_tests_pythonpath_env_entry (_nanobind_tests_pythonpath
-                "${CMAKE_BINARY_DIR}/lib/python/nanobind/$<CONFIG>")
-        else ()
-            oiio_tests_pythonpath_env_entry (_pybind_tests_pythonpath
-                "${CMAKE_BINARY_DIR}/lib/python/site-packages")
-            oiio_tests_pythonpath_env_entry (_nanobind_tests_pythonpath
-                "${CMAKE_BINARY_DIR}/lib/python/nanobind")
-        endif ()
+        # Keep in sync with the pybind11 python-* tests below as dual-backend
+        # coverage expands. imageinput/imagebufalgo also need oiio-images.
         set (nanobind_python_tests
+             docs-examples-python
+             filters
+             python-colorconfig
+             python-deep
+             python-imagebuf
+             python-imagecache
+             python-imageoutput
              python-imagespec
+             python-oiio
              python-paramlist
              python-roi
-             python-typedesc)
+             python-texturesys
+             python-typedesc
+             sourceprovenance)
+        set (nanobind_python_tests_imagedir
+             python-imageinput
+             python-imageinput-colorconfig
+             python-imagebufalgo)
         set (nanobind_python_test_suffix ".nanobind")
         if (OIIO_BUILD_PYTHON_PYBIND11)
             oiio_add_tests (
@@ -276,18 +326,19 @@ macro (oiio_add_all_tests)
                 python-imagecache
                 python-imageoutput
                 python-imagespec
+                python-oiio
                 python-paramlist
                 python-roi
                 python-texturesys
                 python-typedesc
+                sourceprovenance
                 filters
-                ENVIRONMENT "${_pybind_tests_pythonpath}"
                 )
             # These Python tests also need access to oiio-images
             oiio_add_tests (
-                python-imageinput python-imagebufalgo
+                python-imageinput python-imageinput-colorconfig
+                python-imagebufalgo
                 IMAGEDIR oiio-images
-                ENVIRONMENT "${_pybind_tests_pythonpath}"
                 )
         else ()
             set (nanobind_python_test_suffix "")
@@ -297,6 +348,12 @@ macro (oiio_add_all_tests)
             oiio_add_tests (
                 ${nanobind_python_tests}
                 SUFFIX ${nanobind_python_test_suffix}
+                ENVIRONMENT "${_nanobind_tests_pythonpath}"
+                )
+            oiio_add_tests (
+                ${nanobind_python_tests_imagedir}
+                SUFFIX ${nanobind_python_test_suffix}
+                IMAGEDIR oiio-images
                 ENVIRONMENT "${_nanobind_tests_pythonpath}"
                 )
         endif ()
@@ -326,6 +383,17 @@ macro (oiio_add_all_tests)
         IMAGEDIR oiio-images
         )
 
+    # Same test, run against the nanobind bindings (mirrors the pybind11
+    # variant above so hwy coverage isn't pybind11-only).
+    oiio_add_tests ( python-imagebufalgo
+        FOUNDVAR hwy_FOUND
+        ENABLEVAR OIIO_USE_HWY  USE_PYTHON OIIO_BUILD_PYTHON_NANOBIND
+        DISABLEVAR BUILD_OIIOUTIL_ONLY SANITIZE
+        SUFFIX "${nanobind_python_test_suffix}.hwy"
+        ENVIRONMENT "OPENIMAGEIO_ENABLE_HWY=1" "${_nanobind_tests_pythonpath}"
+        IMAGEDIR oiio-images
+        )
+
     # List testsuites for specific formats or features which might be not found
     # or be intentionally disabled, or which need special external reference
     # images from the web that if not found, should skip the tests:
@@ -335,6 +403,8 @@ macro (oiio_add_all_tests)
     oiio_add_tests (cineon
                     ENABLEVAR ENABLE_CINEON
                     IMAGEDIR oiio-images URL "Recent checkout of OpenImageIO-images")
+    oiio_add_tests (dicom
+                    FOUNDVAR DCMTK_FOUND ENABLEVAR ENABLE_DCMTK)
     oiio_add_tests (dpx
                     ENABLEVAR ENABLE_DPX
                     IMAGEDIR oiio-images/dpx URL "Recent checkout of OpenImageIO-images")
@@ -381,9 +451,11 @@ macro (oiio_add_all_tests)
                     URL http://www.itu.int/net/ITU-T/sigdb/speimage/ImageForm-s.aspx?val=10100803)
     oiio_add_tests (jxl
                     FOUNDVAR JXL_FOUND)
+    oiio_add_tests (imagebufalgo-opencv
+                    FOUNDVAR OpenCV_FOUND)
     set (all_openexr_tests
          openexr-suite openexr-multires openexr-chroma openexr-decreasingy
-         openexr-v2 openexr-window perchannel oiiotool-deep)
+         openexr-v2 openexr-window perchannel oiiotool-deep openexr-thumbnail)
     if (USE_PYTHON AND NOT SANITIZE)
         list (APPEND all_openexr_tests openexr-copy)
     endif ()
@@ -391,6 +463,11 @@ macro (oiio_add_all_tests)
         # OpenEXR 3.1.10 is the first release where the exr core library
         # properly supported all compression types (DWA in particular).
         list (APPEND all_openexr_tests openexr-compression)
+        # openexr-scanlines reads a DWA-compressed file, so it needs the same
+        # minimum as openexr-compression for the core-library test variant.
+        if (USE_PYTHON AND NOT SANITIZE)
+            list (APPEND all_openexr_tests openexr-scanlines)
+        endif ()
     endif ()
     if (OpenEXR_VERSION VERSION_GREATER_EQUAL 3.3)
         # OpenEXR 3.3 is when IDManifest was introduced
@@ -409,6 +486,40 @@ macro (oiio_add_all_tests)
                         IMAGEDIR openexr-images
                         URL http://github.com/AcademySoftwareFoundation/openexr-images)
     endif ()
+
+    # HTJ2K was introduced in OpenEXR v.3.4.0
+    if (OpenEXR_VERSION VERSION_GREATER_EQUAL 3.4.0)
+        if (TEST openexr-compression)
+            set_property (TEST openexr-compression APPEND PROPERTY ENVIRONMENT
+                          "OIIO_OPENEXR_HTJ2K_SUPPORT=1")
+        endif()
+        if (TEST openexr-compression.core)
+            set_property (TEST openexr-compression.core APPEND PROPERTY
+                          ENVIRONMENT "OIIO_OPENEXR_HTJ2K_SUPPORT=1")
+        endif()
+    endif()
+    # New compression tests of zstd and lj2k require OpenEXR main branch,
+    # or latest release or at least V3.5.0
+    if (OpenEXR_VERSION VERSION_GREATER_EQUAL 3.5.0)
+        if (TEST openexr-compression)
+            set_property (TEST openexr-compression APPEND PROPERTY ENVIRONMENT
+                          "OIIO_OPENEXR_LJ2K_ZSTD_SUPPORT=1")
+        endif ()
+        if (TEST openexr-compression.core)
+            set_property (TEST openexr-compression.core APPEND PROPERTY 
+                          ENVIRONMENT "OIIO_OPENEXR_LJ2K_ZSTD_SUPPORT=1")
+        endif ()
+    endif ()
+    
+    # Regression test (compiles its own helper and generates its own image)
+    # for a partial edge-tile heap overflow in the OpenEXR readers.
+    oiio_add_tests (openexr-partialtile)
+    # Self-contained decompression-bomb regression (ships its own tiny fixture);
+    # exercises both the C++ and C-API readers via the openexr:core attribute.
+    oiio_add_tests (openexr-bomb)
+    # Self-contained multi-part colorInteropID inheritance test (ships its own
+    # tiny fixture); exercises both the C++ and C-API readers.
+    oiio_add_tests (openexr-multipart-colorspace)
     # if (NOT DEFINED ENV{${PROJECT_NAME}_CI})
     #     oiio_add_tests (openexr-damaged
     #                     IMAGEDIR openexr-images
@@ -420,18 +531,24 @@ macro (oiio_add_all_tests)
                     SUFFIX ".batch"
                     ENVIRONMENT TESTTEX_BATCH=1
                     FOUNDVAR OpenVDB_FOUND ENABLEVAR ENABLE_OpenVDB)
+    # Self-contained malformed-input regression (ships its own tiny fixtures).
+    oiio_add_tests (openvdb-damaged
+                    FOUNDVAR OpenVDB_FOUND ENABLEVAR ENABLE_OpenVDB)
     oiio_add_tests (png png-damaged
                     ENABLEVAR ENABLE_PNG
                     IMAGEDIR oiio-images/png)
+    # Self-contained decompression-bomb regression (ships its own tiny fixture).
+    oiio_add_tests (png-bomb ENABLEVAR ENABLE_PNG)
     oiio_add_tests (pnm
                     ENABLEVAR ENABLE_PNM
                     IMAGEDIR oiio-images)
     oiio_add_tests (psd psd-colormodes
                     ENABLEVAR ENABLE_PSD
                     IMAGEDIR oiio-images/psd)
+    oiio_add_tests (psd-empty-layers ENABLEVAR ENABLE_PSD)
     oiio_add_tests (ptex
                     FOUNDVAR Ptex_FOUND ENABLEVAR ENABLE_PTEX)
-    oiio_add_tests (raw
+    oiio_add_tests (raw raw-thumbnail
                     FOUNDVAR LIBRAW_FOUND ENABLEVAR ENABLE_LIBRAW
                     IMAGEDIR oiio-images/raw)
     oiio_add_tests (rla
@@ -451,6 +568,8 @@ macro (oiio_add_all_tests)
                     ENABLEVAR ENABLE_TARGA
                     IMAGEDIR oiio-images)
     endif()
+    oiio_add_tests (oiiotool-thumbnail-set
+                    ENABLEVAR ENABLE_TARGA)
     if (WIN32)
         if (OIIO_BUILD_TOOLS)
             # Add test for long path handling if support is enabled at the system level.
@@ -478,6 +597,8 @@ macro (oiio_add_all_tests)
     endif ()
     oiio_add_tests (tiff-suite tiff-depths tiff-misc
                     IMAGEDIR oiio-images/libtiffpic)
+    oiio_add_tests (tiff-subimage-seek
+                    ENABLEVAR USE_PYTHON)
     oiio_add_tests (webp
                     FOUNDVAR WebP_FOUND ENABLEVAR ENABLE_WebP
                     IMAGEDIR oiio-images/webp)
@@ -529,9 +650,9 @@ function (oiio_get_test_data name)
         endif ()
         find_package (Git)
         if (Git_FOUND AND GIT_EXECUTABLE)
-            execute_process(COMMAND ${GIT_EXECUTABLE} clone --depth 1
-                                    ${_ogtd_REPO} -b ${_ogtd_BRANCH}
-                                    ${CMAKE_BINARY_DIR}/testsuite/${name})
+            git_clone_with_retry (${name} ${_ogtd_REPO}
+                                  ${CMAKE_BINARY_DIR}/testsuite/${name}
+                GIT_ARGS --depth 1 -b ${_ogtd_BRANCH})
         else ()
             message (WARNING "${ColorRed}Could not find Git executable, could not download test data from ${_ogtd_REPO}${ColorReset}")
         endif ()

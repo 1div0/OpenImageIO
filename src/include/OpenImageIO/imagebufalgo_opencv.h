@@ -22,6 +22,7 @@
 #pragma once
 #define OPENIMAGEIO_IMAGEBUFALGO_OPENCV_H
 
+#include <OpenImageIO/half.h>
 #include <OpenImageIO/imagebufalgo.h>
 #include <OpenImageIO/imagebufalgo_util.h>
 #include <OpenImageIO/platform.h>
@@ -49,7 +50,9 @@ OIIO_PRAGMA_WARNING_PUSH
 // #    pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #endif
 #include <opencv2/opencv.hpp>
-#if OIIO_OPENCV_VERSION >= 40000
+#if OIIO_OPENCV_VERSION >= 50000
+#    include <opencv2/imgproc.hpp>
+#elif OIIO_OPENCV_VERSION >= 40000
 #    include <opencv2/core/core_c.h>
 #    include <opencv2/imgproc/imgproc_c.h>
 #else
@@ -70,25 +73,24 @@ namespace ImageBufAlgo {
 /// ImageBuf. Any error messages can be retrieved by calling `geterror()` on
 /// the returned ImageBuf. If OpenImageIO was compiled without OpenCV support,
 /// this function will return false.
-inline ImageBuf
-from_OpenCV(const cv::Mat& mat, TypeDesc convert = TypeUnknown, ROI roi = {},
-            int nthreads = 0);
+inline ImageBuf from_OpenCV(const cv::Mat& mat, TypeDesc convert = TypeUnknown,
+                            ROI roi = {}, int nthreads = 0);
 
 /// Construct an OpenCV cv::Mat containing the contents of ImageBuf src, and
 /// return true. If it is not possible, or if OpenImageIO was compiled without
 /// OpenCV support, then return false. Any error messages can be retrieved by
 /// calling OIIO::geterror(). Note that OpenCV only supports up to 4 channels,
 /// so >4 channel images will be truncated in the conversion.
-inline bool
-to_OpenCV(cv::Mat& dst, const ImageBuf& src, ROI roi = {}, int nthreads = 0);
+inline bool to_OpenCV(cv::Mat& dst, const ImageBuf& src, ROI roi = {},
+                      int nthreads = 0);
 
 /// Capture a still image from a designated camera.  If able to do so,
 /// store the image in dst and return true.  If there is no such device,
 /// or support for camera capture is not available (such as if OpenCV
 /// support was not enabled at compile time), return false and do not
 /// alter dst.
-inline ImageBuf
-capture_image(int cameranum = 0, TypeDesc convert = TypeUnknown);
+inline ImageBuf capture_image(int cameranum    = 0,
+                              TypeDesc convert = TypeUnknown);
 
 }  // namespace ImageBufAlgo
 

@@ -61,10 +61,7 @@ private:
 
 class HeifWriter final : public heif::Context::Writer {
 public:
-    HeifWriter(Filesystem::IOProxy* ioproxy)
-        : m_ioproxy(ioproxy)
-    {
-    }
+    HeifWriter(Filesystem::IOProxy* ioproxy) : m_ioproxy(ioproxy) {}
     heif_error write(const void* data, size_t size) override
     {
         heif_error herr { heif_error_Ok, heif_suberror_Unspecified, "" };
@@ -83,12 +80,18 @@ private:
 };
 
 
+// Defined in heifinput.cpp. Declare here at C++ namespace scope (not inside
+// the extern "C" block below) so the linkage matches the definition in the
+// non-embedded (dynamic plugin) build where OIIO_PLUGIN_EXPORTS_BEGIN is
+// `extern "C"`.
+extern void oiio_heif_init();
+
+
 OIIO_PLUGIN_EXPORTS_BEGIN
 
 OIIO_EXPORT ImageOutput*
 heif_output_imageio_create()
 {
-    extern void oiio_heif_init();
     oiio_heif_init();
     return new HeifOutput;
 }
@@ -103,7 +106,7 @@ bool
 HeifOutput::open(const std::string& name, const ImageSpec& newspec,
                  OpenMode mode)
 {
-    if (!check_open(mode, newspec, { 0, 1 << 20, 0, 1 << 20, 0, 1, 0, 4 },
+    if (!check_open(mode, newspec, { 0, 1 << 30, 0, 1 << 30, 0, 1, 0, 4 },
                     uint64_t(OpenChecks::Disallow2Channel)))
         return false;
 
@@ -150,12 +153,17 @@ HeifOutput::open(const std::string& name, const ImageSpec& newspec,
 
         auto compqual  = m_spec.decode_compression_metadata("", 75);
         auto extension = Filesystem::extension(m_filename);
+        auto codec     = heif_compression_HEVC;
         if (compqual.first == "avif"
-            || (extension == ".avif" && compqual.first == "")) {
-            m_encoder = heif::Encoder(heif_compression_AV1);
-        } else {
-            m_encoder = heif::Encoder(heif_compression_HEVC);
+            || (extension == ".avif" && compqual.first == ""))
+            codec = heif_compression_AV1;
+        if (!heif_have_encoder_for_format(codec)) {
+            errorfmt("libheif does not have support for codec {}",
+                     codec == heif_compression_AV1 ? "AV1" : "HEVC");
+            m_ctx.reset();
+            return false;
         }
+        m_encoder = heif::Encoder(codec);
     } catch (const heif::Error& err) {
         std::string e = err.get_message();
         errorfmt("{}", e.empty() ? "unknown exception" : e.c_str());
@@ -268,12 +276,7 @@ HeifOutput::close()
         std::unique_ptr<heif_color_profile_nclx,
                         void (*)(heif_color_profile_nclx*)>
             nclx(heif_nclx_color_profile_alloc(), heif_nclx_color_profile_free);
-        const ColorConfig& colorconfig(ColorConfig::default_colorconfig());
-        const ParamValue* p    = m_spec.find_attribute("CICP",
-                                                       TypeDesc(TypeDesc::INT, 4));
-        string_view colorspace = m_spec.get_string_attribute("oiio:ColorSpace");
-        cspan<int> cicp        = (p) ? p->as_cspan<int>()
-                                     : colorconfig.get_cicp(colorspace);
+        cspan<int> cicp = get_colorspace_cicp(m_spec);
         if (!cicp.empty()) {
             nclx->color_primaries          = heif_color_primaries(cicp[0]);
             nclx->transfer_characteristics = heif_transfer_characteristics(

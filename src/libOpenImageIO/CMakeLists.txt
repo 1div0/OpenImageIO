@@ -6,6 +6,15 @@ if (VERBOSE)
    message (STATUS "Create buildopts.h from buildopts.h.in")
 endif ()
 configure_file (buildopts.h.in "${CMAKE_BINARY_DIR}/include/buildopts.h" @ONLY)
+# Embed as a byte array: MSVC caps string literals at 16380 characters.
+file (READ "${CMAKE_CURRENT_SOURCE_DIR}/interop-identities-config.ocio" OIIO_INTEROP_CONFIG HEX)
+string (REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," OIIO_INTEROP_CONFIG "${OIIO_INTEROP_CONFIG}")
+# Break every 16 bytes: MSVC also caps one logical source line at 16384
+# characters. CMake's regex has no {n} repeat, so the 16 groups are spelled out.
+string (REGEX REPLACE "(0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,)" "\\1\n" OIIO_INTEROP_CONFIG "${OIIO_INTEROP_CONFIG}")
+set_property (DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+              "${CMAKE_CURRENT_SOURCE_DIR}/interop-identities-config.ocio")
+configure_file (interop_config.h.in "${CMAKE_BINARY_DIR}/include/interop_config.h" @ONLY)
 
 file (GLOB libOpenImageIO_hdrs ../include/OpenImageIO/*.h)
 
@@ -19,15 +28,6 @@ if (NOT USE_EXTERNAL_PUGIXML)
         set_source_files_properties (formatspec.cpp xmp.cpp
                                      PROPERTIES COMPILE_FLAGS -Wno-error=placement-new)
     endif ()
-endif()
-
-# Make the build complete for newer ffmpeg versions (3.1.1+) that have
-# marked m_format_context->streams[i]->codec as deprecated.
-# FIXME -- at some point, come back and figure out how to fix for real
-# before the field disappears entirely.
-if (NOT MSVC)
-    set_source_files_properties (../ffmpeg.imageio/ffmpeginput.cpp
-                             PROPERTIES COMPILE_FLAGS "-Wno-deprecated-declarations")
 endif()
 
 if (CMAKE_COMPILER_IS_GNUCC)
@@ -108,7 +108,7 @@ endif ()
 
 # Enable default use of OpenEXR core library for versions of the library
 # new enough to support DWA compression in exrcore.
-if (OPENEXR_VERSION VERSION_GREATER_EQUAL 3.1.10)
+if (OpenEXR_VERSION VERSION_GREATER_EQUAL 3.1.10)
     target_compile_definitions(OpenImageIO
                                PRIVATE OIIO_OPENEXR_CORE_DEFAULT=1)
     message (STATUS "OpenEXR core library will be used by default")
@@ -136,8 +136,6 @@ target_include_directories (OpenImageIO
                                 $<INSTALL_INTERFACE:include>
                             ${OPENIMAGEIO_IMATH_DEPENDENCY_VISIBILITY}
                                 ${OPENEXR_INCLUDES}
-                            PRIVATE
-                                ${ROBINMAP_INCLUDES}
                             )
 
 if (NOT BUILD_SHARED_LIBS)
@@ -154,9 +152,10 @@ target_link_libraries (OpenImageIO
         PUBLIC
             OpenImageIO_Util
             ${OPENIMAGEIO_IMATH_DEPENDENCY_VISIBILITY}
-            ${OPENIMAGEIO_IMATH_TARGETS}
+            Imath::Imath
         PRIVATE
-            ${OPENIMAGEIO_OPENEXR_TARGETS}
+            tsl::robin_map
+            OpenEXR::OpenEXR
             ${format_plugin_libs} # Add all the target link libraries from the plugins
             OpenColorIO::OpenColorIO
             $<TARGET_NAME_IF_EXISTS:OpenColorIO::OpenColorIOHeaders>
@@ -278,11 +277,11 @@ if (OIIO_BUILD_TESTS AND BUILD_TESTING)
 
     fancy_add_executable (NAME imagebufalgo_test SRC imagebufalgo_test.cpp
                           SYSTEM_INCLUDE_DIRS
-                                ${ROBINMAP_INCLUDES}
-                                ${OpenCV_INCLUDES}            
+                                ${OpenCV_INCLUDES}
                           LINK_LIBRARIES OpenImageIO
+                                         tsl::robin_map
                                          ${OpenCV_LIBRARIES}
-                                         ${OPENIMAGEIO_IMATH_TARGETS}
+                                         Imath::Imath
                           FOLDER "Unit Tests" NO_INSTALL)
     target_compile_definitions (imagebufalgo_test PRIVATE OIIO_USE_HWY=${_oiio_use_hwy})
     add_test (unit_imagebufalgo ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/imagebufalgo_test)
@@ -299,12 +298,10 @@ if (OIIO_BUILD_TESTS AND BUILD_TESTING)
     add_test (unit_imageinout ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/imageinout_test)
     set_tests_properties (unit_imageinout PROPERTIES PROCESSORS 2 COST 30)
 
-    if (NOT DEFINED ENV{OpenImageIO_CI})
-        fancy_add_executable (NAME imagespeed_test SRC imagespeed_test.cpp
-                              LINK_LIBRARIES OpenImageIO
-                              FOLDER "Unit Tests" NO_INSTALL)
-        #add_test (imagespeed_test ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/imagespeed_test)
-    endif ()
+    fancy_add_executable (NAME imagespeed_test SRC imagespeed_test.cpp
+                          LINK_LIBRARIES OpenImageIO
+                          FOLDER "Unit Tests" NO_INSTALL)
+    #add_test (imagespeed_test ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/imagespeed_test)
 
     fancy_add_executable (NAME compute_test SRC compute_test.cpp
                           LINK_LIBRARIES OpenImageIO

@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-#include <OpenImageIO/color.h>
 #include <OpenImageIO/filesystem.h>
 #include <OpenImageIO/fmath.h>
 #include <OpenImageIO/imageio.h>
@@ -103,6 +102,10 @@ JxlOutput::open(const std::string& name, const ImageSpec& newspec,
     if (!check_open(mode, newspec,
                     { 0, 1073741823, 0, 1073741823, 0, 1, 0, 4099 }))
         return false;
+
+    // Pixels are buffered until close(), which checks that the buffer holds
+    // a whole image, so drop any left from a previous file.
+    m_scanbuffer.clear();
 
     DBG std::cout << "m_filename = " << m_filename << "\n";
 
@@ -542,30 +545,19 @@ JxlOutput::save_image(const void* data)
     bool wrote_colorspace = false;
 
     // Write the ICC profile, if available
-    const ParamValue* icc_profile_parameter = m_spec.find_attribute(
-        "ICCProfile");
-    if (icc_profile_parameter != nullptr) {
-        unsigned char* icc_profile
-            = (unsigned char*)icc_profile_parameter->data();
-        uint32_t length = icc_profile_parameter->type().size();
-        if (icc_profile && length) {
-            if (JXL_ENC_SUCCESS
-                != JxlEncoderSetICCProfile(m_encoder.get(), icc_profile,
-                                           length)) {
-                errorfmt("JxlEncoderSetICCProfile failed\n");
-            }
+    std::vector<uint8_t> icc_profile = get_colorspace_icc_profile(m_spec);
+    if (icc_profile.size()) {
+        if (JXL_ENC_SUCCESS
+            != JxlEncoderSetICCProfile(m_encoder.get(), icc_profile.data(),
+                                       icc_profile.size())) {
+            errorfmt("JxlEncoderSetICCProfile failed\n");
+        } else {
             wrote_colorspace = true;
         }
     }
 
     // Write CICP
-    const ColorConfig& colorconfig(ColorConfig::default_colorconfig());
-    const ParamValue* p    = m_spec.find_attribute("CICP",
-                                                   TypeDesc(TypeDesc::INT, 4));
-    string_view colorspace = m_spec.get_string_attribute("oiio:ColorSpace");
-    cspan<int> cicp        = (p) ? p->as_cspan<int>()
-                             : (!wrote_colorspace) ? colorconfig.get_cicp(colorspace)
-                                                   : cspan<int>();
+    cspan<int> cicp = get_colorspace_cicp(m_spec, !wrote_colorspace);
     if (!cicp.empty()) {
         // JXL only has a subset of CICP, only write if supported. Custom
         // primaries and white point are not currently used but could help
@@ -641,7 +633,8 @@ JxlOutput::save_image(const void* data)
     }
     compressed.resize(next_out - compressed.data());
     if (result != JXL_ENC_SUCCESS) {
-        DBG std::cout << "JxlEncoderProcessOutput failed.\n";
+        errorfmt("JxlEncoderProcessOutput failed with error {}",
+                 (int)JxlEncoderGetError(m_encoder.get()));
         return false;
     }
 
@@ -678,8 +671,15 @@ JxlOutput::close()
         std::vector<unsigned char>().swap(m_tilebuffer);
     }
 
-    //save_image();
-    save_image(m_scanbuffer.data());
+    if (m_scanbuffer.size() < m_spec.image_bytes()) {
+        // save_image() hands libjxl the whole image, so a short buffer would
+        // read past its end, and an empty one would pass a null pointer.
+        errorfmt("Called close() with only {} of {} bytes of pixel data",
+                 m_scanbuffer.size(), m_spec.image_bytes());
+        ok = false;
+    } else {
+        ok &= save_image(m_scanbuffer.data());
+    }
 
     init();
     return ok;

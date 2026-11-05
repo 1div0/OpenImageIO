@@ -31,9 +31,7 @@ class parallel_options {
 public:
     parallel_options(int maxthreads = 0, SplitDir splitdir = Split_Y,
                      size_t minitems = 16384)
-        : maxthreads(maxthreads)
-        , splitdir(splitdir)
-        , minitems(minitems)
+        : maxthreads(maxthreads), splitdir(splitdir), minitems(minitems)
     {
     }
     parallel_options(string_view name, int maxthreads = 0,
@@ -83,9 +81,7 @@ public:
 
     constexpr paropt(int maxthreads = 0, SplitDir splitdir = SplitDir::Y,
                      size_t minitems = 1024) noexcept
-        : m_maxthreads(maxthreads)
-        , m_splitdir(splitdir)
-        , m_minitems(minitems)
+        : m_maxthreads(maxthreads), m_splitdir(splitdir), m_minitems(minitems)
     {
     }
     paropt(string_view name, int maxthreads = 0,
@@ -95,14 +91,10 @@ public:
         // m_name = name;
     }
 
-    constexpr paropt(ParStrategy strat) noexcept
-        : m_strategy(strat)
-    {
-    }
+    constexpr paropt(ParStrategy strat) noexcept : m_strategy(strat) {}
 
     constexpr paropt(int maxthreads, ParStrategy strat) noexcept
-        : m_maxthreads(maxthreads)
-        , m_strategy(strat)
+        : m_maxthreads(maxthreads), m_strategy(strat)
     {
     }
 
@@ -197,33 +189,6 @@ parallel_for_chunked(int64_t begin, int64_t end, int64_t chunksize,
                      paropt opt = paropt(0, paropt::SplitDir::Y, 1));
 
 
-#ifndef OIIO_DOXYGEN
-// DEPRECATED(3.2) -- old version makes a copy of task instead of &&, ick
-OIIO_UTIL_API void
-parallel_for(int32_t begin, int32_t end, function_view<void(int32_t)> task,
-             paropt opt = 0);
-
-// DEPRECATED(3.2) -- old version makes a copy of task instead of &&, ick
-OIIO_UTIL_API void
-parallel_for(int64_t begin, int64_t end, function_view<void(int64_t)> task,
-             paropt opt = 0);
-
-// DEPRECATED(3.2) -- old version makes a copy of task instead of &&, ick
-OIIO_UTIL_API void
-parallel_for(uint32_t begin, uint32_t end, function_view<void(uint32_t)> task,
-             paropt opt = 0);
-
-// DEPRECATED(3.2) -- old version makes a copy of task instead of &&, ick
-OIIO_UTIL_API void
-parallel_for(uint64_t begin, uint64_t end, function_view<void(uint64_t)> task,
-             paropt opt = 0);
-#endif
-
-OIIO_NAMESPACE_3_1_END
-
-
-OIIO_NAMESPACE_BEGIN
-
 /// Parallel "for" loop, for a task that takes a single integer index, run
 /// it on all indices on the range [begin,end):
 ///
@@ -236,26 +201,23 @@ OIIO_NAMESPACE_BEGIN
 /// actually each thread will iterate over some chunk of adjacent indices
 /// (to aid data coherence and minimize the amount of thread queue
 /// diddling). The chunk size is chosen automatically.
-OIIO_UTIL_API void
-parallel_for(int32_t begin, int32_t end, function_view<void(int32_t)>&& task,
-             paropt opt = 0);
+OIIO_UTIL_API void parallel_for(int32_t begin, int32_t end,
+                                function_view<void(int32_t)>&& task,
+                                paropt opt = 0);
 
-OIIO_UTIL_API void
-parallel_for(int64_t begin, int64_t end, function_view<void(int64_t)>&& task,
-             paropt opt = 0);
+OIIO_UTIL_API void parallel_for(int64_t begin, int64_t end,
+                                function_view<void(int64_t)>&& task,
+                                paropt opt = 0);
 
-OIIO_UTIL_API void
-parallel_for(uint32_t begin, uint32_t end, function_view<void(uint32_t)>&& task,
-             paropt opt = 0);
+OIIO_UTIL_API void parallel_for(uint32_t begin, uint32_t end,
+                                function_view<void(uint32_t)>&& task,
+                                paropt opt = 0);
 
-OIIO_UTIL_API void
-parallel_for(uint64_t begin, uint64_t end, function_view<void(uint64_t)>&& task,
-             paropt opt = 0);
-
-OIIO_NAMESPACE_END
+OIIO_UTIL_API void parallel_for(uint64_t begin, uint64_t end,
+                                function_view<void(uint64_t)>&& task,
+                                paropt opt = 0);
 
 
-OIIO_NAMESPACE_3_1_BEGIN
 
 /// Parallel "for" loop, for a task that takes an integer range, run it
 /// on all indices on the range [begin,end):
@@ -332,6 +294,7 @@ OIIO_NAMESPACE_3_1_END
 // Compatibility
 OIIO_NAMESPACE_BEGIN
 #ifndef OIIO_DOXYGEN
+using v3_1::parallel_for;
 using v3_1::parallel_for_2D;
 using v3_1::parallel_for_chunked;
 using v3_1::parallel_for_chunked_2D;

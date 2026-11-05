@@ -143,9 +143,11 @@ private:
     };
 
     struct Layer {
-        uint32_t top, left, bottom, right;
+        int32_t top, left, bottom, right;
         uint32_t width, height;
         uint16_t channel_count;
+
+        bool empty() const { return width == 0 || height == 0; }
 
         std::vector<ChannelInfo> channel_info;
         std::map<int16_t, ChannelInfo*> channel_id_map;
@@ -157,7 +159,7 @@ private:
         uint32_t extra_length;
 
         struct MaskData {
-            uint32_t top, left, bottom, right;
+            int32_t top, left, bottom, right;
             uint8_t default_color;
             uint8_t flags;
         };
@@ -195,7 +197,7 @@ private:
     std::string m_filename;
     //Current subimage
     int m_subimage;
-    //Subimage count (1 + layer count)
+    //Subimage count (composite plus nonempty layers)
     int m_subimage_count;
     std::vector<ImageSpec> m_specs;
     static const ResourceLoader resource_loaders[];
@@ -214,6 +216,7 @@ private:
     std::vector<std::string> m_alpha_names;
     //Index of the transparent color, if any (for Indexed color mode only)
     int16_t m_transparency_index;
+    bool m_has_transparency_index;
     //Background color
     float m_background_color[4];
     ///< Do not convert unassociated alpha
@@ -226,6 +229,7 @@ private:
     GlobalMaskInfo m_global_mask_info;
     ImageDataSection m_image_data;
     ImageBuf m_thumbnail;
+    uint32_t m_maxres = 30000;  // Maximum resolution based on header version
 
     //Reset to initial state
     void init();
@@ -235,6 +239,7 @@ private:
     bool read_header();
     bool validate_header();
     static bool validate_signature(const char signature[4]);
+    bool validate_resolution(string_view name, uint32_t width, uint32_t height);
 
     //Color Mode Data
     bool load_color_data();
@@ -279,6 +284,7 @@ private:
     bool load_layer_channels(Layer& layer);
     bool load_layer_channel(Layer& layer, ChannelInfo& channel_info);
     bool read_rle_lengths(uint32_t height, std::vector<uint32_t>& rle_lengths);
+    bool check_rle_lengths(cspan<uint32_t> rle_lengths, uint64_t available);
 
     //Global Mask Info
     bool load_global_mask_info();
@@ -303,7 +309,7 @@ private:
     // Interleave channels (RRRGGGBBB -> RGBRGBRGB) while copying from
     // channel_buffers[0..nchans-1] to dst.
     template<typename T>
-    static void
+    static bool
     interleave_row(T* dst, cspan<std::vector<unsigned char>> channel_buffers,
                    int width, int nchans);
 
@@ -329,7 +335,15 @@ private:
                 if (c != alpha_channel) {
                     float alpha = data[alpha_channel] * scale;
                     float f     = data[c];
-                    data[c] = T(f - (((1.0f - alpha) * background[c]) / scale));
+                    float value = f
+                                  - (((1.0f - alpha) * background[c]) / scale);
+                    if (std::numeric_limits<T>::is_integer) {
+                        if (value < 0.0f)
+                            value = 0.0f;
+                        else if (value > float(std::numeric_limits<T>::max()))
+                            value = float(std::numeric_limits<T>::max());
+                    }
+                    data[c] = T(value);
                 }
     }
 
@@ -427,7 +441,8 @@ private:
         return true;
     }
 
-    int read_pascal_string(std::string& s, uint16_t mod_padding);
+    bool read_pascal_string(std::string& s, uint16_t mod_padding,
+                            int* bytes_read = nullptr);
 
     // Swap a planar bytespan representing the bytes of a float vector to its
     // interleaved byte order. This is per scanline
@@ -439,7 +454,7 @@ private:
                              uint32_t unpacked_length);
     bool decompress_zip(span<char> src, span<char> dest);
     bool decompress_zip_prediction(span<char> src, span<char> dest,
-                                   const uint32_t width, const uint32_t height);
+                                   const uint64_t width, const uint64_t height);
 
     // These are AdditionalInfo entries that, for PSBs, have an 8-byte length
     static const char* additional_info_psb[];
@@ -494,11 +509,9 @@ private:
 // 1) Add ADD_LOADER(<ResourceID>) below
 // 2) Add a method in PSDInput:
 //    bool load_resource_<ResourceID> (uint32_t length);
-#define ADD_LOADER(id)                                                      \
-    {                                                                       \
-        id, std::bind(&PSDInput::load_resource_##id, std::placeholders::_1, \
-                      std::placeholders::_2)                                \
-    }
+#define ADD_LOADER(id)                                                    \
+    { id, std::bind(&PSDInput::load_resource_##id, std::placeholders::_1, \
+                    std::placeholders::_2) }
 const PSDInput::ResourceLoader PSDInput::resource_loaders[]
     = { ADD_LOADER(1005), ADD_LOADER(1006), ADD_LOADER(1010), ADD_LOADER(1033),
         ADD_LOADER(1036), ADD_LOADER(1039), ADD_LOADER(1047), ADD_LOADER(1058),
@@ -548,7 +561,10 @@ OIIO_PLUGIN_EXPORTS_END
 
 
 
-PSDInput::PSDInput() { init(); }
+PSDInput::PSDInput()
+{
+    init();
+}
 
 
 bool
@@ -575,52 +591,71 @@ PSDInput::open(const std::string& name, ImageSpec& newspec)
     // File Header
     if (!load_header()) {
         errorfmt("failed to open \"{}\": failed load_header", name);
+        close();
         return false;
+    }
+
+    // Set m_type_desc to the appropriate TypeDesc (depends only on the depth,
+    // which load_header has just validated).
+    set_type_desc();
+
+    // Do the resolution/etc sanity checks here, the earliest point at which
+    // the composite resolution, channel count, and data type are known --
+    // before any section allocates or seeks based on them.
+    {
+        ImageSpec headerspec((int)m_header.width, (int)m_header.height,
+                             (int)m_header.channel_count, m_type_desc);
+        if (!check_open(headerspec, { 0, 300000, 0, 300000, 0, 1, 0, 56 })
+            || !check_compression_ratio(headerspec, ioproxy()->size())) {
+            close();
+            return false;
+        }
     }
 
     // Color Mode Data
     if (!load_color_data()) {
         errorfmt("failed to open \"{}\": failed load_color_data", name);
+        close();
         return false;
     }
 
     // Image Resources
     if (!load_resources()) {
         errorfmt("failed to open \"{}\": failed load_resources", name);
+        close();
         return false;
     }
 
     // Layers
     if (!load_layers()) {
         errorfmt("failed to open \"{}\": failed load_layers", name);
+        close();
         return false;
     }
 
     // Global Mask Info
     if (!load_global_mask_info()) {
         errorfmt("failed to open \"{}\": failed load_global_mask_info", name);
+        close();
         return false;
     }
 
     // Global Additional Layer Info
     if (!load_global_additional()) {
         errorfmt("failed to open \"{}\": failed load_global_additional", name);
+        close();
         return false;
     }
 
     // Image Data
     if (!load_image_data()) {
         errorfmt("failed to open \"{}\": failed load_image_data", name);
+        close();
         return false;
     }
 
-    // Layer count + 1 for merged composite (Image Data Section)
-    m_subimage_count = m_layers.size() + 1;
-    // Set m_type_desc to the appropriate TypeDesc
-    set_type_desc();
     // Setup ImageSpecs and m_channels
-    bool ok = true;
-    ok &= setup();
+    bool ok = setup();
 
     if (ok)
         ok &= seek_subimage(0, 0);
@@ -769,7 +804,7 @@ PSDInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
     // here safely.
     const ImageSpec& spec = m_specs[subimage];
     y -= spec.y;
-    if (y < 0 || y > spec.height) {
+    if (y < 0 || y >= spec.height) {
         errorfmt("Requested scanline {} out of range [0-{}]", y,
                  spec.height - 1);
         return false;
@@ -796,16 +831,25 @@ PSDInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
         || m_header.color_mode == ColorMode_Grayscale) {
         switch (bps) {
         case 4:
-            interleave_row((float*)dst, channel_buffers, spec.width,
-                           spec.nchannels);
+            if (!interleave_row((float*)dst, channel_buffers, spec.width,
+                                spec.nchannels)) {
+                errorfmt("Corrupt PSD channel data for row {}", y + spec.y);
+                return false;
+            }
             break;
         case 2:
-            interleave_row((unsigned short*)dst, channel_buffers, spec.width,
-                           spec.nchannels);
+            if (!interleave_row((unsigned short*)dst, channel_buffers,
+                                spec.width, spec.nchannels)) {
+                errorfmt("Corrupt PSD channel data for row {}", y + spec.y);
+                return false;
+            }
             break;
         default:
-            interleave_row((unsigned char*)dst, channel_buffers, spec.width,
-                           spec.nchannels);
+            if (!interleave_row((unsigned char*)dst, channel_buffers,
+                                spec.width, spec.nchannels)) {
+                errorfmt("Corrupt PSD channel data for row {}", y + spec.y);
+                return false;
+            }
             break;
         }
     } else if (m_header.color_mode == ColorMode_CMYK) {
@@ -813,8 +857,11 @@ PSDInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
         switch (bps) {
         case 4: {
             std::unique_ptr<float[]> cmyk(new float[cmyklen]);
-            interleave_row(cmyk.get(), channel_buffers, spec.width,
-                           channel_count);
+            if (!interleave_row(cmyk.get(), channel_buffers, spec.width,
+                                channel_count)) {
+                errorfmt("Corrupt PSD channel data for row {}", y + spec.y);
+                return false;
+            }
             cmyk_to_rgb(spec.width, make_cspan(cmyk.get(), cmyklen),
                         channel_count,
                         make_span((float*)dst, spec.width * spec.nchannels),
@@ -823,8 +870,11 @@ PSDInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
         }
         case 2: {
             std::unique_ptr<unsigned short[]> cmyk(new unsigned short[cmyklen]);
-            interleave_row(cmyk.get(), channel_buffers, spec.width,
-                           channel_count);
+            if (!interleave_row(cmyk.get(), channel_buffers, spec.width,
+                                channel_count)) {
+                errorfmt("Corrupt PSD channel data for row {}", y + spec.y);
+                return false;
+            }
             cmyk_to_rgb(spec.width, make_cspan(cmyk.get(), cmyklen),
                         channel_count,
                         make_span((uint16_t*)dst, spec.width * spec.nchannels),
@@ -833,8 +883,11 @@ PSDInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
         }
         default: {
             std::unique_ptr<unsigned char[]> cmyk(new unsigned char[cmyklen]);
-            interleave_row(cmyk.get(), channel_buffers, spec.width,
-                           channel_count);
+            if (!interleave_row(cmyk.get(), channel_buffers, spec.width,
+                                channel_count)) {
+                errorfmt("Corrupt PSD channel data for row {}", y + spec.y);
+                return false;
+            }
             cmyk_to_rgb(spec.width, make_cspan(cmyk.get(), cmyklen),
                         channel_count,
                         make_span((uint8_t*)dst, spec.width * spec.nchannels),
@@ -912,6 +965,7 @@ PSDInput::init()
     m_channels.clear();
     m_alpha_names.clear();
     m_transparency_index      = -1;
+    m_has_transparency_index  = false;
     m_keep_unassociated_alpha = false;
     m_background_color[0]     = 1.0;
     m_background_color[1]     = 1.0;
@@ -957,6 +1011,22 @@ PSDInput::validate_signature(const char signature[4])
 
 
 bool
+PSDInput::validate_resolution(string_view name, uint32_t width, uint32_t height)
+{
+    if (width < 1 || width > m_maxres) {
+        errorfmt("[{}] invalid image width {}", name, width);
+        return false;
+    }
+    if (height < 1 || height > m_maxres) {
+        errorfmt("[{}] invalid image height {}", name, height);
+        return false;
+    }
+    return true;
+}
+
+
+
+bool
 PSDInput::validate_header()
 {
     if (!validate_signature(m_header.signature)) {
@@ -971,56 +1041,44 @@ PSDInput::validate_header()
         errorfmt("[Header] invalid channel count");
         return false;
     }
-    switch (m_header.version) {
-    case 1:
-        // PSD
-        // width/height range: [1,30000]
-        if (m_header.height < 1 || m_header.height > 30000) {
-            errorfmt("[Header] invalid image height");
-            return false;
-        }
-        if (m_header.width < 1 || m_header.width > 30000) {
-            errorfmt("[Header] invalid image width");
-            return false;
-        }
-        break;
-    case 2:
-        // PSB (Large Document Format)
-        // width/height range: [1,300000]
-        if (m_header.height < 1 || m_header.height > 300000) {
-            errorfmt("[Header] invalid image height {}", m_header.height);
-            return false;
-        }
-        if (m_header.width < 1 || m_header.width > 300000) {
-            errorfmt("[Header] invalid image width {}", m_header.width);
-            return false;
-        }
-        break;
-    }
+    if (m_header.version == 2 /* PSB - Large Document Format */)
+        m_maxres = 300000;
+    else /* PSD */
+        m_maxres = 30000;
+    if (!validate_resolution("Header", m_header.height, m_header.width))
+        return false;
+
     // Valid depths are 1,8,16,32
     if (m_header.depth != 1 && m_header.depth != 8 && m_header.depth != 16
         && m_header.depth != 32) {
         errorfmt("[Header] invalid depth {}", m_header.depth);
         return false;
     }
-    if (m_WantRaw)
-        return true;
-
-    //There are other (undocumented) color modes not listed here
+    // Reject color modes outside the known set
     switch (m_header.color_mode) {
     case ColorMode_Bitmap:
     case ColorMode_Indexed:
     case ColorMode_RGB:
     case ColorMode_Grayscale:
     case ColorMode_CMYK:
-    case ColorMode_Multichannel: break;
+    case ColorMode_Multichannel:
+    case ColorMode_Duotone:
+    case ColorMode_Lab: break;
+    default:
+        errorfmt("[Header] unrecognized color mode {:d}", m_header.color_mode);
+        return false;
+    }
+
+    if (m_WantRaw)
+        return true;
+
+    // Duotone and Lab are only supported via the raw path (handled above).
+    switch (m_header.color_mode) {
     case ColorMode_Duotone:
     case ColorMode_Lab:
         errorfmt("[Header] unsupported color mode {:d}", m_header.color_mode);
         return false;
-    default:
-        errorfmt("[Header] unrecognized color mode {:d}", m_header.color_mode);
-        return false;
+    default: break;
     }
     return true;
 }
@@ -1037,6 +1095,11 @@ PSDInput::load_color_data()
         return false;
 
     if (m_color_data.length) {
+        // Check if the reported size of the color data is less than the
+        // remaining size of the file before we allocate.
+        int64_t file_size = ioproxy() ? ioproxy()->size() : 0;
+        if (iotell() + int64_t(m_color_data.length) > file_size)
+            return false;
         m_color_data.data.reset(new uint8_t[m_color_data.length]);
         return ioread(m_color_data.data.get(), m_color_data.length);
     }
@@ -1195,7 +1258,10 @@ PSDInput::load_resource_1006(uint32_t length)
     int32_t bytes_remaining = length;
     std::string name;
     while (bytes_remaining >= 2) {
-        bytes_remaining -= read_pascal_string(name, 1);
+        int b = 0;
+        if (!read_pascal_string(name, 1, &b))
+            return false;
+        bytes_remaining -= b;
         m_alpha_names.push_back(name);
     }
     return true;
@@ -1240,6 +1306,17 @@ PSDInput::load_resource_1036(uint32_t length)
 bool
 PSDInput::load_resource_1039(uint32_t length)
 {
+    if (length > 10 * 1024 * 1024) {
+        if (OIIO::get_int_attribute("imageinput:strict")) {
+            errorfmt(
+                "Implausibly large ICC profile ({} bytes), presumed corrupted file\n",
+                length);
+            return false;
+        } else {
+            // non-strict mode: skip the probable corruption, but no error
+            return true;
+        }
+    }
     std::unique_ptr<uint8_t[]> icc_buf(new uint8_t[length]);
     if (!ioread(icc_buf.get(), length))
         return false;
@@ -1262,15 +1339,23 @@ PSDInput::load_resource_1039(uint32_t length)
 
 
 bool
-PSDInput::load_resource_1047(uint32_t /*length*/)
+PSDInput::load_resource_1047(uint32_t length)
 {
+    if (length != sizeof(m_transparency_index)) {
+        errorfmt("[Image Resource] Transparency index length {} is invalid",
+                 length);
+        return false;
+    }
+
     if (!read_bige<int16_t>(m_transparency_index))
         return false;
-    if (m_transparency_index < 0 || m_transparency_index >= 768) {
+    if (m_transparency_index < 0 || m_transparency_index >= 256) {
         errorfmt("[Image Resource] Transparency index {} is out of range",
                  m_transparency_index);
         return false;
     }
+
+    m_has_transparency_index = true;
     return true;
 }
 
@@ -1279,13 +1364,24 @@ PSDInput::load_resource_1047(uint32_t /*length*/)
 bool
 PSDInput::load_resource_1058(uint32_t length)
 {
+    if (length > 10 * 1024 * 1024) {
+        if (OIIO::get_int_attribute("imageinput:strict")) {
+            errorfmt(
+                "Implausibly large Exif profile ({} bytes), presumed corrupted file\n",
+                length);
+            return false;
+        } else {
+            // non-strict mode: skip the probable corruption, but no error
+            return true;
+        }
+    }
     std::string data(length, 0);
     if (!ioread(&data[0], length))
         return false;
 
     if (!decode_exif(data, m_composite_attribs)
         || !decode_exif(data, m_common_attribs)) {
-        errorfmt("Failed to decode Exif data");
+        errorfmt("Could not decode Exif");
         return false;
     }
     return true;
@@ -1305,6 +1401,17 @@ PSDInput::load_resource_1059(uint32_t length)
 bool
 PSDInput::load_resource_1060(uint32_t length)
 {
+    if (length > 10 * 1024 * 1024) {
+        if (OIIO::get_int_attribute("imageinput:strict")) {
+            errorfmt(
+                "Implausibly large XMP profile ({} bytes), presumed corrupted file\n",
+                length);
+            return false;
+        } else {
+            // non-strict mode: skip the probable corruption, but no error
+            return true;
+        }
+    }
     std::string data(length, 0);
     if (!ioread(&data[0], length))
         return false;
@@ -1354,7 +1461,21 @@ PSDInput::load_resource_thumbnail(uint32_t length, bool isBGR)
     uint32_t compressed_size;
     uint16_t bpp;
     uint16_t planes;
+
+    // The 28-byte thumbnail header must fit within the resource.
+    if (length < 28) {
+        errorfmt("[Image Resource] [Thumbnail] resource length {} too small",
+                 length);
+        return false;
+    }
     uint32_t jpeg_length = length - 28;
+    int64_t file_size    = ioproxy() ? ioproxy()->size() : 0;
+    if (int64_t(jpeg_length) > file_size - iotell()) {
+        errorfmt(
+            "[Image Resource] [Thumbnail] data length {} exceeds remaining file size",
+            jpeg_length);
+        return false;
+    }
 
     bool ok = read_bige<uint32_t>(format) && read_bige<uint32_t>(width)
               && read_bige<uint32_t>(height) && read_bige<uint32_t>(widthbytes)
@@ -1496,16 +1617,26 @@ bool
 PSDInput::load_layer(Layer& layer)
 {
     bool ok = true;
-    ok &= read_bige<uint32_t>(layer.top);
-    ok &= read_bige<uint32_t>(layer.left);
-    ok &= read_bige<uint32_t>(layer.bottom);
-    ok &= read_bige<uint32_t>(layer.right);
+    ok &= read_bige<int32_t>(layer.top);
+    ok &= read_bige<int32_t>(layer.left);
+    ok &= read_bige<int32_t>(layer.bottom);
+    ok &= read_bige<int32_t>(layer.right);
     ok &= read_bige<uint16_t>(layer.channel_count);
     if (!ok)
         return false;
 
-    layer.width  = std::abs((int)layer.right - (int)layer.left);
-    layer.height = std::abs((int)layer.bottom - (int)layer.top);
+    // The rectangle coordinates are signed 32-bit (a layer may have negative
+    // offsets). Widen to int64 before subtracting: a plain int32 subtraction
+    // can overflow (undefined behavior) on corrupt files with extreme values.
+    // The absolute difference of two int32 always fits in uint32.
+    int64_t w    = int64_t(layer.right) - int64_t(layer.left);
+    int64_t h    = int64_t(layer.bottom) - int64_t(layer.top);
+    layer.width  = uint32_t(w < 0 ? -w : w);
+    layer.height = uint32_t(h < 0 ? -h : h);
+    // Tolerate empty rectangles, but still enforce upper size limits.
+    if (!validate_resolution("Layer Record", std::max(layer.width, 1u),
+                             std::max(layer.height, 1u)))
+        return false;
     layer.channel_info.resize(layer.channel_count);
     for (uint16_t channel = 0; channel < layer.channel_count; channel++) {
         ChannelInfo& channel_info = layer.channel_info[channel];
@@ -1545,10 +1676,10 @@ PSDInput::load_layer(Layer& layer)
         auto lmd_end   = lmd_start + lmd_length;
 
         if (lmd_length >= 4 * 4 + 1 * 2) {
-            ok &= read_bige<uint32_t>(layer.mask_data.top);
-            ok &= read_bige<uint32_t>(layer.mask_data.left);
-            ok &= read_bige<uint32_t>(layer.mask_data.bottom);
-            ok &= read_bige<uint32_t>(layer.mask_data.right);
+            ok &= read_bige<int32_t>(layer.mask_data.top);
+            ok &= read_bige<int32_t>(layer.mask_data.left);
+            ok &= read_bige<int32_t>(layer.mask_data.bottom);
+            ok &= read_bige<int32_t>(layer.mask_data.right);
             ok &= read_bige<uint8_t>(layer.mask_data.default_color);
             ok &= read_bige<uint8_t>(layer.mask_data.flags);
         }
@@ -1571,7 +1702,10 @@ PSDInput::load_layer(Layer& layer)
     if (!ok)
         return false;
 
-    extra_remaining -= read_pascal_string(layer.name, 4);
+    int b = 0;
+    if (!read_pascal_string(layer.name, 4, &b))
+        return false;
+    extra_remaining -= b;
     while (ok && extra_remaining >= 12) {
         layer.additional_info.emplace_back();
         Layer::AdditionalInfo& info = layer.additional_info.back();
@@ -1625,21 +1759,46 @@ PSDInput::load_layer_channel(Layer& layer, ChannelInfo& channel_info)
     if (channel_info.data_length <= 2)
         return true;
 
+    // A channel's stored data, including the 2 byte compression tag already
+    // read, cannot extend past the end of the file. Compare unsigned: for PSB
+    // the length is 64 bits and a corrupt value would wrap negative if cast.
+    int64_t file_size = ioproxy() ? ioproxy()->size() : 0;
+    int64_t remaining = file_size - start_pos;
+    if (remaining < 0 || channel_info.data_length > uint64_t(remaining)) {
+        errorfmt("[Layer Channel] data length {} exceeds remaining file size",
+                 channel_info.data_length);
+        return false;
+    }
+
+    // Empty layers are not exposed as images, but their channels may still
+    // contain RLE row counts or ZIP data. Masks have independent dimensions.
+    if (layer.empty() && channel_info.channel_id != ChannelID_LayerMask)
+        return ioseek(start_pos + channel_info.data_length);
+
     // Use mask_data size when channel_id is -2
     uint32_t width, height;
     if (channel_info.channel_id == ChannelID_LayerMask) {
-        width  = (uint32_t)std::abs((int)layer.mask_data.right
-                                    - (int)layer.mask_data.left);
-        height = (uint32_t)std::abs((int)layer.mask_data.bottom
-                                    - (int)layer.mask_data.top);
+        // Widen to int64 before subtracting: a plain int32 subtraction can
+        // overflow (undefined behavior) on corrupt files with extreme
+        // values. The absolute difference of two int32 always fits in
+        // uint32.
+        int64_t w = int64_t(layer.mask_data.right)
+                    - int64_t(layer.mask_data.left);
+        int64_t h = int64_t(layer.mask_data.bottom)
+                    - int64_t(layer.mask_data.top);
+        width     = uint32_t(w < 0 ? -w : w);
+        height    = uint32_t(h < 0 ? -h : h);
     } else {
         width  = layer.width;
         height = layer.height;
     }
+    if (!validate_resolution("layer_channel", width, height))
+        return false;
     channel_info.width  = width;
     channel_info.height = height;
 
     channel_info.data_pos = iotell();
+
     channel_info.row_pos.resize(height);
     channel_info.row_length = (width * m_header.depth + 7) / 8;
 
@@ -1664,9 +1823,18 @@ PSDInput::load_layer_channel(Layer& layer, ChannelInfo& channel_info)
 
         // channel data is located after the RLE lengths
         channel_info.data_pos = iotell();
-        // subtract the RLE lengths read above
+        // subtract the RLE lengths read above, which a corrupt file may
+        // declare to be longer than the channel itself
+        if (uint64_t(channel_info.data_pos - start_pos)
+            > channel_info.data_length) {
+            errorfmt("[Layer Channel] RLE lengths exceed channel data length");
+            return false;
+        }
         channel_info.data_length = channel_info.data_length
                                    - (channel_info.data_pos - start_pos);
+        if (!check_rle_lengths(channel_info.rle_lengths,
+                               channel_info.data_length))
+            return false;
         if (height) {
             channel_info.row_pos[0] = channel_info.data_pos;
             for (uint32_t i = 1; i < height; ++i)
@@ -1685,7 +1853,7 @@ PSDInput::load_layer_channel(Layer& layer, ChannelInfo& channel_info)
         // randomly so we parse the data up-front and store it
         std::vector<char> compressed_data(channel_info.data_length);
         channel_info.decompressed_data = std::vector<char>(
-            width * height * (m_header.depth / 8));
+            size_t(width) * size_t(height) * (m_header.depth / 8));
 
         if (!ioseek(channel_info.data_pos))
             return false;
@@ -1702,7 +1870,7 @@ PSDInput::load_layer_channel(Layer& layer, ChannelInfo& channel_info)
         // randomly so we parse the data up-front and store it
         std::vector<char> compressed_data(channel_info.data_length);
         channel_info.decompressed_data = std::vector<char>(
-            width * height * (m_header.depth / 8));
+            size_t(width) * size_t(height) * (m_header.depth / 8));
 
         if (!ioseek(channel_info.data_pos))
             return false;
@@ -1737,6 +1905,23 @@ PSDInput::read_rle_lengths(uint32_t height, std::vector<uint32_t>& rle_lengths)
             ok &= read_bige<uint32_t>(rle_lengths[row]);
     }
     return ok;
+}
+
+
+
+// Sum of a channel's RLE row lengths must fit in the bytes available for it.
+bool
+PSDInput::check_rle_lengths(cspan<uint32_t> rle_lengths, uint64_t available)
+{
+    uint64_t total = 0;
+    for (uint32_t len : rle_lengths)
+        total += len;
+    if (total > available) {
+        errorfmt("RLE row lengths ({} bytes) exceed available data ({} bytes)",
+                 total, available);
+        return false;
+    }
+    return true;
 }
 
 
@@ -1793,7 +1978,7 @@ PSDInput::load_global_additional()
     uint64_t length    = 0;
     uint64_t remaining = m_layer_mask_info.length
                          - (iotell() - m_layer_mask_info.begin);
-    bool ok = true;
+    bool ok            = true;
     while (ok && remaining >= 12) {
         if (!ioread(signature, 4))
             return false;
@@ -1851,7 +2036,11 @@ PSDInput::load_layers_16_32(uint64_t length)
 
     LayerMaskInfo::LayerInfo& layer_info = m_layer_mask_info.layer_info;
     // The layer info length must have been 0 in the actual layer info section
-    OIIO_ASSERT(layer_info.length == 0);
+    if (layer_info.length != 0) {
+        errorfmt("[Global Additional Layer Info] unexpected second layer info "
+                 "section");
+        return false;
+    }
     layer_info.length = length;
 
     uint64_t begin = iotell();
@@ -1933,6 +2122,14 @@ PSDInput::load_image_data()
                 return false;
         }
     }
+    if (compression == Compression_RLE) {
+        int64_t file_size = ioproxy() ? ioproxy()->size() : 0;
+        int64_t remaining = std::max(file_size - iotell(), int64_t(0));
+        for (ChannelInfo& channel_info : m_image_data.channel_info) {
+            if (!check_rle_lengths(channel_info.rle_lengths, remaining))
+                return false;
+        }
+    }
     bool ok = true;
     for (ChannelInfo& channel_info : m_image_data.channel_info) {
         channel_info.row_pos.resize(m_header.height);
@@ -1980,7 +2177,7 @@ PSDInput::setup()
             spec_channel_count++;
             raw_channel_count++;
         } else if (m_header.color_mode == ColorMode_Indexed
-                   && m_transparency_index) {
+                   && m_has_transparency_index) {
             spec_channel_count++;
         }
     }
@@ -1997,13 +2194,15 @@ PSDInput::setup()
             spec.attribute("oiio:UnassociatedAlpha", 1);
 
     // Composite channels
-    m_channels.reserve(m_subimage_count);
+    m_channels.reserve(m_layers.size() + 1);
     m_channels.resize(1);
     m_channels[0].reserve(raw_channel_count);
     for (int i = 0; i < raw_channel_count; ++i)
         m_channels[0].push_back(&m_image_data.channel_info[i]);
 
     for (Layer& layer : m_layers) {
+        if (layer.empty())
+            continue;
         spec_channel_count = m_WantRaw ? mode_channel_count[m_header.color_mode]
                                        : 3;
         raw_channel_count  = mode_channel_count[m_header.color_mode];
@@ -2015,9 +2214,19 @@ PSDInput::setup()
         }
         m_specs.emplace_back(layer.width, layer.height, spec_channel_count,
                              m_type_desc);
-        ImageSpec& spec    = m_specs.back();
-        spec.x             = layer.left;
-        spec.y             = layer.top;
+        ImageSpec& spec = m_specs.back();
+        spec.x          = layer.left;
+        spec.y          = layer.top;
+        // Check that x+width and y+height are also going to fit inside an
+        // int32 (similarly to ImageInput::check_open).
+        if (int64_t(spec.x) + spec.width > std::numeric_limits<int>::max()
+            || int64_t(spec.y) + spec.height
+                   > std::numeric_limits<int>::max()) {
+            errorfmt(
+                "Layer data window origin+size is out of range: origin ({}, {}), size {}x{}. Possible corrupt input?",
+                spec.x, spec.y, spec.width, spec.height);
+            return false;
+        }
         spec.extra_attribs = m_common_attribs.extra_attribs;
         if (m_WantRaw)
             fill_channel_names(spec, transparency);
@@ -2029,8 +2238,14 @@ PSDInput::setup()
         std::vector<ChannelInfo*>& channels = m_channels.back();
         channels.reserve(raw_channel_count);
         for (unsigned int i = 0; i < mode_channel_count[m_header.color_mode];
-             ++i)
-            channels.push_back(layer.channel_id_map[i]);
+             ++i) {
+            auto found = layer.channel_id_map.find(int16_t(i));
+            if (found == layer.channel_id_map.end()) {
+                errorfmt("[Layer Record] Layer is missing channel id {}", i);
+                return false;
+            }
+            channels.push_back(found->second);
+        }
 
         if (transparency)
             channels.push_back(layer.channel_id_map[ChannelID_Transparency]);
@@ -2038,6 +2253,7 @@ PSDInput::setup()
             spec.attribute("oiio:subimagename", layer.name);
     }
 
+    m_subimage_count = int(m_specs.size());
     return true;
 }
 
@@ -2123,16 +2339,24 @@ PSDInput::read_channel_row(ChannelInfo& channel_info, uint32_t row, char* data)
 
 
 template<typename T>
-void
+bool
 PSDInput::interleave_row(T* dst,
                          cspan<std::vector<unsigned char>> channel_buffers,
                          int width, int nchans)
 {
+    if (!dst || width < 0 || nchans < 0
+        || span_size_t(channel_buffers.size()) < size_t(nchans))
+        return false;
+
+    const uint64_t row_bytes = uint64_t(width) * sizeof(T);
     for (int c = 0; c < nchans; ++c) {
+        if (channel_buffers[c].size() < row_bytes)
+            return false;
         const T* cbuf = reinterpret_cast<const T*>(channel_buffers[c].data());
         for (int x = 0; x < width; ++x)
             dst[nchans * x + c] = cbuf[x];
     }
+    return true;
 }
 
 
@@ -2144,7 +2368,11 @@ PSDInput::indexed_to_rgb(span<unsigned char> dst, cspan<unsigned char> src,
     OIIO_ASSERT(src.size() && dst.size());
     // The color table is 768 bytes which is 256 * 3 channels (always RGB)
     const auto& table(m_color_data.data);
-    if (m_transparency_index >= 0) {
+    if (src.size() < span_size_t(width))
+        return false;
+    if (m_has_transparency_index) {
+        if (dst.size() < span_size_t(width) * 4)
+            return false;
         for (int i = 0; i < width; ++i) {
             int index = src[i];
             if (index == m_transparency_index) {
@@ -2160,6 +2388,8 @@ PSDInput::indexed_to_rgb(span<unsigned char> dst, cspan<unsigned char> src,
             }
         }
     } else {
+        if (dst.size() < span_size_t(width) * 3)
+            return false;
         for (int i = 0; i < width; ++i) {
             int index      = src[i];
             dst[3 * i + 0] = table[index];        // R
@@ -2202,33 +2432,40 @@ PSDInput::set_type_desc()
 
 
 
-int
-PSDInput::read_pascal_string(std::string& s, uint16_t mod_padding)
+bool
+PSDInput::read_pascal_string(std::string& s, uint16_t mod_padding,
+                             int* bytes_read)
 {
+    if (bytes_read)
+        *bytes_read = 0;
+    int bytes = 0;
     s.clear();
     uint8_t length;
-    int bytes = 0;
-    if (ioread((char*)&length, 1)) {
-        bytes = 1;
-        if (length == 0) {
-            if (ioseek(mod_padding - 1, SEEK_CUR))
-                bytes += mod_padding - 1;
-        } else {
-            s.resize(length);
-            if (ioread(&s[0], length)) {
-                bytes += length;
-                if (mod_padding > 0) {
-                    for (int padded_length = length + 1;
-                         padded_length % mod_padding != 0; padded_length++) {
-                        if (!ioseek(1, SEEK_CUR))
-                            break;
-                        bytes++;
-                    }
-                }
+    if (!ioread((char*)&length, 1))
+        return false;
+    bytes = 1;
+    if (length == 0) {
+        if (ioseek(mod_padding - 1, SEEK_CUR))
+            bytes += mod_padding - 1;
+        else
+            return false;
+    } else {
+        s.resize(length);
+        if (!ioread(&s[0], length))
+            return false;
+        bytes += length;
+        if (mod_padding > 0) {
+            for (int padded_length = length + 1;
+                 padded_length % mod_padding != 0; padded_length++) {
+                if (!ioseek(1, SEEK_CUR))
+                    return false;
+                bytes++;
             }
         }
     }
-    return bytes;
+    if (bytes_read)
+        *bytes_read = bytes;
+    return true;
 }
 
 
@@ -2262,8 +2499,8 @@ bool
 PSDInput::decompress_packbits(const char* src, char* dst,
                               uint32_t packed_length, uint32_t unpacked_length)
 {
-    int32_t src_remaining = packed_length;
-    int32_t dst_remaining = unpacked_length;
+    int64_t src_remaining = packed_length;
+    int64_t dst_remaining = unpacked_length;
     int16_t header;
     int length;
 
@@ -2363,7 +2600,7 @@ PSDInput::decompress_zip(span<char> src, span<char> dest)
 
 bool
 PSDInput::decompress_zip_prediction(span<char> src, span<char> dest,
-                                    const uint32_t width, const uint32_t height)
+                                    const uint64_t width, const uint64_t height)
 {
     OIIO_ASSERT(width * height * (m_header.depth / 8) == dest.size());
     bool ok = true;

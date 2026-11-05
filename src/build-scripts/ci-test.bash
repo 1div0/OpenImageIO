@@ -20,6 +20,16 @@ fi
 #
 echo ; echo "Results of oiiotool --version:"
 $OpenImageIO_ROOT/bin/oiiotool --version
+echo ; echo "Results of oiiotool --buildinfo:"
+$OpenImageIO_ROOT/bin/oiiotool --buildinfo | tee -a "$GITHUB_STEP_SUMMARY"
+# Note: the above both echos the --buildinfo output, and also appends it
+# to the message that will be visible in the GHA summary log page so it's
+# easy to see at a glance which build chain & dependencies were used across
+# all the tests.
+if [[ -s build/clone-retries.txt ]] ; then
+    echo "Recovered from clone failures of: $(awk '{printf "%s%s", (NR>1 ? ", " : ""), $0}' build/clone-retries.txt)" \
+        | tee -a "$GITHUB_STEP_SUMMARY"
+fi
 echo ; echo "Results of oiiotool brief help:"
 $OpenImageIO_ROOT/bin/oiiotool || true
 echo ; echo "Results of oiiotool full --help:"
@@ -46,6 +56,11 @@ echo "Parallel test ${CTEST_PARALLEL_LEVEL}"
 echo "Default timeout ${CTEST_TEST_TIMEOUT}"
 echo "Test exclusions '${CTEST_EXCLUSIONS}'"
 echo "CTEST_ARGS '${CTEST_ARGS}'"
+
+# Adjustments to OPENIMAGEIO_OPTIONS
+# - limits:imagesize_MB=32768 forces the same limit regardless of physical
+#   memory size of the CI runner, for the sake of uniform error messages.
+export OPENIMAGEIO_OPTIONS="limits:imagesize_MB=32768,${OPENIMAGEIO_OPTIONS}"
 
 pushd build
 time ctest -C ${CMAKE_BUILD_TYPE} --force-new-ctest-process --output-on-failure \

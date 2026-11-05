@@ -7,6 +7,9 @@
 
 import os
 
+redirect = " >> out.txt 2>&1 "
+
+
 # print("ociover =", ociover)
 
 # Make test pattern with increasing intensity left to right, decreasing
@@ -96,6 +99,42 @@ command += oiiotool ("--autocc ../common/tahoe-tiny.tif --ociolook \"ACES 1.3 Re
 
 # test various behaviors and misbehaviors related to OCIO configs.
 command += oiiotool ("--nostderr --colorconfig missing.ocio -echo \"Nonexistent config\"", failureok=True)
+
+# Test what happens with autocc and input files with color space names in
+# their filenames, for both color-managed and non-color-managed spaces.
+#
+# Input: We transform an exr with each name to acescg, with autocc.
+# - "nope" is an unknown color space, and should warn.
+# - "raw" means known to be not color managed, and should warn.
+# - "acescg" is known and should end up with output (as acescg) that is
+#   unchanged, so the value should still be 0.5.
+# - "srgb_tx" is known but should make a real transformation, giving a pixel
+#   value that is not 0.5.
+for c in ("nope", "raw", "acescg", "srgb_tx") :
+    command += oiiotool (f"--pattern constant:color=.5 1x1 3 -d half -o in_{c}.exr")
+    command += oiiotool (f"--autocc in_{c}.exr -o out_acescg.exr")
+    command += oiiotool (f"out_acescg.exr -echo \"{c}: {{TOP.AVGCOLOR}} {{TOP.nativeformat}}\"")
+# Output: We transform an acescg image to outputs with each name, with autocc.
+# - "nope" is an unknown color space, and should warn. Or should it?
+# - "raw" should retain the 0.5 value with no warning, since you're asking to
+#   output a non-color-manaaged image.
+# - "acescg" is known and should end up with output (as acescg) that is
+#   unchanged, so the value should still be 0.5.
+# - "srgb_tx" is known but should make a real transformation, giving a pixel
+#   value that is not 0.5.
+for c in ("nope", "raw", "acescg", "srgb_tx") :
+    command += oiiotool (f"--pattern constant:color=.5 1x1 3 -d half -iscolorspace acescg "
+                         + f"-autocc -o out_{c}.exr")
+    command += oiiotool (f"out_{c}.exr -echo \"{c}: {{TOP.AVGCOLOR}} {{TOP.nativeformat}}\"")
+
+# Channels beyond the first four should pass through a color conversion
+# unaltered (issue #5638): channels 4 and 5 must stay 0.25 and 0.75. Only
+# those channels are printed, since the converted RGB values vary in the
+# last digit across platforms.
+command += oiiotool ("--pattern constant:color=.5,.5,.5,1,.25,.75 1x1 6 "
+                     + "--colorconvert lin_srgb sRGB --ch 4,5 "
+                     + "-echo \"6chan: {TOP.AVGCOLOR}\"")
+
 
 
 # To add more tests, just append more lines like the above and also add

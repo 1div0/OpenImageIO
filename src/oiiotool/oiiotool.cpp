@@ -134,7 +134,10 @@ using pvt::print_info_options;
 
 
 
-Oiiotool::Oiiotool() { clear_options(); }
+Oiiotool::Oiiotool()
+{
+    clear_options();
+}
 
 
 
@@ -286,22 +289,39 @@ template<typename T>
 static bool
 scan_offset(string_view str, T& x, T& y)
 {
-    return Strutil::parse_value(str, x)
-           && (str.size() && (str[0] == '+' || str[0] == '-'))
-           && Strutil::parse_value(str, y);
+    string_view orig = str;
+    if (Strutil::parse_value(str, x)
+        && (str.size() && (str[0] == '+' || str[0] == '-'))
+        && Strutil::parse_value(str, y))
+        return true;
+    str = orig;
+    if (Strutil::parse_value(str, x) && Strutil::parse_char(str, ',')
+        && Strutil::parse_value(str, y))
+        return true;
+    return false;
 }
+
 
 
 template<typename T>
 static bool
 scan_res_offset(string_view str, T& w, T& h, T& x, T& y)
 {
-    return Strutil::parse_value(str, w) && Strutil::parse_char(str, 'x')
-           && Strutil::parse_value(str, h)
-           && (str.size() && (str[0] == '+' || str[0] == '-'))
-           && Strutil::parse_value(str, x)
-           && (str.size() && (str[0] == '+' || str[0] == '-'))
-           && Strutil::parse_value(str, y);  // NOSONAR
+    string_view orig = str;
+    if (Strutil::parse_value(str, w) && Strutil::parse_char(str, 'x')
+        && Strutil::parse_value(str, h)
+        && (str.size() && (str[0] == '+' || str[0] == '-'))
+        && Strutil::parse_value(str, x)
+        && (str.size() && (str[0] == '+' || str[0] == '-'))
+        && Strutil::parse_value(str, y))
+        return true;
+    str = orig;
+    if (Strutil::parse_value(str, w) && Strutil::parse_char(str, 'x')
+        && Strutil::parse_value(str, h) && Strutil::parse_char(str, ',')
+        && Strutil::parse_value(str, x) && Strutil::parse_char(str, ',')
+        && Strutil::parse_value(str, y))
+        return true;
+    return false;
 }
 
 
@@ -416,6 +436,13 @@ Oiiotool::read(ImageRecRef img, ReadPolicy readpolicy, string_view channel_set)
     total_imagecache_readtime += post_ic_time - pre_ic_time;
     total_readtime.add_seconds(pre_ic_time - post_ic_time);
 
+    // A failed read leaves the ImageRec with no subimages, so bail out before
+    // anything below tries to examine its specs.
+    if (!ok || !img->subimages()) {
+        error("read", format_read_error(img->name(), img->geterror()));
+        return false;
+    }
+
     // If this is the first tiled image we have come across, use it to
     // set our tile size (unless the user explicitly set a tile size, or
     // explicitly instructed scanline output).
@@ -428,9 +455,7 @@ Oiiotool::read(ImageRecRef img, ReadPolicy readpolicy, string_view channel_set)
     // channel name that we encounter.
     remember_input_channelformats(img);
 
-    if (!ok)
-        error("read", format_read_error(img->name(), img->geterror()));
-    return ok;
+    return true;
 }
 
 
@@ -454,9 +479,13 @@ Oiiotool::read_nativespec(ImageRecRef img)
     imagecache->getattribute("stat:fileio_time", post_ic_time);
     total_imagecache_readtime += post_ic_time - pre_ic_time;
 
-    if (!ok)
+    // A failed read leaves the ImageRec with no subimages, so callers must
+    // not be handed back a "success" they will dereference.
+    if (!ok || !img->subimages()) {
         error("read", format_read_error(img->name(), img->geterror()));
-    return ok;
+        return false;
+    }
+    return true;
 }
 
 
@@ -968,7 +997,7 @@ adjust_output_options(string_view filename, ImageSpec& spec,
     if (tilesize.size()) {
         int x, y;  // dummy vals for adjust_geometry
         ot.adjust_geometry("-o", requested_tilewidth, requested_tileheight, x,
-                           y, tilesize.c_str(), false);
+                           y, tilesize.c_str(), false, false);
     }
     bool requested_scanline = fileoptions.get_int("scanline",
                                                   ot.output_scanline);
@@ -1641,9 +1670,7 @@ Oiiotool::get_position(string_view command, string_view geom, int& x, int& y)
 
 
 // Tround rounds x to the nearest T type.
-template<typename T>
-inline T
-Tround(float x);
+template<typename T> inline T Tround(float x);
 
 // Tround of float to float just returns the float, no round necessary.
 template<>
@@ -1775,7 +1802,23 @@ unit_test_adjust_geometry(Oiiotool& ot)
     OIIO_CHECK_ASSERT(
         !ot.adjust_geometry("foo", w, h, x, y, "10x20+100+200", true, false));
 
-    // res
+    // geom with comma notation for origin
+    w = h = x = y = -42;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "10x20,100,200")
+                      && x == 100 && y == 200 && w == 10 && h == 20);
+    w = h = x = y = -42;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "10x20,-100,-200")
+                      && x == -100 && y == -200 && w == 10 && h == 20);
+    w = 100, h = 50, x = y = 0;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "20x0,100,200")
+                      && x == 100 && y == 200 && w == 20 && h == 10);
+    w = 100, h = 50, x = y = 0;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "0x20,100,200")
+                      && x == 100 && y == 200 && w == 40 && h == 20);
+    OIIO_CHECK_ASSERT(
+        !ot.adjust_geometry("foo", w, h, x, y, "10x20+100+200", true, false));
+
+    // res only
     w = h = x = y = -42;
     OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "10x20") && x == -42
                       && y == -42 && w == 10 && h == 20);
@@ -1807,6 +1850,23 @@ unit_test_adjust_geometry(Oiiotool& ot)
     w = h = x = y = -42;
     OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "+100+200")
                       && x == 100 && y == 200 && w == -42 && h == -42);
+    w = h = x = y = -42;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "+100-200")
+                      && x == 100 && y == -200 && w == -42 && h == -42);
+    w = h = x = y = -42;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "-100+200")
+                      && x == -100 && y == 200 && w == -42 && h == -42);
+
+    // offset with comma notation
+    w = h = x = y = -42;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "100,200")
+                      && x == 100 && y == 200 && w == -42 && h == -42);
+    w = h = x = y = -42;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "100,-200")
+                      && x == 100 && y == -200 && w == -42 && h == -42);
+    w = h = x = y = -42;
+    OIIO_CHECK_ASSERT(ot.adjust_geometry("foo", w, h, x, y, "-100,200")
+                      && x == -100 && y == 200 && w == -42 && h == -42);
 
     // scale by factor
     w = 640;
@@ -1978,7 +2038,7 @@ static bool
 do_rotate_orientation(ImageSpec& spec, string_view cmd)
 {
     bool rotcw  = (cmd == "--orientcw" || cmd == "-orientcw" || cmd == "--rotcw"
-                  || cmd == "-rotcw");
+                   || cmd == "-rotcw");
     bool rotccw = (cmd == "--orientccw" || cmd == "-orientccw"
                    || cmd == "--rotccw" || cmd == "-rotccw");
     bool rot180 = (cmd == "--orient180" || cmd == "-orient180"
@@ -2325,8 +2385,7 @@ static void
 set_colorconfig(Oiiotool& ot, cspan<const char*> argv)
 {
     OIIO_DASSERT(argv.size() == 2);
-    ot.colorconfig().reset(argv[1]);
-    if (ot.colorconfig().has_error()) {
+    if (!ot.colorconfig().reset(argv[1])) {
         ot.errorfmt("--colorconfig", "{}", ot.colorconfig().geterror());
     }
 }
@@ -2836,6 +2895,38 @@ action_channels(Oiiotool& ot, cspan<const char*> argv)
 
 
 
+// --nchannels
+static void
+action_nchannels(Oiiotool& ot, cspan<const char*> argv)
+{
+    if (ot.postpone_callback(1, action_nchannels, argv))
+        return;
+
+    // Get the requested number of channels
+    int n = Strutil::stoi(ot.express(argv[1]));
+    if (n < 1) {
+        ot.errorfmt(argv[0], "nchannels must be at least 1 (got {})", n);
+        return;
+    }
+
+    // We build the indices into a vector, then join them into a string.
+    std::vector<int> indices;
+    for (int i = 0; i < n; ++i)
+        indices.push_back(i);
+
+    // Convert to ustring to ensure the underlying char* is interned.
+    // This guarantees the pointer remains valid even if action_channels
+    // defers execution (postpones) beyond the scope of this function.
+    ustring channel_list(Strutil::join(indices, ","));
+
+    // Hand off to action_channels with our generated index list.
+    // this ensures we are always doing the same thing as --ch
+    const char* fake_argv[] = { argv[0], channel_list.c_str() };
+    action_channels(ot, fake_argv);
+}
+
+
+
 // --chappend
 static void
 action_chappend(Oiiotool& ot, cspan<const char*> argv)
@@ -3133,6 +3224,118 @@ action_subimage_append_all(Oiiotool& ot, cspan<const char*> argv)
 
 
 
+// --thumbnail-get
+static void
+action_thumbnail_get(Oiiotool& ot, cspan<const char*> argv)
+{
+    if (ot.postpone_callback(1, action_thumbnail_get, argv))
+        return;
+    string_view command = ot.express(argv[0]);
+    OTScopedTimer timer(ot, command);
+
+    // Parse options from the command token, e.g.
+    //     --thumbnail-get:fail=0:index=0
+    auto options = ot.extract_options(command);
+
+    bool fail_if_missing = options.get_int("fail", 1);
+    int index            = options.get_int("index", 0);
+
+    // The current ImageInput/ImageBuf API exposes only a single (primary)
+    // thumbnail per subimage. Formats that embed multiple thumbnails at
+    // different resolutions (such as some camera raw formats) cannot yet be
+    // distinguished, so for now only index 0 is valid. The `:index=` modifier
+    // reserves the syntax for when the API gains multi-thumbnail support.
+    // See https://github.com/AcademySoftwareFoundation/OpenImageIO/issues/4888
+    if (index != 0) {
+        ot.errorfmt(command,
+                    "Thumbnail index {} is not available; only the primary "
+                    "thumbnail (index 0) is currently supported",
+                    index);
+        return;
+    }
+
+    ImageRecRef A = ot.pop();
+    // Reading the spec loads the thumbnail, so avoid a full pixel read.
+    if (!ot.read_nativespec(A)) {
+        ot.push(A);
+        return;
+    }
+
+    auto thumb = (*A)(0, 0).get_thumbnail();
+    if (!thumb || !thumb->initialized()) {
+        if (fail_if_missing) {
+            ot.errorfmt(command, "Image \"{}\" has no thumbnail", A->name());
+            ot.push(A);
+            return;
+        }
+
+        // synthesize a thumbnail from the image itself
+        if (!ot.read(A)) {
+            ot.push(A);
+            return;
+        }
+
+        const ImageBuf& Aib((*A)(0, 0));
+        const ImageSpec& Aspec(Aib.spec());
+
+        // Fit inside a box, preserving aspect ratio and never enlarging
+        const int boxsize = 256;
+        int longest = std::max(1,
+                               std::max(Aspec.full_width, Aspec.full_height));
+        float scale = std::min(1.0f, float(boxsize) / float(longest));
+        int tw      = std::max(1, int(roundf(Aspec.full_width * scale)));
+        int th      = std::max(1, int(roundf(Aspec.full_height * scale)));
+        ROI roi(0, tw, 0, th, 0, 1, 0, Aspec.nchannels);
+
+        ImageBufRef generated(new ImageBuf(
+            ImageBufAlgo::resize(Aib, ImageBufAlgo::KWArgs(), roi)));
+
+        if (generated->has_error()) {
+            ot.errorfmt(command, "{}", generated->geterror());
+            ot.push(A);
+            return;
+        }
+        ot.push(new ImageRec(generated, false));
+        return;
+    }
+    ot.push(new ImageRec(ImageBufRef(new ImageBuf(*thumb)), false));
+}
+
+
+
+// --thumbnail-set
+static void
+action_thumbnail_set(Oiiotool& ot, cspan<const char*> argv)
+{
+    if (ot.postpone_callback(2, action_thumbnail_set, argv))
+        return;
+    string_view command = ot.express(argv[0]);
+    OTScopedTimer timer(ot, command);
+
+    // Top image is the thumbnail
+    ImageRecRef T = ot.pop();
+    ImageRecRef A = ot.pop();
+    if (!ot.read(T) || !ot.read(A)) {
+        ot.push(A);
+        ot.push(T);
+        return;
+    }
+
+    const ImageBuf& thumb((*T)(0, 0));
+    if (!thumb.initialized()) {
+        ot.errorfmt(command, "Thumbnail image \"{}\" is empty", T->name());
+        ot.push(A);
+        ot.push(T);
+        return;
+    }
+
+    (*A)(0, 0).set_thumbnail(thumb);
+    A->update_spec_from_imagebuf(0, 0);
+    ot.push(A);
+}
+
+
+
 // --colorcount
 static void
 action_colorcount(Oiiotool& ot, cspan<const char*> argv)
@@ -3271,13 +3474,6 @@ action_flipdiff(Oiiotool& ot, cspan<const char*> argv)
     string_view command = ot.express(argv[0]);
     OTScopedTimer timer(ot, command);
 
-    if (!ot.experimental) {
-        ot.errorfmt(
-            command,
-            "--flipdiff cannot be used without the --experimental flag.");
-        return;
-    }
-
     // Pop reference (deeper) and test (top) images.
     ImageRecRef test = ot.pop();
     ImageRecRef ref  = ot.pop();
@@ -3296,8 +3492,7 @@ action_flipdiff(Oiiotool& ot, cspan<const char*> argv)
     bool do_print        = options.get_int("print", 1);
 
     ImageBuf dst;
-    bool ok = ImageBufAlgo::experimental::FLIP_diff(dst, img_ref, img_test,
-                                                    options);
+    bool ok = ImageBufAlgo::FLIP_diff(dst, img_ref, img_test, options);
     if (!ok) {
         ot.error(command, dst.geterror());
         return;
@@ -3502,12 +3697,11 @@ OIIOTOOL_OP(colormap, 1, [&](OiiotoolOp& op, span<ImageBuf*> img) {
 // that we don't break compatibility repeatedly.
 
 namespace ImageBufAlgox {
-ImageBuf
-cryptomatte_colors(const ImageBuf& src, span<const int> channelset,
-                   ROI roi = {}, int nthreads = 0);
-bool
-cryptomatte_colors(ImageBuf& dst, const ImageBuf& src,
-                   span<const int> channelset, ROI roi = {}, int nthreads = 0);
+ImageBuf cryptomatte_colors(const ImageBuf& src, span<const int> channelset,
+                            ROI roi = {}, int nthreads = 0);
+bool cryptomatte_colors(ImageBuf& dst, const ImageBuf& src,
+                        span<const int> channelset, ROI roi = {},
+                        int nthreads = 0);
 }  // namespace ImageBufAlgox
 
 // The cryptomatte spec can be found here:
@@ -3793,6 +3987,22 @@ OIIOTOOL_OP(demosaic, 1, [&](OiiotoolOp& op, span<ImageBuf*> img) {
     }
 
     return ImageBufAlgo::demosaic(*img[0], *img[1], KWArgs(list));
+});
+
+
+// --decorrstretch
+OIIOTOOL_OP(decorrstretch, 1, [&](OiiotoolOp& op, span<ImageBuf*> img) {
+    ParamValueList list;
+    const std::vector<std::string> keys = { "firstchannel", "nchannels",
+                                            "scale",        "sigma",
+                                            "mean",         "percentile",
+                                            "mode" };
+    for (const auto& key : keys) {
+        auto iter = op.options().find(key);
+        if (iter != op.options().cend())
+            list.push_back(iter[0]);
+    }
+    return ImageBufAlgo::decorr_stretch(*img[0], *img[1], KWArgs(list));
 });
 
 
@@ -4352,14 +4562,14 @@ public:
             }
             nochange = false;
             // Compute corresponding data window.
-            float wratio = float(newspec.full_width) / float(Aspec.full_width);
-            float hratio = float(newspec.full_height)
-                           / float(Aspec.full_height);
-            newspec.x = newspec.full_x
-                        + int(floorf((Aspec.x - Aspec.full_x) * wratio));
-            newspec.y = newspec.full_y
-                        + int(floorf((Aspec.y - Aspec.full_y) * hratio));
-            newspec.width  = int(ceilf(Aspec.width * wratio));
+            float wratio  = float(newspec.full_width) / float(Aspec.full_width);
+            float hratio  = float(newspec.full_height)
+                            / float(Aspec.full_height);
+            newspec.x     = newspec.full_x
+                            + int(floorf((Aspec.x - Aspec.full_x) * wratio));
+            newspec.y     = newspec.full_y
+                            + int(floorf((Aspec.y - Aspec.full_y) * hratio));
+            newspec.width = int(ceilf(Aspec.width * wratio));
             newspec.height = int(ceilf(Aspec.height * hratio));
         }
         if (nochange) {
@@ -4418,10 +4628,10 @@ public:
                                / float(Aspec.full_width);
                 float hratio = float(newspec.full_height)
                                / float(Aspec.full_height);
-                newspec.x = newspec.full_x
-                            + int(floorf((Aspec.x - Aspec.full_x) * wratio));
-                newspec.y = newspec.full_y
-                            + int(floorf((Aspec.y - Aspec.full_y) * hratio));
+                newspec.x    = newspec.full_x
+                               + int(floorf((Aspec.x - Aspec.full_x) * wratio));
+                newspec.y    = newspec.full_y
+                               + int(floorf((Aspec.y - Aspec.full_y) * hratio));
                 newspec.width  = int(ceilf(Aspec.width * wratio));
                 newspec.height = int(ceilf(Aspec.height * hratio));
             }
@@ -5263,12 +5473,12 @@ OIIOTOOL_OP(contrast, 1, [&](OiiotoolOp& op, span<ImageBuf*> img) {
         op.options().get_string("black", "0"), n, 0.0f);
     auto white = Strutil::extract_from_list_string(
         op.options().get_string("white", "1"), n, 1.0f);
-    auto min
-        = Strutil::extract_from_list_string(op.options().get_string("min", "0"),
-                                            n, 0.0f);
-    auto max
-        = Strutil::extract_from_list_string(op.options().get_string("max", "1"),
-                                            n, 1.0f);
+    auto min = Strutil::extract_from_list_string(op.options().get_string("min",
+                                                                         "0"),
+                                                 n, 0.0f);
+    auto max = Strutil::extract_from_list_string(op.options().get_string("max",
+                                                                         "1"),
+                                                 n, 1.0f);
     auto scontrast = Strutil::extract_from_list_string(
         op.options().get_string("scontrast", "1"), n, 1.0f);
     auto sthresh = Strutil::extract_from_list_string(
@@ -5414,6 +5624,7 @@ input_file(Oiiotool& ot, cspan<const char*> argv)
                                                     ot.printinfo_format);
     TypeDesc input_dataformat(fileoptions.get_string("type"));
     std::string channel_set = fileoptions["ch"];
+    bool get_thumbnail      = fileoptions.get_int("get_thumbnail", 0);
 
     for (int i = 0; i < std::ssize(argv); i++) {
         // FIXME: this loop is pointless, since there is ever only one arg
@@ -5471,7 +5682,7 @@ input_file(Oiiotool& ot, cspan<const char*> argv)
                 // Try to get a more precise error message to report.
                 auto in         = ImageInput::open(filename);
                 std::string err = in ? in->geterror() : OIIO::geterror();
-                errmsg = Strutil::format(ot.format_read_error(filename, err));
+                errmsg          = ot.format_read_error(filename, err);
             }
             // Second chances: do we have a substitute image policy?
             ImageSpec substitute_spec;
@@ -5521,16 +5732,20 @@ input_file(Oiiotool& ot, cspan<const char*> argv)
             if (ot.input_config_set)
                 ot.curimg->configspec(ot.input_config);
             ot.curimg->input_dataformat(input_dataformat);
+            bool ok;
             if (readnow) {
                 ReadPolicy policy = native ? ReadNativeNoCache : ReadNoCache;
-                ot.read(policy, channel_set);
-            } else
-                ot.read_nativespec();
+                ok                = ot.read(policy, channel_set);
+            } else {
+                ok = ot.read_nativespec();
+            }
+            if (!ok)
+                break;  // error already reported by the read
+            const ImageSpec* nspec = ot.curimg->nativespec();
             if (!ot.first_input_dimensions_is_set()) {
                 ImageSpec new_first_dims;
-                new_first_dims.copy_dimensions(*ot.curimg->nativespec());
-                new_first_dims.channelnames
-                    = ot.curimg->nativespec()->channelnames;
+                new_first_dims.copy_dimensions(*nspec);
+                new_first_dims.channelnames = nspec->channelnames;
                 ot.set_first_input_dimensions(new_first_dims);
                 if (ot.parent_oiiotool)
                     ot.parent_oiiotool->set_first_input_dimensions(
@@ -5556,6 +5771,20 @@ input_file(Oiiotool& ot, cspan<const char*> argv)
         // the input timer.
         timer.stop();
 
+        if (get_thumbnail && !substitute) {
+            // Swap in the embedded thumbnail via the --thumbnail-get logic.
+            // Done before autoorient/autocc so they apply to the thumbnail.
+            std::string thumbcmd = "--thumbnail-get";
+            if (fileoptions.contains("fail"))
+                thumbcmd += Strutil::fmt::format(":fail={}",
+                                                 fileoptions.get_int("fail"));
+            if (fileoptions.contains("index"))
+                thumbcmd += Strutil::fmt::format(":index={}",
+                                                 fileoptions.get_int("index"));
+            const char* argv[] = { thumbcmd.c_str() };
+            action_thumbnail_get(ot, argv);
+        }
+
         if (ot.autoorient) {
             void action_reorient(Oiiotool & ot, cspan<const char*> argv);
             const char* argv[] = { "--reorient" };
@@ -5566,6 +5795,8 @@ input_file(Oiiotool& ot, cspan<const char*> argv)
             // Try to deduce the color space it's in
             std::string colorspace(
                 ot.colorconfig().getColorSpaceFromFilepath(filename, "", true));
+            if (colorspace == "unknown")
+                colorspace.clear();
             if (colorspace.size() && ot.debug)
                 OIIO::print("  From {}, we deduce color space \"{}\"\n",
                             filename, colorspace);
@@ -5601,6 +5832,45 @@ input_file(Oiiotool& ot, cspan<const char*> argv)
 
     ot.clear_input_config();
     ot.input_channel_set.clear();
+    ot.check_peak_memory();
+    // ot.total_readtime.stop();
+    return 0;
+}
+
+
+
+// --testread
+static int
+test_read(Oiiotool& ot, cspan<const char*> argv)
+{
+    // ot.total_readtime.start();
+    string_view command  = ot.express(argv[0]);
+    string_view filename = ot.express(argv[1]);
+    auto fileoptions     = ot.extract_options(command);
+    TypeDesc input_dataformat(fileoptions.get_string("type", "uint8"));
+
+    OTScopedTimer timer(ot, command);
+
+    bool ok  = true;
+    auto inp = OIIO::ImageInput::open(filename, ot.input_config_set
+                                                    ? &ot.input_config
+                                                    : nullptr);
+    if (inp)
+        ok = OIIO::pvt::test_read_all_images(*inp, input_dataformat);
+    if (!ok || !inp) {
+        ot.error("testread",
+                 ot.format_read_error(filename, inp ? inp->geterror()
+                                                    : OIIO::geterror()));
+    } else {
+        OIIO::print("OK {}\n", filename);
+    }
+    ot.printed_info = true;
+
+    // Everything past this point should be credited to other ops, so stop
+    // the input timer.
+    timer.stop();
+
+    ot.process_pending();
     ot.check_peak_memory();
     // ot.total_readtime.stop();
     return 0;
@@ -5728,9 +5998,9 @@ output_file(Oiiotool& ot, cspan<const char*> argv)
     string_view stripped_command = command;
     Strutil::parse_char(stripped_command, '-');
     Strutil::parse_char(stripped_command, '-');
-    bool do_tex     = Strutil::starts_with(stripped_command, "otex");
-    bool do_latlong = Strutil::starts_with(stripped_command, "oenv")
-                      || Strutil::starts_with(stripped_command, "olatlong");
+    bool do_tex        = Strutil::starts_with(stripped_command, "otex");
+    bool do_latlong    = Strutil::starts_with(stripped_command, "oenv")
+                         || Strutil::starts_with(stripped_command, "olatlong");
     bool do_shad       = Strutil::starts_with(stripped_command, "oshad");
     bool do_bumpslopes = Strutil::starts_with(stripped_command, "obump");
 
@@ -5863,13 +6133,14 @@ output_file(Oiiotool& ot, cspan<const char*> argv)
         for (int s = 0; s < ir->subimages(); ++s)
             crops_needed |= (roi != (*ir)(s).roi());
         if (crops_needed) {
-            std::string crop
-                = (ir->spec(0, 0)->depth == 1)
-                      ? format_resolution(roi.width(), roi.height(), roi.xbegin,
-                                          roi.ybegin)
-                      : format_resolution(roi.width(), roi.height(),
-                                          roi.depth(), roi.xbegin, roi.ybegin,
-                                          roi.zbegin);
+            std::string crop = (ir->spec(0, 0)->depth == 1)
+                                   ? format_resolution(roi.width(),
+                                                       roi.height(), roi.xbegin,
+                                                       roi.ybegin)
+                                   : format_resolution(roi.width(),
+                                                       roi.height(),
+                                                       roi.depth(), roi.xbegin,
+                                                       roi.ybegin, roi.zbegin);
             const char* argv[] = { "crop:allsubimages=1", crop.c_str() };
             void action_crop(Oiiotool & ot,
                              cspan<const char*> argv);  // forward decl
@@ -5905,10 +6176,11 @@ output_file(Oiiotool& ot, cspan<const char*> argv)
         TypeDesc type;
         int bits;
         type = ot.colorconfig().getColorSpaceDataType(outcolorspace, &bits);
-        if (type.basetype != TypeDesc::UNKNOWN) {
+        if (type != TypeUnknown && type != TypeFloat) {
             if (ot.debug)
-                std::cout << "  Deduced data type " << type << " (" << bits
-                          << "bits) for output to " << filename << "\n";
+                OIIO::print(
+                    "  Deduced data type {} ({} bits) for output to {}\n", type,
+                    bits, filename);
             if ((ot.output_dataformat && ot.output_dataformat != type)
                 || (bits && ot.output_bitspersample
                     && ot.output_bitspersample != bits)) {
@@ -6440,6 +6712,8 @@ print_ocio_info(Oiiotool& ot, std::ostream& out)
                 && colorconfig.equivalent(n, linear))
             || colorconfig.isColorSpaceLinear(n))
             out << " (linear)";
+        if (!colorconfig.isColorSpaceActive(n))
+            out << " (inactive)";
         out << "\n";
         auto aliases = colorconfig.getAliases(n);
         if (aliases.size()) {
@@ -6525,9 +6799,9 @@ print_build_info(Oiiotool& ot, std::ostream& out)
                             OIIO_CPLUSPLUS_VERSION, __cplusplus);
     OIIO::print(out, "{}\n", Strutil::wordwrap(buildinfo, columns, 4));
 
-    auto hwbuildfeats
-        = format("    HW features enabled at build: {}",
-                 OIIO::get_string_attribute("build:simd", "no SIMD"));
+    auto hwbuildfeats = format("    HW features enabled at build: {}",
+                               OIIO::get_string_attribute("build:simd",
+                                                          "no SIMD"));
     OIIO::print(out, "{}\n", Strutil::wordwrap(hwbuildfeats, columns, 4));
 #ifdef OIIO_USE_CUDA
     int cudaver = OIIO::get_int_attribute("cuda:build_version");
@@ -6858,13 +7132,17 @@ Oiiotool::getargs(int argc, char* argv[])
 
     ap.separator("Commands that read images:");
     ap.arg("-i %s:FILENAME")
-      .help("Input file (options: autocc=, ch=, info=, infoformat=, native=, now=, type=, unpremult=)")
+      .help("Input file (options: autocc=, ch=, get_thumbnail=, info=, "
+            "infoformat=, native=, now=, type=, unpremult=)")
       .OTACTION(input_file);
     ap.arg("--iconfig %s:NAME %s:VALUE")
       .help("Sets input config attribute (options: type=...)")
       .OTACTION(set_input_attribute);
     ap.arg("--missingfile %s:OPTION", &ot.missingfile_policy)
       .help("Set policy for missing input files: 'error' (default), 'black', 'checker'");
+    ap.arg("--testread %s:FILENAME")
+      .help("Test file read (do not keep image; used for debugging)")
+      .OTACTION(test_read);
 
     ap.separator("Commands that write images:");
     ap.arg("-o %s:FILENAME")
@@ -7026,7 +7304,7 @@ Oiiotool::getargs(int argc, char* argv[])
       .help("Print report on the Yee perceptual difference of two images (modified by --fail, --failpercent, --hardfail, --warn, --warnpercent --hardwarn)")
       .OTACTION(action_pdiff);
     ap.arg("--flipdiff")
-      .help("[EXPERIMENTAL] Compute FLIP perceptual difference of two images (options: hdr=1, colormap=NAME, ppd=67.02, maxluminance=2.0)")
+      .help("Compute FLIP perceptual difference of two images (options: hdr=1, colormap=NAME, ppd=67.02, maxluminance=2.0)")
       .OTACTION(action_flipdiff);
     ap.arg("--add")
       .help("Add two images")
@@ -7247,6 +7525,9 @@ Oiiotool::getargs(int argc, char* argv[])
     ap.arg("--saturate %f:SCALE")
       .help("Scale saturation of the color channels")
       .OTACTION(action_saturate);
+    ap.arg("--decorrstretch")
+      .help("Decorrelation stretch, exaggerating subtle color variation (options: firstchannel=0, nchannels=, scale=1.0, sigma=, mean=, percentile=, mode=covariance|correlation)")
+      .OTACTION(action_decorrstretch);
     ap.arg("--rangecompress")
       .help("Compress the range of pixel values with a log scale (options: luma=0|1)")
       .OTACTION(action_rangecompress);
@@ -7276,6 +7557,9 @@ Oiiotool::getargs(int argc, char* argv[])
     ap.arg("--ch %s:CHANLIST")
       .help("Select or shuffle channels (e.g., \"R,G,B\", \"B,G,R\", \"2,3,4\")")
       .OTACTION(action_channels);
+    ap.arg("--nchannels %d:N")
+      .help("Force the current image to have N channels (padding with 0.0 as needed)")
+      .OTACTION(action_nchannels);
     ap.arg("--chappend")
       .help("Append the channels of the last two images")
       .OTACTION(action_chappend);
@@ -7306,6 +7590,12 @@ Oiiotool::getargs(int argc, char* argv[])
     ap.arg("--flatten")
       .help("Flatten deep image to non-deep")
       .OTACTION(action_flatten);
+    ap.arg("--thumbnail-get")
+      .help("Extract an embedded thumbnail (options: fail=, index=)")
+      .OTACTION(action_thumbnail_get);
+    ap.arg("--thumbnail-set")
+      .help("Attach the top image as the thumbnail of the image below it")
+      .OTACTION(action_thumbnail_set);
 
     ap.separator("Image stack manipulation:");
     ap.arg("--label %s")
@@ -7521,9 +7811,9 @@ handle_sequence(Oiiotool& ot, int argc, const char** argv)
     // '%v' or '%V' characters.  Any found indicate that there are numeric
     // range or wildcards to deal with.  Also look for --frames,
     // --framepadding and --views options.
-#define ONERANGE_SPEC "-?[0-9]+(--?[0-9]+((x|y)-?[0-9]+)?)?"
+#define ONERANGE_SPEC  "-?[0-9]+(--?[0-9]+((x|y)-?[0-9]+)?)?"
 #define MANYRANGE_SPEC ONERANGE_SPEC "(," ONERANGE_SPEC ")*"
-#define VIEW_SPEC "%[Vv]"
+#define VIEW_SPEC      "%[Vv]"
 #define SEQUENCE_SPEC        \
     "((" MANYRANGE_SPEC ")?" \
     "((#|@)+|(%[0-9]*d)))"   \

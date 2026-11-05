@@ -32,6 +32,8 @@ Full command line was:
  
 Reading black.tif
     oiio:DebugOpenConfig!: 42
+Reading black.tif
+
 Reading add_rgb_rgba.exr
 add_rgb_rgba.exr     :   64 x   64, 4 channel, float openexr
     SHA-1: 9CCAC57A0A0D45F40EF14337A95207094D008E02
@@ -40,6 +42,7 @@ add_rgb_rgba.exr     :   64 x   64, 4 channel, float openexr
     PixelAspectRatio: 1
     screenWindowCenter: 0, 0
     screenWindowWidth: 1
+    oiio:RowsPerChunk: 16
     oiio:subimages: 1
     openexr:lineOrder: "increasingY"
 dumpdata:
@@ -62,6 +65,10 @@ oiiotool ERROR: -o : Non-existent output directory: folder1/folder2
 Full command line was:
 > oiiotool --create 2x2 1 -o folder1/folder2/out.tif
 folder1/folder2/out.tif :    2 x    2, 1 channel, float tiff
+WARNING: --ch: Unknown channel name "R", filling with 0 (actual channels: "Y")
+WARNING: --ch: Unknown channel name "R", filling with 0 (actual channels: "Y")
+    channel list: Y
+    channel list: R
 Comparing "filled.tif" and "ref/filled.tif"
 PASS
 Comparing "autotrim.tif" and "ref/autotrim.tif"
@@ -203,4 +210,12 @@ PASS
 Comparing "box_over_missing2.tif" and "ref/box_over_missing2.tif"
 PASS
 Comparing "box_over_missing3.tif" and "ref/box_over_missing3.tif"
+PASS
+Comparing "single_channel_black.tif" and "ref/single_channel_black.tif"
+PASS
+Comparing "single_channel_good.tif" and "ref/single_channel_good.tif"
+PASS
+Comparing "single_channel_good_y.exr" and "ref/single_channel_good_y.exr"
+PASS
+Comparing "single_channel_good_r.exr" and "ref/single_channel_good_r.exr"
 PASS

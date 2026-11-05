@@ -10,6 +10,7 @@
 #include <iostream>
 #include <memory>
 
+#include <tiffconf.h>
 #include <tiffio.h>
 #include <zlib.h>
 
@@ -41,12 +42,8 @@
 #    define OIIO_TIFFLIB_VERSION 40200
 #elif TIFFLIB_VERSION >= 20191103
 #    define OIIO_TIFFLIB_VERSION 40100
-#elif TIFFLIB_VERSION >= 20120922
-#    define OIIO_TIFFLIB_VERSION 40003
-#elif TIFFLIB_VERSION >= 20111221
-#    define OIIO_TIFFLIB_VERSION 40000
 #else
-#    error "libtiff 4.0.0 or later is required"
+#    error "libtiff 4.1.0 or later is required"
 #endif
 // clang-format on
 
@@ -109,6 +106,7 @@ private:
     int m_outputchans;             // Number of channels for the output
     bool m_convert_rgb_to_cmyk;
     bool m_bigtiff;  // force bigtiff
+    bool m_allow_half = false;
 
     // Initialize private members to pre-opened state
     void init(void)
@@ -123,6 +121,7 @@ private:
         m_outputchans         = 0;
         m_convert_rgb_to_cmyk = false;
         m_bigtiff             = false;
+        m_allow_half          = false;
         ioproxy_clear();
     }
 
@@ -138,15 +137,15 @@ private:
     }
 
     // Convert planar contiguous to planar separate data format
-    void contig_to_separate(int n, int nchans, const char* contig,
+    void contig_to_separate(size_t n, int nchans, const char* contig,
                             char* separate);
 
     // Convert RGB to CMYK.
-    void* convert_to_cmyk(int npixels, const void* data,
+    void* convert_to_cmyk(size_t npixels, const void* data,
                           std::vector<unsigned char>& cmyk);
 
     // Fix unusual bit depths
-    void fix_bitdepth(void* data, int nvals);
+    void fix_bitdepth(void* data, size_t nvals);
 
     // Add a parameter to the output
     bool put_parameter(const ParamValue& metadata);
@@ -287,10 +286,8 @@ OIIO_PLUGIN_EXPORTS_END
 
 
 #if OIIO_TIFFLIB_VERSION < 40500
-extern std::string&
-oiio_tiff_last_error();
-extern void
-oiio_tiff_set_error_handler();
+extern std::string& oiio_tiff_last_error();
+extern void oiio_tiff_set_error_handler();
 #endif
 
 
@@ -315,24 +312,23 @@ static std::pair<int, const char*> tiff_output_compressions[] = {
     //  { COMPRESSION_NEXT,          "next" },        // NeXT 2-bit RLE
     //  { COMPRESSION_CCITTRLEW,     "ccittrle2" },   // #1 w/ word alignment
     { COMPRESSION_PACKBITS, "packbits" },  // Macintosh RLE
-//  { COMPRESSION_THUNDERSCAN,   "thunderscan" }, // ThundeScan RLE
-//  { COMPRESSION_IT8CTPAD,      "IT8CTPAD" },    // IT8 CT w/ patting
-//  { COMPRESSION_IT8LW,         "IT8LW" },       // IT8 linework RLE
-//  { COMPRESSION_IT8MP,         "IT8MP" },       // IT8 monochrome picture
-//  { COMPRESSION_IT8BL,         "IT8BL" },       // IT8 binary line art
-//  { COMPRESSION_PIXARFILM,     "pixarfilm" },   // Pixar 10 bit LZW
-//  { COMPRESSION_PIXARLOG,      "pixarlog" },    // Pixar 11 bit ZIP
-//  { COMPRESSION_DCS,           "dcs" },         // Kodak DCS encoding
-//  { COMPRESSION_JBIG,          "isojbig" },     // ISO JBIG
-//  { COMPRESSION_SGILOG,        "sgilog" },      // SGI log luminance RLE
-//  { COMPRESSION_SGILOG24,      "sgilog24" },    // SGI log 24bit
-//  { COMPRESSION_JP2000,        "jp2000" },      // Leadtools JPEG2000
-#if defined(TIFF_VERSION_BIG) && OIIO_TIFFLIB_VERSION >= 40003
-// Others supported in more recent TIFF library versions.
-//  { COMPRESSION_T85,           "T85" },         // TIFF/FX T.85 JBIG
-//  { COMPRESSION_T43,           "T43" },         // TIFF/FX T.43 color layered JBIG
-//  { COMPRESSION_LZMA,          "lzma" },        // LZMA2
-#endif
+    //  { COMPRESSION_THUNDERSCAN,   "thunderscan" }, // ThundeScan RLE
+    //  { COMPRESSION_IT8CTPAD,      "IT8CTPAD" },    // IT8 CT w/ patting
+    //  { COMPRESSION_IT8LW,         "IT8LW" },       // IT8 linework RLE
+    //  { COMPRESSION_IT8MP,         "IT8MP" },       // IT8 monochrome picture
+    //  { COMPRESSION_IT8BL,         "IT8BL" },       // IT8 binary line art
+    //  { COMPRESSION_PIXARFILM,     "pixarfilm" },   // Pixar 10 bit LZW
+    //  { COMPRESSION_PIXARLOG,      "pixarlog" },    // Pixar 11 bit ZIP
+    //  { COMPRESSION_DCS,           "dcs" },         // Kodak DCS encoding
+    //  { COMPRESSION_JBIG,          "isojbig" },     // ISO JBIG
+    //  { COMPRESSION_SGILOG,        "sgilog" },      // SGI log luminance RLE
+    //  { COMPRESSION_SGILOG24,      "sgilog24" },    // SGI log 24bit
+    //  { COMPRESSION_JP2000,        "jp2000" },      // Leadtools JPEG2000
+    //  { COMPRESSION_T85,           "T85" },         // TIFF/FX T.85 JBIG
+    //  { COMPRESSION_T43,           "T43" },         // TIFF/FX T.43 color layered JBIG
+    //  { COMPRESSION_LZMA,          "lzma" },        // LZMA2
+    //  { COMPRESSION_ZSTD,          "zstd" },        // zstd
+    //  { COMPRESSION_WEBP,          "webp" },        // webp
 };
 
 static int
@@ -395,9 +391,6 @@ TIFFOutput::supports(string_view feature) const
     // Everything else, we either don't support or don't know about
     return false;
 }
-
-
-#define ICC_PROFILE_ATTR "ICCProfile"
 
 
 // Do all elements of vector d have value v?
@@ -473,7 +466,7 @@ TIFFOutput::open(const std::string& name, const ImageSpec& userspec,
     closetif();
 
     if (!check_open(mode, userspec,
-                    { 0, 1 << 20, 0, 1 << 20, 0, 1 << 16, 0, 1 << 16 }))
+                    { 0, 1 << 30, 0, 1 << 30, 0, 1 << 16, 0, 1 << 16 }))
         return false;
 
     // Check for things this format doesn't support
@@ -509,6 +502,13 @@ TIFFOutput::open(const std::string& name, const ImageSpec& userspec,
     m_bigtiff |= m_spec.image_bytes() > (4000LL * 1024LL * 1024LL);
     const char* openmode = m_bigtiff ? (mode == AppendSubimage ? "a8" : "w8")
                                      : (mode == AppendSubimage ? "a" : "w");
+
+    if (m_spec.format == TypeDesc::HALF) {
+        // Look for hints about whether half output is allowed
+        m_allow_half
+            = m_spec.get_int_attribute("tiff:half",
+                                       OIIO::get_int_attribute("tiff:half"));
+    }
 
     // Open the file
 #if OIIO_TIFFLIB_VERSION >= 40500
@@ -625,8 +625,7 @@ TIFFOutput::open(const std::string& name, const ImageSpec& userspec,
         // unless the "tiff:half" attribute is nonzero -- use the global
         // OIIO attribute, but override with a specific attribute for this
         // file.
-        if (m_spec.get_int_attribute("tiff:half",
-                                     OIIO::get_int_attribute("tiff:half"))) {
+        if (m_allow_half) {
             m_bitspersample = 16;
         } else {
             // Silently change requests for unsupported 'half' to 'float'
@@ -875,18 +874,14 @@ TIFFOutput::open(const std::string& name, const ImageSpec& userspec,
     }
 
     // Write ICC profile, if we have anything
-    const ParamValue* icc_profile_parameter = m_spec.find_attribute(
-        ICC_PROFILE_ATTR);
-    if (icc_profile_parameter != NULL) {
-        unsigned char* icc_profile
-            = (unsigned char*)icc_profile_parameter->data();
-        uint32_t length = icc_profile_parameter->type().size();
-        if (icc_profile && length)
-            TIFFSetField(m_tif, TIFFTAG_ICCPROFILE, length, icc_profile);
+    std::vector<uint8_t> icc_profile = get_colorspace_icc_profile(m_spec);
+    if (icc_profile.size()) {
+        uint32_t icc_profile_size = uint32_t(icc_profile.size());
+        TIFFSetField(m_tif, TIFFTAG_ICCPROFILE, icc_profile_size,
+                     icc_profile.data());
     }
 
-    if (equivalent_colorspace(m_spec.get_string_attribute("oiio:ColorSpace"),
-                              "srgb_rec709_scene"))
+    if (is_colorspace_srgb(m_spec, false))
         m_spec.attribute("Exif:ColorSpace", 1);
 
     // Deal with missing XResolution or YResolution, or a PixelAspectRatio
@@ -927,6 +922,16 @@ TIFFOutput::open(const std::string& name, const ImageSpec& userspec,
     // Deal with all other params
     for (const auto& p : m_spec.extra_attribs)
         put_parameter(p);
+
+    // Now that m_rowsperstrip has stopped moving -- put_parameter above
+    // honors a "tiff:RowsPerStrip" request -- say how many scanlines are in
+    // each of the strips we are about to write, so that
+    // ImageOutput::write_image can hand us whole strips. A value carried in
+    // from some other file says nothing about this one, so erase it either
+    // way.
+    m_spec.erase_attribute("oiio:RowsPerChunk");
+    if (!m_spec.tile_width && m_rowsperstrip > 1)
+        m_spec.attribute("oiio:RowsPerChunk", m_rowsperstrip);
 
     if (m_spec.get_int_attribute("tiff:write_iptc")) {
         // Enable IPTC block writing only if "tiff_write_iptc" hint is explicitly
@@ -1087,7 +1092,6 @@ TIFFOutput::put_parameter(const ParamValue& param)
 bool
 TIFFOutput::write_exif_data()
 {
-#if defined(TIFF_VERSION_BIG) && OIIO_TIFFLIB_VERSION >= 40003
     // Older versions of libtiff do not support writing Exif directories
 
     if (m_spec.get_int_attribute("tiff:write_exif", 1) == 0) {
@@ -1111,25 +1115,25 @@ TIFFOutput::write_exif_data()
                 continue;  // libtiff doesn't understand these
             any_exif = true;
         }
-#    if OIIO_TIFFLIB_VERSION >= 40200
+#if OIIO_TIFFLIB_VERSION >= 40200
         if (!any_gps && gps_tag_lookup(p.name(), tag, tifftype, count)
             && tifftype != TIFF_NOTYPE) {
             any_gps = true;
         }
-#    endif
+#endif
         if (any_exif && any_gps)
             break;  // If we've found both kinds, we're done
     }
     if (!any_exif && !any_gps)
         return true;
 
-#    if ENABLE_JPEG_COMPRESSION
+#if ENABLE_JPEG_COMPRESSION
     if (m_compression == COMPRESSION_JPEG) {
         // For reasons we don't understand, JPEG-compressed TIFF seems
         // to not output properly without a directory checkpoint here.
         TIFFCheckpointDirectory(m_tif);
     }
-#    endif
+#endif
 
     // First, finish writing the current directory
     if (!TIFFWriteDirectory(m_tif)) {
@@ -1146,7 +1150,7 @@ TIFFOutput::write_exif_data()
         }
         exif_dir_offset = write_extra_tag_directory("Exif");
     }
-#    if OIIO_TIFFLIB_VERSION >= 40200
+#if OIIO_TIFFLIB_VERSION >= 40200
     uint64_t gps_dir_offset = 0;
     if (any_gps) {
         // Create a GPS directory
@@ -1156,17 +1160,16 @@ TIFFOutput::write_exif_data()
         }
         gps_dir_offset = write_extra_tag_directory("GPS");
     }
-#    endif
+#endif
 
     // Go back to the first directory, and add the EXIFIFD pointer.
     // std::cout << "diffdir = " << tiffdir << "\n";
     TIFFSetDirectory(m_tif, 0);
     if (exif_dir_offset)
         TIFFSetField(m_tif, TIFFTAG_EXIFIFD, exif_dir_offset);
-#    if OIIO_TIFFLIB_VERSION >= 40200
+#if OIIO_TIFFLIB_VERSION >= 40200
     if (gps_dir_offset)
         TIFFSetField(m_tif, TIFFTAG_GPSIFD, gps_dir_offset);
-#    endif
 #endif
 
     return true;  // all is ok
@@ -1309,13 +1312,13 @@ TIFFOutput::close()
 /// Helper: Convert n pixels from contiguous (RGBRGBRGB) to separate
 /// (RRRGGGBBB) planarconfig.
 void
-TIFFOutput::contig_to_separate(int n, int nchans, const char* contig,
+TIFFOutput::contig_to_separate(size_t n, int nchans, const char* contig,
                                char* separate)
 {
-    int channelbytes = m_spec.channel_bytes();
-    for (int p = 0; p < n; ++p)                     // loop over pixels
-        for (int c = 0; c < nchans; ++c)            // loop over channels
-            for (int i = 0; i < channelbytes; ++i)  // loop over data bytes
+    size_t channelbytes = m_spec.channel_bytes();
+    for (size_t p = 0; p < n; ++p)                     // loop over pixels
+        for (size_t c = 0; c < size_t(nchans); ++c)    // loop over channels
+            for (size_t i = 0; i < channelbytes; ++i)  // loop over data bytes
                 separate[(c * n + p) * channelbytes + i]
                     = contig[(p * nchans + c) * channelbytes + i];
 }
@@ -1324,7 +1327,8 @@ TIFFOutput::contig_to_separate(int n, int nchans, const char* contig,
 
 template<typename T>
 static void
-rgb_to_cmyk(int n, const T* rgb, size_t rgb_stride, T* cmyk, size_t cmyk_stride)
+rgb_to_cmyk(size_t n, const T* rgb, size_t rgb_stride, T* cmyk,
+            size_t cmyk_stride)
 {
     for (; n; --n, cmyk += cmyk_stride, rgb += rgb_stride) {
         float R               = convert_type<T, float>(rgb[0]);
@@ -1348,7 +1352,7 @@ rgb_to_cmyk(int n, const T* rgb, size_t rgb_stride, T* cmyk, size_t cmyk_stride)
 
 
 void*
-TIFFOutput::convert_to_cmyk(int npixels, const void* data,
+TIFFOutput::convert_to_cmyk(size_t npixels, const void* data,
                             std::vector<unsigned char>& cmyk)
 {
     cmyk.resize(m_outputchans * spec().format.size() * npixels);
@@ -1388,10 +1392,11 @@ TIFFOutput::write_scanline(int y, int z, TypeDesc format, const void* data,
     y -= m_spec.y;
     if (m_planarconfig == PLANARCONFIG_SEPARATE && m_spec.nchannels > 1) {
         // Convert from contiguous (RGBRGBRGB) to separate (RRRGGGBBB)
-        int plane_bytes = m_spec.width * m_spec.format.size();
+        size_t plane_bytes = size_t(m_spec.width) * m_spec.format.size();
 
         char* separate;
-        OIIO_ALLOCATE_STACK_OR_HEAP(separate, char, plane_bytes* m_outputchans);
+        OIIO_ALLOCATE_STACK_OR_HEAP(separate, char,
+                                    plane_bytes* size_t(m_outputchans));
 
         contig_to_separate(m_spec.width, m_outputchans, (const char*)data,
                            separate);
@@ -1631,7 +1636,7 @@ TIFFOutput::write_tile(int x, int y, int z, TypeDesc format, const void* data,
     // Handle weird bit depths
     if (spec().format.size() * 8 != m_bitspersample) {
         data = move_to_scratch(data, tile_vals * spec().format.size());
-        fix_bitdepth(m_scratch.data(), int(tile_vals));
+        fix_bitdepth(m_scratch.data(), tile_vals);
     }
 
     if (m_planarconfig == PLANARCONFIG_SEPARATE && m_spec.nchannels > 1) {
@@ -1641,7 +1646,8 @@ TIFFOutput::write_tile(int x, int y, int z, TypeDesc format, const void* data,
         OIIO_DASSERT(plane_bytes * m_spec.nchannels == m_spec.tile_bytes());
 
         char* separate;
-        OIIO_ALLOCATE_STACK_OR_HEAP(separate, char, plane_bytes* m_outputchans);
+        OIIO_ALLOCATE_STACK_OR_HEAP(separate, char,
+                                    plane_bytes* size_t(m_outputchans));
         contig_to_separate(tile_pixels, m_outputchans, (const char*)data,
                            separate);
         for (int c = 0; c < m_outputchans; ++c) {
@@ -1788,10 +1794,11 @@ TIFFOutput::write_tiles(int xbegin, int xend, int ybegin, int yend, int zbegin,
                         tile_ystride = tile_xstride * m_spec.tile_width;
                         tile_zstride = tile_ystride * m_spec.tile_height;
                     }
-                    const void* buf
-                        = to_native_tile(format, tilestart, tile_xstride,
-                                         tile_ystride, tile_zstride,
-                                         tilebuf[tileno], m_dither, x, y, z);
+                    const void* buf = to_native_tile(format, tilestart,
+                                                     tile_xstride, tile_ystride,
+                                                     tile_zstride,
+                                                     tilebuf[tileno], m_dither,
+                                                     x, y, z);
                     if (buf == (const void*)tilestart) {
                         // Ugly detail: if to_native_rectangle did not allocate
                         // scratch space and copy to it, we need to do it now,
@@ -1891,48 +1898,48 @@ TIFFOutput::source_is_rgb(const ImageSpec& spec)
 
 
 void
-TIFFOutput::fix_bitdepth(void* data, int nvals)
+TIFFOutput::fix_bitdepth(void* data, size_t nvals)
 {
     OIIO_DASSERT(spec().format.size() * 8 != m_bitspersample);
 
     if (spec().format == TypeDesc::UINT16 && m_bitspersample == 10) {
         unsigned short* v = (unsigned short*)data;
-        for (int i = 0; i < nvals; ++i)
+        for (size_t i = 0; i < nvals; ++i)
             v[i] = bit_range_convert<16, 10>(v[i]);
         bit_pack(cspan<unsigned short>(v, v + nvals), v, 10);
     } else if (spec().format == TypeDesc::UINT16 && m_bitspersample == 12) {
         unsigned short* v = (unsigned short*)data;
-        for (int i = 0; i < nvals; ++i)
+        for (size_t i = 0; i < nvals; ++i)
             v[i] = bit_range_convert<16, 12>(v[i]);
         bit_pack(cspan<unsigned short>(v, v + nvals), v, 12);
     } else if (spec().format == TypeDesc::UINT16 && m_bitspersample == 14) {
         unsigned short* v = (unsigned short*)data;
-        for (int i = 0; i < nvals; ++i)
+        for (size_t i = 0; i < nvals; ++i)
             v[i] = bit_range_convert<16, 14>(v[i]);
         bit_pack(cspan<unsigned short>(v, v + nvals), v, 14);
     } else if (spec().format == TypeDesc::UINT8 && m_bitspersample == 4) {
         unsigned char* v = (unsigned char*)data;
-        for (int i = 0; i < nvals; ++i)
+        for (size_t i = 0; i < nvals; ++i)
             v[i] = bit_range_convert<8, 4>(v[i]);
         bit_pack(cspan<unsigned char>(v, v + nvals), v, 4);
     } else if (spec().format == TypeDesc::UINT8 && m_bitspersample == 2) {
         unsigned char* v = (unsigned char*)data;
-        for (int i = 0; i < nvals; ++i)
+        for (size_t i = 0; i < nvals; ++i)
             v[i] = bit_range_convert<8, 2>(v[i]);
         bit_pack(cspan<unsigned char>(v, v + nvals), v, 2);
     } else if (spec().format == TypeDesc::UINT8 && m_bitspersample == 6) {
         unsigned char* v = (unsigned char*)data;
-        for (int i = 0; i < nvals; ++i)
+        for (size_t i = 0; i < nvals; ++i)
             v[i] = bit_range_convert<8, 6>(v[i]);
         bit_pack(cspan<unsigned char>(v, v + nvals), v, 6);
     } else if (spec().format == TypeDesc::UINT8 && m_bitspersample == 1) {
         unsigned char* v = (unsigned char*)data;
-        for (int i = 0; i < nvals; ++i)
+        for (size_t i = 0; i < nvals; ++i)
             v[i] = bit_range_convert<8, 1>(v[i]);
         bit_pack(cspan<unsigned char>(v, v + nvals), v, 1);
     } else if (spec().format == TypeDesc::UINT32 && m_bitspersample == 24) {
         unsigned int* v = (unsigned int*)data;
-        for (int i = 0; i < nvals; ++i)
+        for (size_t i = 0; i < nvals; ++i)
             v[i] = bit_range_convert<32, 24>(v[i]);
         bit_pack(cspan<unsigned int>(v, v + nvals), v, 24);
     } else {

@@ -8,9 +8,28 @@
 #include <OpenImageIO/dassert.h>
 #include <OpenImageIO/export.h>
 #include <OpenImageIO/strutil.h>
+#include <OpenImageIO/sysutil.h>
 #include <OpenImageIO/thread.h>
 #include <OpenImageIO/unordered_map_concurrent.h>
 #include <OpenImageIO/ustring.h>
+
+
+
+OIIO_NAMESPACE_BEGIN
+namespace pvt {
+
+// If nonzero, the ustring table will be freed at process exit. This is off by
+// default because cleanup is unnecessary (the OS reclaims the memory) and can
+// add measurable time at exit for large tables. Enable it when using valgrind
+// or other leak detectors to suppress false positives. Settable via
+// OIIO::attribute("ustring:cleanup",1) or the OIIO_USTRING_CLEANUP
+// environment variable.
+OIIO_UTIL_API int oiio_ustring_cleanup = Strutil::stoi(
+    Sysutil::getenv("OIIO_USTRING_CLEANUP"));
+
+}  // namespace pvt
+OIIO_NAMESPACE_END
+
 
 OIIO_NAMESPACE_3_1_BEGIN
 
@@ -38,15 +57,30 @@ template<unsigned BASE_CAPACITY, unsigned POOL_SIZE> struct TableRepMap {
 
     TableRepMap()
         : entries(static_cast<ustring::TableRep**>(
-            calloc(BASE_CAPACITY, sizeof(ustring::TableRep*))))
+              calloc(BASE_CAPACITY, sizeof(ustring::TableRep*))))
         , pool(static_cast<char*>(malloc(POOL_SIZE)))
         , memory_usage(sizeof(*this) + POOL_SIZE
                        + sizeof(ustring::TableRep*) * BASE_CAPACITY)
     {
+        pool_allocs.push_back(pool);
     }
 
     ~TableRepMap()
-    { /* just let memory leak */
+    {
+        if (OIIO::pvt::oiio_ustring_cleanup) {
+            // If requested, take the time to properly destroy all the entries
+            // and everything we malloced.
+            ustring_write_lock_t lock(mutex);
+            for (size_t i = 0; i <= mask; ++i) {
+                if (entries[i])
+                    entries[i]->~TableRep();
+            }
+            free(entries);
+            for (auto p : pool_allocs)
+                free(p);
+        } else {
+            /* just let memory leak */
+        }
     }
 
     size_t get_memory_usage()
@@ -187,13 +221,16 @@ private:
 
         if (len >= POOL_SIZE) {
             memory_usage += len;
-            return (char*)malloc(len);  // no need to try and use the pool
+            char* r = (char*)malloc(len);  // no need to try and use the pool
+            pool_allocs.push_back(r);
+            return r;
         }
         if (pool_offset + len > POOL_SIZE) {
             // NOTE: old pool will leak - this is ok because ustrings cannot be freed
             memory_usage += POOL_SIZE;
             pool        = (char*)malloc(POOL_SIZE);
             pool_offset = 0;
+            pool_allocs.push_back(pool);
         }
         char* result = pool + pool_offset;
         pool_offset += len;
@@ -207,6 +244,7 @@ private:
     char* pool;
     size_t pool_offset = 0;
     size_t memory_usage;
+    std::vector<char*> pool_allocs;
 #ifdef USTRING_TRACK_NUM_LOOKUPS
     size_t num_lookups = 0;
 #endif
@@ -421,8 +459,8 @@ ustring::TableRep::TableRep(string_view strref, ustring::hash_t hash)
     // the length), we construct it ourselves, forcing the pointer to point
     // to the characters in the TableRep we allocated.
     if (length >= libcpp_string__min_cap /* it'll be a "long string" */) {
-        ((libcpp_string__long*)&str)->__cap_ = libcpp_string__long_mask
-                                               | (length + 1);
+        ((libcpp_string__long*)&str)->__cap_  = libcpp_string__long_mask
+                                                | (length + 1);
         ((libcpp_string__long*)&str)->__size_ = length;
         ((libcpp_string__long*)&str)->__data_ = (char*)c_str();
         OIIO_DASSERT(str.c_str() == c_str() && str.size() == length);
@@ -557,7 +595,7 @@ ustring::make_unique(string_view strref)
             std::string s = Strutil::escape_chars(strref);
             print(stderr, "IDEMPOTENT RE-HASH! |{}|\n", s);
             for (auto c : s)
-                print(stderr, c > 0 ? "{:c}" : "\\{:03o}",
+                print(stderr, fmt::runtime(c > 0 ? "{:c}" : "\\{:03o}"),
                       static_cast<unsigned char>(c));
             print(stderr, "\n");
 #    endif

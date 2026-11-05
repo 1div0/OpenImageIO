@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // https://github.com/AcademySoftwareFoundation/OpenImageIO
 
-// clang-format off
-
 /////////////////////////////////////////////////////////////////////////
 /// @file   thread.h
 ///
@@ -40,6 +38,44 @@
 // allowing this construct on all platforms.
 #ifndef OIIO_THREAD_ALLOW_DCLP
 #    define OIIO_THREAD_ALLOW_DCLP 1
+#endif
+
+
+// ThreadSanitizer cannot tell that the spin locks below are locks: they are
+// built out of atomics, so it never sees the happens-before edges they
+// establish and reports races on the data they protect. The __tsan_mutex_*
+// hooks tell it. Compiled away unless the TU is built with tsan.
+#if defined(__SANITIZE_THREAD__)
+#    define OIIO_TSAN_ANNOTATE_LOCKS 1
+#elif defined(__has_feature)
+#    if __has_feature(thread_sanitizer)
+#        define OIIO_TSAN_ANNOTATE_LOCKS 1
+#    endif
+#endif
+#ifndef OIIO_TSAN_ANNOTATE_LOCKS
+#    define OIIO_TSAN_ANNOTATE_LOCKS 0
+#endif
+
+#if OIIO_TSAN_ANNOTATE_LOCKS
+#    include <sanitizer/tsan_interface.h>
+#    define OIIO_TSAN_PRE_LOCK(m, f)  __tsan_mutex_pre_lock((void*)(m), (f))
+#    define OIIO_TSAN_POST_LOCK(m, f) __tsan_mutex_post_lock((void*)(m), (f), 0)
+#    define OIIO_TSAN_PRE_UNLOCK(m, f) \
+        ((void)__tsan_mutex_pre_unlock((void*)(m), (f)))
+#    define OIIO_TSAN_POST_UNLOCK(m, f) \
+        __tsan_mutex_post_unlock((void*)(m), (f))
+#    define OIIO_TSAN_F_TRY __tsan_mutex_try_lock
+#    define OIIO_TSAN_F_TRY_FAILED \
+        (__tsan_mutex_try_lock | __tsan_mutex_try_lock_failed)
+#    define OIIO_TSAN_F_READ __tsan_mutex_read_lock
+#else
+#    define OIIO_TSAN_PRE_LOCK(m, f)    ((void)0)
+#    define OIIO_TSAN_POST_LOCK(m, f)   ((void)0)
+#    define OIIO_TSAN_PRE_UNLOCK(m, f)  ((void)0)
+#    define OIIO_TSAN_POST_UNLOCK(m, f) ((void)0)
+#    define OIIO_TSAN_F_TRY             0
+#    define OIIO_TSAN_F_TRY_FAILED      0
+#    define OIIO_TSAN_F_READ            0
 #endif
 
 
@@ -81,8 +117,8 @@ public:
 using std::mutex;
 using std::recursive_mutex;
 using std::thread;
-using lock_guard = std::lock_guard<mutex>;
-using recursive_lock_guard = std::lock_guard<recursive_mutex>;
+using lock_guard                 = std::lock_guard<mutex>;
+using recursive_lock_guard       = std::lock_guard<recursive_mutex>;
 using recursive_timed_lock_guard = std::lock_guard<std::recursive_timed_mutex>;
 
 
@@ -98,50 +134,53 @@ yield() noexcept
 
 
 
-// Slight pause
+// Slight pause. Unrolling a constant-delay pause bloats every inlined
+// spin_mutex::lock(), so tell the compiler not to.
+#define OIIO_PAUSE_NOUNROLL \
+    OIIO_CLANG_PRAGMA(nounroll) OIIO_GCC_ONLY_PRAGMA(GCC unroll 1)
+
 inline void
 pause(int delay) noexcept
 {
-#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
-    for (int i = 0; i < delay; ++i)
-        __asm__ __volatile__("pause;");
-
-#elif defined(__GNUC__) && (defined(__arm__) || defined(__s390__))
-    for (int i = 0; i < delay; ++i)
-        __asm__ __volatile__("NOP;");
-
-#elif defined(_MSC_VER)
+    OIIO_PAUSE_NOUNROLL
     for (int i = 0; i < delay; ++i) {
-        // A reimplementation of winnt.h YieldProcessor,
-        // to avoid including windows headers.
-        #if defined(_M_AMD64)
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+        __asm__ __volatile__("pause;");
+#elif defined(__GNUC__) && defined(__aarch64__)
+        // isb, not yield: yield is effectively a nop (e.g. on Apple Silicon).
+        __asm__ __volatile__("isb" ::: "memory");
+#elif defined(__GNUC__) && (defined(__arm__) || defined(__s390__))
+        __asm__ __volatile__("NOP;");
+#elif defined(_MSC_VER)
+// A reimplementation of winnt.h YieldProcessor,
+// to avoid including windows headers.
+#    if defined(_M_AMD64) && !defined(_M_ARM64EC)
         _mm_pause();
-        #elif defined(_M_ARM64) || defined(_M_HYBRID_X86_ARM64)
+#    elif defined(_M_ARM64) || defined(_M_ARM64EC) \
+        || defined(_M_HYBRID_X86_ARM64)
         __dmb(_ARM64_BARRIER_ISHST);
         __yield();
-        #elif defined(_M_ARM)
+#    elif defined(_M_ARM)
         __dmb(_ARM_BARRIER_ISHST);
         __yield();
-        #else
+#    else
         _asm pause
-        #endif
-    }
-
+#    endif
 #else
-    // No pause on this platform, just punt
-    for (int i = 0; i < delay; ++i)
-        ;
+        // No pause on this platform, just punt
 #endif
+    }
 }
 
 
 
 // Helper class to deliver ever longer pauses until we yield our timeslice.
+// Pauses double from 1 up to `pausemax`, then repeat `pausemax` for
+// `spins` more rounds, then each call yields the timeslice.
 class atomic_backoff {
 public:
-    atomic_backoff(int pausemax = 16) noexcept
-        : m_count(1)
-        , m_pausemax(pausemax)
+    atomic_backoff(int pausemax = 16, int spins = 0) noexcept
+        : m_count(1), m_pausemax(pausemax), m_spins(spins)
     {
     }
 
@@ -150,6 +189,9 @@ public:
         if (m_count <= m_pausemax) {
             pause(m_count);
             m_count *= 2;
+        } else if (m_spins > 0) {
+            pause(m_pausemax);
+            --m_spins;
         } else {
             std::this_thread::yield();
         }
@@ -158,8 +200,8 @@ public:
 private:
     int m_count;
     int m_pausemax;
+    int m_spins;
 };
-
 
 
 
@@ -200,34 +242,21 @@ public:
     ///
     void lock() noexcept
     {
-        // To avoid spinning too tightly, we use the atomic_backoff to
-        // provide increasingly longer pauses, and if the lock is under
-        // lots of contention, eventually yield the timeslice.
-        atomic_backoff backoff;
+        // Back off with exponentially longer pauses, up to a long cap,
+        // before yielding the timeslice. Yielding (and short pauses that
+        // keep waiters hammering the line) is what hurts most under
+        // contention, especially across sockets or core types. This
+        // spins about 0.1-0.2 ms before the first yield.
+        atomic_backoff backoff(4096, 2);
 
-        // Try to get ownership of the lock. Though experimentation, we
-        // found that OIIO_UNLIKELY makes this just a bit faster on gcc
-        // x86/x86_64 systems.
-        while (!OIIO_UNLIKELY(try_lock())) {
-#if OIIO_THREAD_ALLOW_DCLP
-            // The full try_lock() involves a test_and_set, which
-            // writes memory, and that will lock the bus.  But a normal
-            // read of m_locked will let us spin until the value
-            // changes, without locking the bus. So it's faster to
-            // check in this manner until the mutex appears to be free.
-            // HOWEVER... Thread Sanitizer things this is an instance of
-            // an unsafe "double checked lock pattern" (DCLP) and flags it
-            // as an error. I think it's a false negative, because the
-            // outer loop is still an atomic check, the inner non-atomic
-            // loop only serves to delay, and can't lead to a true data
-            // race. But we provide this build-time switch to, at least,
-            // give a way to use tsan for other checks.
+        // Try to get ownership of the lock. Failing is the unlikely case.
+        while (OIIO_UNLIKELY(!try_lock())) {
+            // The exchange in try_lock() writes the cache line. Spin on a
+            // plain relaxed load until the lock looks free, so waiters
+            // don't keep stealing the line from the holder.
             do {
                 backoff();
-            } while (*(volatile bool*)&m_locked);
-#else
-            backoff();
-#endif
+            } while (m_locked.load(std::memory_order_relaxed));
         }
     }
 
@@ -235,37 +264,38 @@ public:
     ///
     void unlock() noexcept
     {
-        // Fastest way to do it is with a clear with "release" semantics
-        m_locked.clear(std::memory_order_release);
+        OIIO_TSAN_PRE_UNLOCK(&m_locked, 0);
+        m_locked.store(false, std::memory_order_release);
+        OIIO_TSAN_POST_UNLOCK(&m_locked, 0);
     }
 
     /// Try to acquire the lock.  Return true if we have it, false if
     /// somebody else is holding the lock.
     bool try_lock() noexcept
     {
-        return !m_locked.test_and_set(std::memory_order_acquire);
+        OIIO_TSAN_PRE_LOCK(&m_locked, OIIO_TSAN_F_TRY);
+        const bool got = !m_locked.exchange(true, std::memory_order_acquire);
+        OIIO_TSAN_POST_LOCK(&m_locked,
+                            got ? OIIO_TSAN_F_TRY : OIIO_TSAN_F_TRY_FAILED);
+        return got;
     }
 
     /// Helper class: scoped lock for a spin_mutex -- grabs the lock upon
     /// construction, releases the lock when it exits scope.
     class lock_guard {
     public:
-        lock_guard(spin_mutex& fm) noexcept
-            : m_fm(fm)
-        {
-            m_fm.lock();
-        }
+        lock_guard(spin_mutex& fm) noexcept : m_fm(fm) { m_fm.lock(); }
         ~lock_guard() noexcept { m_fm.unlock(); }
 
     private:
-        lock_guard() = delete;
-        lock_guard(const lock_guard& other) = delete;
+        lock_guard()                                   = delete;
+        lock_guard(const lock_guard& other)            = delete;
         lock_guard& operator=(const lock_guard& other) = delete;
         spin_mutex& m_fm;
     };
 
 private:
-    std::atomic_flag m_locked = ATOMIC_FLAG_INIT;  // initialize to unlocked
+    std::atomic<bool> m_locked { false };
 };
 
 
@@ -287,7 +317,7 @@ public:
     ~spin_rw_mutex() noexcept {}
 
     // Do not allow copy or assignment.
-    spin_rw_mutex(const spin_rw_mutex&) = delete;
+    spin_rw_mutex(const spin_rw_mutex&)                  = delete;
     const spin_rw_mutex& operator=(const spin_rw_mutex&) = delete;
 
     /// Acquire the reader lock.
@@ -297,9 +327,12 @@ public:
         // first increase the readers, and if it turned out nobody was
         // writing, we're done. This means that acquiring a read when nobody
         // is writing is a single atomic operation.
+        OIIO_TSAN_PRE_LOCK(&m_bits, OIIO_TSAN_F_READ);
         int oldval = m_bits.fetch_add(1, std::memory_order_acquire);
-        if (!(oldval & WRITER))
+        if (!(oldval & WRITER)) {
+            OIIO_TSAN_POST_LOCK(&m_bits, OIIO_TSAN_F_READ);
             return;
+        }
         // Oops, we incremented readers but somebody was writing. Backtrack
         // by subtracting, and do things the hard way.
         int expected = (--m_bits) & NOTWRITER;
@@ -307,49 +340,60 @@ public:
         // Do compare-and-exchange until we can increase the number of
         // readers by one and have no writers.
         if (m_bits.compare_exchange_weak(expected, expected + 1,
-                                         std::memory_order_acquire))
+                                         std::memory_order_acquire)) {
+            OIIO_TSAN_POST_LOCK(&m_bits, OIIO_TSAN_F_READ);
             return;
+        }
         atomic_backoff backoff;
         do {
             backoff();
             expected = m_bits.load() & NOTWRITER;
         } while (!m_bits.compare_exchange_weak(expected, expected + 1,
                                                std::memory_order_acquire));
+        OIIO_TSAN_POST_LOCK(&m_bits, OIIO_TSAN_F_READ);
     }
 
     /// Release the reader lock.
     ///
     void read_unlock() noexcept
     {
+        OIIO_TSAN_PRE_UNLOCK(&m_bits, OIIO_TSAN_F_READ);
         // Atomically reduce the number of readers.  It's at least 1,
         // and the WRITER bit should definitely not be set, so this just
         // boils down to an atomic decrement of m_bits.
         m_bits.fetch_sub(1, std::memory_order_release);
+        OIIO_TSAN_POST_UNLOCK(&m_bits, OIIO_TSAN_F_READ);
     }
 
     /// Acquire the writer lock.
     ///
     void write_lock() noexcept
     {
+        OIIO_TSAN_PRE_LOCK(&m_bits, 0);
         // Do compare-and-exchange until we have just ourselves as writer
         int expected = 0;
         if (m_bits.compare_exchange_weak(expected, WRITER,
-                                         std::memory_order_acquire))
+                                         std::memory_order_acquire)) {
+            OIIO_TSAN_POST_LOCK(&m_bits, 0);
             return;
+        }
         atomic_backoff backoff;
         do {
             backoff();
             expected = 0;
         } while (!m_bits.compare_exchange_weak(expected, WRITER,
                                                std::memory_order_acquire));
+        OIIO_TSAN_POST_LOCK(&m_bits, 0);
     }
 
     /// Release the writer lock.
     ///
     void write_unlock() noexcept
     {
+        OIIO_TSAN_PRE_UNLOCK(&m_bits, 0);
         // Remove the writer bit
         m_bits.fetch_sub(WRITER, std::memory_order_release);
+        OIIO_TSAN_POST_UNLOCK(&m_bits, 0);
     }
 
     /// lock() is a synonym for exclusive (write) lock.
@@ -362,24 +406,32 @@ public:
     /// read lock upon construction, releases the lock when it exits scope.
     class read_lock_guard {
     public:
-        read_lock_guard (spin_rw_mutex &fm) noexcept : m_fm(fm) { m_fm.read_lock(); }
-        ~read_lock_guard () noexcept { m_fm.read_unlock(); }
+        read_lock_guard(spin_rw_mutex& fm) noexcept : m_fm(fm)
+        {
+            m_fm.read_lock();
+        }
+        ~read_lock_guard() noexcept { m_fm.read_unlock(); }
+
     private:
-        read_lock_guard(const read_lock_guard& other) = delete;
-        read_lock_guard& operator = (const read_lock_guard& other) = delete;
-        spin_rw_mutex & m_fm;
+        read_lock_guard(const read_lock_guard& other)            = delete;
+        read_lock_guard& operator=(const read_lock_guard& other) = delete;
+        spin_rw_mutex& m_fm;
     };
 
     /// Helper class: scoped write lock for a spin_rw_mutex -- grabs the
     /// read lock upon construction, releases the lock when it exits scope.
     class write_lock_guard {
     public:
-        write_lock_guard (spin_rw_mutex &fm) noexcept : m_fm(fm) { m_fm.write_lock(); }
-        ~write_lock_guard () noexcept { m_fm.write_unlock(); }
+        write_lock_guard(spin_rw_mutex& fm) noexcept : m_fm(fm)
+        {
+            m_fm.write_lock();
+        }
+        ~write_lock_guard() noexcept { m_fm.write_unlock(); }
+
     private:
-        write_lock_guard(const write_lock_guard& other) = delete;
-        write_lock_guard& operator = (const write_lock_guard& other) = delete;
-        spin_rw_mutex & m_fm;
+        write_lock_guard(const write_lock_guard& other)            = delete;
+        write_lock_guard& operator=(const write_lock_guard& other) = delete;
+        spin_rw_mutex& m_fm;
     };
 
 private:
@@ -387,13 +439,13 @@ private:
     // that it's locked for writing.  This will only work if we have
     // fewer than 2^30 simultaneous readers.  I think that should hold
     // us for some time.
-    enum { WRITER = 1<<30, NOTWRITER = WRITER-1 };
+    enum { WRITER = 1 << 30, NOTWRITER = WRITER - 1 };
     std::atomic<int> m_bits { 0 };
 };
 
 
 
-using spin_rw_read_lock = spin_rw_mutex::read_lock_guard;
+using spin_rw_read_lock  = spin_rw_mutex::read_lock_guard;
 using spin_rw_write_lock = spin_rw_mutex::write_lock_guard;
 
 
@@ -414,7 +466,10 @@ template<class Mutex, class Key, class Hash, size_t Bins = 16>
 class mutex_pool {
 public:
     mutex_pool() noexcept {}
-    Mutex& operator[](const Key& key) noexcept { return m_mutex[m_hash(key) % Bins].m; }
+    Mutex& operator[](const Key& key) noexcept
+    {
+        return m_mutex[m_hash(key) % Bins].m;
+    }
 
 private:
     // Helper type -- force cache line alignment. This should make an array
@@ -578,17 +633,18 @@ public:
     /// has no worker threads, the task will be run immediately by the
     /// calling thread.
     template<typename F, typename... Rest>
-    auto push (F && f, Rest&&... rest) ->std::future<decltype(f(0, rest...))> {
-        auto pck = std::make_shared<std::packaged_task<decltype(f(0, rest...))(int)>>(
-            std::bind(std::forward<F>(f), std::placeholders::_1, std::forward<Rest>(rest)...)
-        );
+    auto push(F&& f, Rest&&... rest) -> std::future<decltype(f(0, rest...))>
+    {
+        auto pck
+            = std::make_shared<std::packaged_task<decltype(f(0, rest...))(int)>>(
+                std::bind(std::forward<F>(f), std::placeholders::_1,
+                          std::forward<Rest>(rest)...));
         if (size() < 1) {
-            (*pck)(-1); // No worker threads, run it with the calling thread
+            (*pck)(-1);  // No worker threads, run it with the calling thread
         } else {
-            auto _f = new std::function<void(int id)>([pck](int id) {
-                (*pck)(id);
-            });
-            push_queue_and_notify (_f);
+            auto _f = new std::function<void(int id)>(
+                [pck](int id) { (*pck)(id); });
+            push_queue_and_notify(_f);
         }
         return pck->get_future();
     }
@@ -633,10 +689,10 @@ public:
 
 private:
     // Disallow copy construction and assignment
-    thread_pool(const thread_pool&) = delete;
-    thread_pool(thread_pool&&) = delete;
+    thread_pool(const thread_pool&)            = delete;
+    thread_pool(thread_pool&&)                 = delete;
     thread_pool& operator=(const thread_pool&) = delete;
-    thread_pool& operator=(thread_pool&&) = delete;
+    thread_pool& operator=(thread_pool&&)      = delete;
 
     // PIMPL pattern hides all the guts far away from the public API
     class Impl;
@@ -692,7 +748,7 @@ public:
     }
     ~task_set() { wait(); }
 
-    task_set(const task_set&) = delete;
+    task_set(const task_set&)                  = delete;
     const task_set& operator=(const task_set&) = delete;
 
     // Return the thread id of the thread that set up this task_set and
@@ -743,15 +799,14 @@ OIIO_NAMESPACE_3_1_END
 
 
 // Compatibility -- current version just reuses these old items
-// clang-format off
 #ifndef OIIO_DOXYGEN
 OIIO_NAMESPACE_BEGIN
 using v3_1::atomic_backoff;
 using v3_1::default_thread_pool;
 using v3_1::default_thread_pool_shutdown;
 using v3_1::mutex_pool;
-using v3_1::null_mutex;
 using v3_1::null_lock;
+using v3_1::null_mutex;
 using v3_1::pause;
 using v3_1::spin_mutex;
 using v3_1::spin_rw_mutex;
@@ -764,12 +819,11 @@ using std::mutex;
 using std::recursive_mutex;
 using std::thread;
 
-using lock_guard = std::lock_guard<mutex>;
-using recursive_lock_guard = std::lock_guard<recursive_mutex>;
+using lock_guard                 = std::lock_guard<mutex>;
+using recursive_lock_guard       = std::lock_guard<recursive_mutex>;
 using recursive_timed_lock_guard = std::lock_guard<std::recursive_timed_mutex>;
-using spin_lock = spin_mutex::lock_guard;
-using spin_rw_read_lock = spin_rw_mutex::read_lock_guard;
-using spin_rw_write_lock = spin_rw_mutex::write_lock_guard;
+using spin_lock                  = spin_mutex::lock_guard;
+using spin_rw_read_lock          = spin_rw_mutex::read_lock_guard;
+using spin_rw_write_lock         = spin_rw_mutex::write_lock_guard;
 OIIO_NAMESPACE_END
 #endif
-// clang-format on
