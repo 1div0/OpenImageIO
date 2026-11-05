@@ -50,6 +50,15 @@ spin_mutex ImageCacheImpl::m_perthread_info_mutex;
 
 namespace {  // anonymous
 
+// When a file can only be read in whole groups of scanlines, we make our
+// fake tiles hold a whole number of those groups (see the autotile logic in
+// ImageCacheFile::open). This caps how big that is allowed to make one tile.
+// Beyond this, so few tiles fit in the cache that the extra eviction costs
+// more than the redundant decompression it saves, so we stop aligning and
+// keep the tiles small.
+static const imagesize_t max_autotile_bytes = 16 * 1024 * 1024;
+
+
 static thread_local tsl::robin_map<uint64_t, std::string> imcache_error_messages;
 static std::shared_ptr<ImageCache> shared_image_cache;
 static spin_mutex shared_image_cache_mutex;
@@ -301,10 +310,7 @@ has_one_tile(const T& s)
 
 
 LevelInfo::LevelInfo(ImageSpec* spec_, ImageDims* dims_)
-    : m_dims(dims_)
-    , nxtiles(1)
-    , nytiles(1)
-    , nztiles(1)
+    : m_dims(dims_), nxtiles(1), nytiles(1), nztiles(1)
 {
     OIIO_DASSERT(spec_);
     const ImageDims& dims = m_dims ? *m_dims : ImageDims::convert(*spec_);
@@ -399,7 +405,10 @@ ImageCacheFile::ImageCacheFile(ImageCacheImpl& imagecache,
 
 
 
-ImageCacheFile::~ImageCacheFile() { close(); }
+ImageCacheFile::~ImageCacheFile()
+{
+    close();
+}
 
 
 
@@ -488,7 +497,7 @@ ImageCacheFile::SubimageInfo::init(ImageCacheFile& icfile, ImageSpec* spec_,
     // See if there's a constant color tag
     string_view software = spec.get_string_attribute("Software");
     bool from_maketx     = Strutil::istarts_with(software, "OpenImageIO")
-                       || Strutil::istarts_with(software, "maketx");
+                           || Strutil::istarts_with(software, "maketx");
 
     string_view constant_color = spec.get_string_attribute(
         "oiio:ConstantColor");
@@ -767,8 +776,8 @@ ImageCacheFile::open(ImageCachePerThreadInfo* thread_info)
         // an unnecessary file open.
         std::string fmt;
         if (m_imagecache.trust_file_extensions()
-            && m_filename.find('?') != m_filename.npos)
-            fmt = OIIO::Filesystem::extension(fmt, false);
+            && m_filename.find('?') == m_filename.npos)
+            fmt = OIIO::Filesystem::extension(m_filename.string(), false);
         else
             fmt = m_filename.string();
         inp = ImageInput::create(fmt, false, &configspec, nullptr,
@@ -846,6 +855,8 @@ ImageCacheFile::open(ImageCachePerThreadInfo* thread_info)
                     "Images with more than 65535 channels are not supported.");
             tempspec = nativespec;
             if (nmip == 0) {
+                OIIO::pvt::set_source_provenance(tempspec, inp->format_name(),
+                                                 m_filename.string());
                 sispec = find_or_create_spec(nsubimages, tempspec);
                 OIIO_DASSERT(sispec);
                 // Things to do on MIP level 0, i.e. once per subimage
@@ -861,13 +872,23 @@ ImageCacheFile::open(ImageCachePerThreadInfo* thread_info)
             if (tempspec.tile_width == 0 || tempspec.tile_height == 0) {
                 si.untiled   = true;
                 int autotile = imagecache().autotile();
-                // Special consideration: for TIFF files, there is extra
-                // efficiency from making our fake tiles correspond to the
-                // strips. (N.B.: for non-TIFF files, this attribute will
-                // be absent and thus default to 0.)
-                int rps = tempspec["tiff:RowsPerStrip"].get<int>();
-                if (rps > 1)
-                    autotile = round_to_multiple(std::max(autotile, 64), rps);
+                // Special consideration: a file that reads groups of
+                // scanlines at a time (TIFF strips, EXR compressed chunks) is
+                // better to break into "tiles" of a reasonable multiple of
+                // that number of scanlines, and full image width. (N.B.: for
+                // files that don't read in groups, this attribute will be
+                // absent and thus default to 0.)
+                int rps = tempspec["oiio:RowsPerChunk"].get<int>();
+                if (rps > 1) {
+                    int target  = std::max(autotile, 64);
+                    int aligned = round_to_multiple(target, rps);
+                    // But not if that makes one tile so big that too few of
+                    // them fit in the cache.
+                    autotile = (imagesize_t(aligned) * tempspec.scanline_bytes()
+                                <= max_autotile_bytes)
+                                   ? aligned
+                                   : target;
+                }
                 si.autotiled = (autotile != 0);
                 if (autotile) {
                     // Automatically make it appear as if it's tiled
@@ -1402,8 +1423,8 @@ ImageCacheFile::release()
         // pressure on the cache, it'll get freed next time around.
         return;
     }
-    if (m_used)
-        m_used = false;
+    if (m_used.load(std::memory_order_relaxed))
+        m_used.store(false, std::memory_order_relaxed);
     else if (m_allow_release)
         close();
     m_input_mutex.unlock();
@@ -1791,9 +1812,7 @@ ImageCacheImpl::set_min_cache_size(long long newsize)
 
 
 
-ImageCacheTile::ImageCacheTile(const TileID& id)
-    : m_id(id)
-    , m_valid(true)
+ImageCacheTile::ImageCacheTile(const TileID& id) : m_id(id), m_valid(true)
 {
     id.file().imagecache().incr_tiles(0);  // mem counted separately in read
 }
@@ -1884,7 +1903,7 @@ ImageCacheTile::read(ImageCachePerThreadInfo* thread_info)
                         + ((m_id.y() - dims.y) / dims.tile_height) * lev.nxtiles
                         + ((m_id.z() - dims.z) / dims.tile_depth)
                               * (lev.nxtiles * lev.nytiles);
-        int index       = whichtile / 64;
+        int index     = whichtile / 64;
         int64_t bitmask = int64_t(1ULL << (whichtile & 63));
         int64_t oldval  = lev.tiles_read[index].fetch_or(bitmask);
         if (oldval & bitmask)  // Was it previously read?
@@ -3591,7 +3610,7 @@ ImageCacheImpl::get_pixels(ImageCacheFile* file,
     size_t formatsize           = format.size();
     stride_t result_pixelsize   = result_nchans * formatsize;
     bool xcontig                = (result_pixelsize == xstride
-                    && result_nchans == cache_nchans);
+                                   && result_nchans == cache_nchans);
     stride_t scanlinesize       = (xend - xbegin) * result_pixelsize;
     stride_t zplanesize         = (yend - ybegin) * scanlinesize;
     OIIO_DASSERT(dims.depth >= 1 && dims.tile_depth >= 1);
@@ -3931,9 +3950,10 @@ ImageCacheImpl::add_tile(ustring filename, int subimage, int miplevel, int x,
         chend   = file->spec(subimage).nchannels;
     }
     TileID tileid(*file, subimage, miplevel, x, y, z, chbegin, chend);
-    ImageCacheTileRef tile
-        = new ImageCacheTile(tileid, buffer.data(), format, buffer.xstride(),
-                             buffer.ystride(), buffer.zstride(), copy);
+    ImageCacheTileRef tile = new ImageCacheTile(tileid, buffer.data(), format,
+                                                buffer.xstride(),
+                                                buffer.ystride(),
+                                                buffer.zstride(), copy);
     if (!tile || !tile->valid()) {
         if (file->errors_should_issue())
             error("Could not construct the tile; unknown reasons.");
@@ -4126,7 +4146,7 @@ ImageCacheFile::udim_setup()
     // that these markers will almost always be close to the end of the
     // full pathname.
     bool udim1   = (Strutil::rcontains(m_filename, "<UDIM>")
-                  || Strutil::rcontains(m_filename, "%(UDIM)d"));
+                    || Strutil::rcontains(m_filename, "%(UDIM)d"));
     bool udim2_0 = (Strutil::rcontains(m_filename, "<u>")
                     || Strutil::rcontains(m_filename, "<v>")
                     || Strutil::rcontains(m_filename, "<uvtile>")
@@ -4426,7 +4446,7 @@ ImageCacheImpl::footprint(ImageCacheFootprint& output) const
     // strings
     output.ic_str_count = m_searchdirs.size() + 2;
     output.ic_str_mem   = heapsize(m_searchdirs) + heapsize(m_searchpath)
-                        + heapsize(m_plugin_searchpath);
+                          + heapsize(m_plugin_searchpath);
 
     // thread info
     output.ic_thdi_count = m_all_perthread_info.size();
@@ -4441,8 +4461,8 @@ ImageCacheImpl::footprint(ImageCacheFootprint& output) const
     // finger prints; we only account for references, this map does not own the files.
     constexpr size_t sizeofFingerprintPair = sizeof(ustring)
                                              + sizeof(ImageCacheFileRef);
-    output.ic_fgpt_count = m_fingerprints.size();
-    output.ic_fgpt_mem   = output.ic_fgpt_count * sizeofFingerprintPair;
+    output.ic_fgpt_count                   = m_fingerprints.size();
+    output.ic_fgpt_mem = output.ic_fgpt_count * sizeofFingerprintPair;
 
     // files; count the footprint of files, subimages, level infos, image inputs, image specs
     for (FilenameMap::iterator t = m_files.begin(), e = m_files.end(); t != e;
@@ -4502,14 +4522,15 @@ ImageCache::impl_deleter(ImageCacheImpl* todel)
 
 
 
-ImageCache::ImageCache()
-    : m_impl(new ImageCacheImpl, &impl_deleter)
+ImageCache::ImageCache() : m_impl(new ImageCacheImpl, &impl_deleter)
 {
 }
 
 
 
-ImageCache::~ImageCache() {}
+ImageCache::~ImageCache()
+{
+}
 
 
 

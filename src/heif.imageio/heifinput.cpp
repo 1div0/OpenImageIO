@@ -35,8 +35,7 @@ OIIO_PLUGIN_NAMESPACE_BEGIN
 
 class HeifReader final : public heif::Context::Reader {
 public:
-    HeifReader(Filesystem::IOProxy* ioproxy)
-        : m_ioproxy(ioproxy)
+    HeifReader(Filesystem::IOProxy* ioproxy) : m_ioproxy(ioproxy)
     {
         m_ioproxy->seek(0);
     }
@@ -87,6 +86,9 @@ public:
                        stride_t xstride) override;
 
 private:
+    // Set up the decode state and m_spec for one subimage.
+    bool read_subimage_spec(int subimage);
+
     std::string m_filename;
     int m_subimage                 = -1;
     int m_num_subimages            = 0;
@@ -205,15 +207,19 @@ HeifInput::open(const std::string& name, ImageSpec& newspec,
     } catch (const heif::Error& err) {
         std::string e = err.get_message();
         errorfmt("{}", e.empty() ? "unknown exception" : e.c_str());
+        close();
         return false;
     } catch (const std::exception& err) {
         std::string e = err.what();
         errorfmt("{}", e.empty() ? "unknown exception" : e.c_str());
+        close();
         return false;
     }
 
     bool ok = seek_subimage(0, 0);
     newspec = spec();
+    if (!ok)
+        close();
     return ok;
 }
 
@@ -226,6 +232,7 @@ HeifInput::close()
     m_ihandle = heif::ImageHandle();
     m_ctx.reset();
     m_reader.reset();
+    m_item_ids.clear();
     m_subimage                = -1;
     m_num_subimages           = 0;
     m_associated_alpha        = true;
@@ -239,7 +246,7 @@ HeifInput::close()
 bool
 HeifInput::seek_subimage(int subimage, int miplevel)
 {
-    if (miplevel != 0)
+    if (miplevel != 0 || subimage < 0)
         return false;
 
     if (subimage == m_subimage) {
@@ -250,17 +257,56 @@ HeifInput::seek_subimage(int subimage, int miplevel)
         return false;
     }
 
-    auto id   = (subimage == 0) ? m_primary_id : m_item_ids[subimage - 1];
+    // We're about to overwrite the decode state and m_spec, so give up the
+    // current subimage first. Every failure below then leaves us on none,
+    // rather than on one whose spec and decoded pixels describe different
+    // images. The context stays open, so rejecting one subimage doesn't stop
+    // a later seek to a different (valid) one.
+    m_subimage = -1;
+    m_himage   = heif::Image();
+    m_spec     = ImageSpec();
+
+    // The libheif C++ wrapper throws on errors (e.g. get_image_handle() on a
+    // damaged file), so don't let that escape.
+    bool ok = false;
+    try {
+        ok = read_subimage_spec(subimage);
+    } catch (const heif::Error& err) {
+        std::string e = err.get_message();
+        errorfmt("{}", e.empty() ? "unknown exception" : e.c_str());
+    } catch (const std::exception& err) {
+        std::string e = err.what();
+        errorfmt("{}", e.empty() ? "unknown exception" : e.c_str());
+    }
+    if (!ok) {
+        // Nor keep the spec of an image we refused or could not decode:
+        // spec() would report it, and read_scanline() would size its
+        // buffer from it.
+        m_spec = ImageSpec();
+        return false;
+    }
+
+    m_subimage = subimage;
+    return true;
+}
+
+
+
+// Set up the decode state and m_spec for one subimage. On failure m_spec
+// is left partly filled; the caller clears it.
+bool
+HeifInput::read_subimage_spec(int subimage)
+{
+    // m_item_ids[0] is the primary image; the rest follow in file order.
+    auto id   = m_item_ids[subimage];
     m_ihandle = m_ctx->get_image_handle(id);
 
     m_bitdepth = m_ihandle.get_luma_bits_per_pixel();
     if (m_bitdepth < 0) {
         errorfmt("Image has undefined bit depth");
-        m_ctx.reset();
         return false;
     } else if (!(m_bitdepth == 8 || m_bitdepth == 10 || m_bitdepth == 12)) {
         errorfmt("Image has unsupported bit depth {}", m_bitdepth);
-        m_ctx.reset();
         return false;
     }
 
@@ -299,6 +345,15 @@ HeifInput::seek_subimage(int subimage, int miplevel)
                                                      : heif_channel_interleaved;
     const int nchannels              = is_monochrome ? 1 : m_has_alpha ? 4 : 3;
 
+    // Validate the handle's declared dimensions against OIIO's limits BEFORE
+    // asking libheif to decode (and allocate) the full image. libheif has its
+    // own internal security limits, but this additionally enforces OIIO's
+    // limits:* policy and rejects degenerate (zero/negative) dimensions.
+    m_spec = ImageSpec(m_ihandle.get_width(), m_ihandle.get_height(), nchannels,
+                       (m_bitdepth > 8) ? TypeUInt16 : TypeUInt8);
+    if (!check_open(m_spec, { 0, 1 << 18, 0, 1 << 18, 0, 1, 0, 4 }))
+        return false;
+
 #if 0
     try {
         m_himage = m_ihandle.decode_image(heif_colorspace_RGB, chroma);
@@ -324,7 +379,6 @@ HeifInput::seek_subimage(int subimage, int miplevel)
         m_himage = heif::Image(img_tmp);
     if (herr.code != heif_error_Ok || !img_tmp) {
         errorfmt("Could not decode image ({})", herr.message);
-        m_ctx.reset();
         return false;
     }
 #endif
@@ -379,7 +433,7 @@ HeifInput::seek_subimage(int subimage, int miplevel)
     // alpha (i.e. colors are premultiplied).
     m_associated_alpha = m_himage.is_premultiplied_alpha();
     m_do_associate     = (!m_associated_alpha && m_spec.alpha_channel >= 0
-                      && !m_keep_unassociated_alpha);
+                          && !m_keep_unassociated_alpha);
     if (!m_associated_alpha && m_spec.nchannels >= 4) {
         // Indicate that file stored unassociated alpha data
         m_spec.attribute("heif:UnassociatedAlpha", 1);
@@ -412,12 +466,20 @@ HeifInput::seek_subimage(int subimage, int miplevel)
         if (Strutil::iequals(m_ihandle.get_metadata_type(m), "Exif")
             && metacontents.size() >= 10) {
             cspan<uint8_t> s(&metacontents[10], metacontents.size() - 10);
-            decode_exif(s, m_spec);
+            bool ok = decode_exif(s, m_spec);
+            if (!ok && OIIO::get_int_attribute("imageinput:strict")) {
+                errorfmt("Could not decode Exif");
+                return false;
+            }
         } else if (0  // For now, skip this, I haven't seen anything useful
                    && Strutil::iequals(m_ihandle.get_metadata_type(m), "mime")
                    && Strutil::iequals(m_ihandle.get_metadata_content_type(m),
                                        "application/rdf+xml")) {
-            decode_xmp(metacontents, m_spec);
+            bool ok = decode_xmp(metacontents, m_spec);
+            if (!ok && OIIO::get_int_attribute("imageinput:strict")) {
+                errorfmt("Could not decode XMP");
+                return false;
+            }
         } else {
 #ifdef DEBUG
             print(
@@ -453,9 +515,11 @@ HeifInput::seek_subimage(int subimage, int miplevel)
         if (type == heif_item_property_type_transform_rotation) {
             int rot = heif_item_get_property_transform_rotation_ccw(raw_ctx, id,
                                                                     xprops[i]);
-            // cw[] maps to one additional clockwise 90 degree turn
+            // cw[] maps to one additional clockwise 90 degree turn. The
+            // irot angle is the anticlockwise presentation rotation, so
+            // applying it equals (4 - rot/90) % 4 clockwise quarter turns.
             static const int cw[] = { 0, 6, 7, 8, 5, 2, 3, 4, 1 };
-            for (int i = 0; i < rot / 90; ++i)
+            for (int i = 0; i < (4 - rot / 90) % 4; ++i)
                 orientation = cw[orientation];
         } else if (type == heif_item_property_type_transform_mirror) {
             int mirror = heif_item_get_property_transform_mirror(raw_ctx, id,
@@ -487,19 +551,18 @@ HeifInput::seek_subimage(int subimage, int miplevel)
             m_spec.attribute("oiio:OriginalOrientation", orientation);
             m_spec.attribute("Orientation", 1);
         } else {
-            // libheif supplies oriented width & height, so if we are NOT
-            // auto-reorienting and it's one of the orientations that swaps
-            // width and height, we need to do that swap ourselves.
-            // Note: all the orientations that swap width and height are 5-8,
-            // whereas 1-4 preserve aspect ratio.
-            if (orientation >= 5) {
-                std::swap(m_spec.width, m_spec.height);
-                std::swap(m_spec.full_width, m_spec.full_height);
-            }
+            // We asked libheif to ignore the transformations, so the decoded
+            // image and its planes are in the stored, unrotated orientation,
+            // and m_spec -- assigned above from the decoded image dimensions
+            // -- already matches the plane geometry. Swapping width and
+            // height here would make the spec disagree with the planes and
+            // make read_native_scanline run past the end of the plane for
+            // orientations 5-8. Just report the orientation so callers can
+            // account for the stored rotation themselves.
+            m_spec.attribute("Orientation", orientation);
         }
     }
 
-    m_subimage = subimage;
     return true;
 }
 

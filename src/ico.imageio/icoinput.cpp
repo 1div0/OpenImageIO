@@ -57,6 +57,7 @@ private:
     int m_color_type;      ///< PNG color model type
     int m_interlace_type;  ///< PNG interlace type
     Imath::Color3f m_bg;   ///< PNG background color
+    bool m_err = false;
 
     /// Reset everything to initial state
     ///
@@ -65,6 +66,7 @@ private:
         m_subimage = -1;
         m_png      = NULL;
         m_info     = NULL;
+        m_err      = false;
         memset(&m_ico, 0, sizeof(m_ico));
         m_buf.clear();
         ioproxy_clear();
@@ -81,7 +83,14 @@ private:
         ICOInput* icoinput = (ICOInput*)png_get_io_ptr(png_ptr);
         OIIO_DASSERT(icoinput);
         if (!icoinput->ioread(data, length)) {
-            png_chunk_error(png_ptr, icoinput->geterror(false).c_str());
+            icoinput->m_err = true;
+            // png_chunk_error() does not return -- it longjmps back to
+            // libpng's setjmp point, which skips C++ destructors. Copy the
+            // message into a plain stack buffer so no heap-allocated
+            // std::string is left alive (and leaked) across the longjmp.
+            char msg[256];
+            Strutil::safe_strcpy(msg, icoinput->geterror(false), sizeof(msg));
+            png_chunk_error(png_ptr, msg);
         }
     }
 };
@@ -128,8 +137,10 @@ ICOInput::open(const std::string& name, ImageSpec& newspec,
 
     ioseek(0);
 
-    if (!ioread(&m_ico, 1, sizeof(m_ico)))
+    if (!ioread(&m_ico, 1, sizeof(m_ico))) {
+        close();
         return false;
+    }
 
     if (bigendian()) {
         // ICOs are little endian
@@ -139,6 +150,7 @@ ICOInput::open(const std::string& name, ImageSpec& newspec,
     }
     if (m_ico.reserved != 0 || m_ico.type != 1) {
         errorfmt("File failed ICO header check");
+        close();
         return false;
     }
 
@@ -173,10 +185,14 @@ ICOInput::seek_subimage(int subimage, int miplevel)
     if (m_png && m_info)
         PNG_pvt::destroy_read_struct(m_png, m_info);
 
-    m_subimage = subimage;
+    // We're about to overwrite m_spec and the decode state, so give up the
+    // current subimage first. Every failure below then leaves us on none,
+    // rather than on one whose spec and offsets don't match.
+    m_subimage = -1;
+    m_spec     = ImageSpec();
 
     // read subimage header
-    ioseek(sizeof(ico_header) + m_subimage * sizeof(ico_subimage), SEEK_SET);
+    ioseek(sizeof(ico_header) + subimage * sizeof(ico_subimage), SEEK_SET);
     ico_subimage subimg;
     if (!ioread(&subimg, 1, sizeof(subimg)))
         return false;
@@ -231,14 +247,20 @@ ICOInput::seek_subimage(int subimage, int miplevel)
 
         png_set_sig_bytes(m_png, 8);  // already read 8 bytes
 
-        if (!PNG_pvt::read_info(m_png, m_info, m_bpp, m_color_type,
-                                m_interlace_type, m_bg, m_spec, true))
+        bool ok = PNG_pvt::read_info(m_png, m_info, m_bpp, m_color_type,
+                                     m_interlace_type, m_bg, m_spec, true);
+        if (!ok || m_err
+            || !check_open(m_spec, { 0, 1 << 30, 0, 1 << 30, 0, 1, 0, 4 })
+            || !check_compression_ratio(m_spec, ioproxy()->size())) {
+            // Nor keep the spec we refused: spec() would report it, and
+            // read_scanline() would size its buffer from it. Same below.
+            m_spec = ImageSpec();
             return false;
-        if (!check_open(m_spec, { 0, 1 << 20, 0, 1 << 20, 0, 1, 0, 4 }))
-            return false;
+        }
 
         m_spec.attribute("oiio:BitsPerSample", m_bpp / m_spec.nchannels);
 
+        m_subimage = subimage;
         return true;
     }
 
@@ -271,8 +293,10 @@ ICOInput::seek_subimage(int subimage, int miplevel)
     m_spec = ImageSpec(subimg.width(), subimg.height(), 4 /* always RGBA */,
                        TypeDesc::UINT8);  // 4- and 16-bit are expanded to 8bpp
     m_spec.default_channel_names();
-    if (!check_open(m_spec, { 0, 256, 0, 256, 0, 1, 0, 4 }))
+    if (!check_open(m_spec, { 0, 256, 0, 256, 0, 1, 0, 4 })) {
+        m_spec = ImageSpec();
         return false;
+    }
 
     // copy off values for later use
     m_bpp = bmi.bpp;
@@ -282,6 +306,7 @@ ICOInput::seek_subimage(int subimage, int miplevel)
         /*&& m_bpp != 16*/
         && m_bpp != 24 && m_bpp != 32) {
         errorfmt("Unsupported image color depth, probably corrupt file");
+        m_spec = ImageSpec();
         return false;
     }
     m_offset        = subimg.ofs;
@@ -298,6 +323,7 @@ ICOInput::seek_subimage(int subimage, int miplevel)
     /*std::cerr << "[ico] expected bytes: scanline " << m_spec.scanline_bytes()
               << ", image " << m_spec.image_bytes() << "\n";*/
 
+    m_subimage = subimage;
     return true;
 }
 
@@ -312,7 +338,7 @@ ICOInput::readimg()
 
         //std::cerr << "[ico] PNG buffer size = " << m_buf.size () << "\n";
 
-        if (s.length()) {
+        if (s.length() || m_err || has_error()) {
             errorfmt("{}", s);
             return false;
         }

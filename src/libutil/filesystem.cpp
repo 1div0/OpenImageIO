@@ -346,8 +346,14 @@ Filesystem::exists(string_view path) noexcept
 bool
 Filesystem::is_directory(string_view path) noexcept
 {
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesW(
+        Strutil::utf8_to_utf16wstring(path).c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+#else
     error_code ec;
     return filesystem::is_directory(u8path(path), ec);
+#endif
 }
 
 
@@ -355,8 +361,15 @@ Filesystem::is_directory(string_view path) noexcept
 bool
 Filesystem::is_regular(string_view path) noexcept
 {
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesW(
+        Strutil::utf8_to_utf16wstring(path).c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)
+           && !(attr & FILE_ATTRIBUTE_REPARSE_POINT);  // exclude symlinks
+#else
     error_code ec;
     return filesystem::is_regular_file(u8path(path), ec);
+#endif
 }
 
 
@@ -538,8 +551,8 @@ Filesystem::fopen(string_view path, string_view mode)
 int
 Filesystem::fseek(FILE* file, int64_t offset, int whence)
 {
-#ifdef _MSC_VER
-    return _fseeki64(file, __int64(offset), whence);
+#ifdef _WIN32
+    return _fseeki64(file, static_cast<__int64>(offset), whence);
 #else
     return fseeko(file, offset, whence);
 #endif
@@ -550,7 +563,7 @@ Filesystem::fseek(FILE* file, int64_t offset, int whence)
 int64_t
 Filesystem::ftell(FILE* file)
 {
-#ifdef _MSC_VER
+#ifdef _WIN32
     return _ftelli64(file);
 #else
     return ftello(file);
@@ -774,9 +787,18 @@ Filesystem::last_write_time(string_view path, std::time_t time) noexcept
 uint64_t
 Filesystem::file_size(string_view path) noexcept
 {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA data {};
+    if (!GetFileAttributesExW(Strutil::utf8_to_utf16wstring(path).c_str(),
+                              GetFileExInfoStandard, &data))
+        return 0;
+    return (static_cast<uint64_t>(data.nFileSizeHigh) << 32)
+           | static_cast<uint64_t>(data.nFileSizeLow);
+#else
     error_code ec;
     uint64_t sz = filesystem::file_size(u8path(path), ec);
     return ec ? 0 : sz;
+#endif
 }
 
 
@@ -870,7 +892,7 @@ Filesystem::parse_pattern(const char* pattern_, int framepadding_override,
     // The pattern is either a range (e.g., "1-15#"), a
     // set of hash marks (e.g. "####"), or a printf-style format
     // string (e.g. "%04d").
-#define ONERANGE_SPEC "[0-9]+(-[0-9]+((x|y)-?[0-9]+)?)?"
+#define ONERANGE_SPEC  "[0-9]+(-[0-9]+((x|y)-?[0-9]+)?)?"
 #define MANYRANGE_SPEC ONERANGE_SPEC "(," ONERANGE_SPEC ")*"
 #define SEQUENCE_SPEC       \
     "(" MANYRANGE_SPEC ")?" \
@@ -1216,8 +1238,7 @@ Filesystem::IOFile::IOFile(string_view filename, Mode mode)
 }
 
 Filesystem::IOFile::IOFile(FILE* file, Mode mode)
-    : IOProxy("", mode)
-    , m_file(file)
+    : IOProxy("", mode), m_file(file)
 {
     if (m_mode == Read) {
         m_pos = OIIO::Filesystem::ftell(m_file);       // save old position
@@ -1401,15 +1422,16 @@ Filesystem::IOMemReader::pread(void* buf, size_t size, int64_t offset)
     // N.B. No lock necessary
     if (!m_buf.size() || !size)
         return 0;
-    if (size + size_t(offset) > std::size(m_buf)) {
-        if (offset < 0 || size_t(offset) >= std::size(m_buf)) {
-            error(Strutil::fmt::format(
-                "Invalid pread offset {} for an IOMemReader buffer of size {}",
-                offset, m_buf.size()));
-            return 0;
-        }
-        size = std::size(m_buf) - size_t(offset);
+    // Validate the offset before any arithmetic that could overflow.
+    if (offset < 0 || size_t(offset) >= m_buf.size()) {
+        error(Strutil::format(
+            "Invalid pread offset {} for an IOMemReader buffer of size {}",
+            offset, m_buf.size()));
+        return 0;
     }
+    // offset is now known to be in [0, buffer size), so this subtraction
+    // cannot underflow. Clamp the read to the bytes actually available.
+    size = std::min(size, m_buf.size() - size_t(offset));
     memcpy(buf, m_buf.data() + offset, size);
     return size;
 }

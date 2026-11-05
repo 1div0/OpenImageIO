@@ -10,10 +10,12 @@ redirect += " 2>&1"
 failureok = True
 
 # Create some test images we need
-command += oiiotool ("--create 320x240 3 -d uint8 -o black.tif")
-command += oiiotool ("--pattern constant:color=0.5,0.5,0.5 128x128 3 -d half -o grey128.exr")
-command += oiiotool ("--pattern constant:color=0.5,0.5,0.5 64x64 3 -d half -o grey64.exr")
-command += oiiotool ("--create 256x256 3 --fill:color=1,.5,.5 256x256 --fill:color=0,1,0 80x80+100+100 -d uint8 -o filled.tif")
+command += run_commands("""
+    oiiotool --create 320x240 3 -d uint8 -o black.tif
+    oiiotool --pattern constant:color=0.5,0.5,0.5 128x128 3 -d half -o grey128.exr
+    oiiotool --pattern constant:color=0.5,0.5,0.5 64x64 3 -d half -o grey64.exr
+    oiiotool --create 256x256 3 --fill:color=1,.5,.5 256x256 --fill:color=0,1,0 80x80+100+100 -d uint8 -o filled.tif
+    """)
 
 
 # test --autotrim
@@ -232,6 +234,8 @@ command += oiiotool ("--info -v -metamatch Debug --iconfig oiio:DebugOpenConfig!
                      "--iconfig:type=float oiio:DebugOpenConfigFloat! 3 " +
                      "--iconfig:type=string oiio:DebugOpenConfigStr! 4 " +
                      "black.tif")
+# --metamatch matching nothing prints nothing
+command += oiiotool ("--info -v --metamatch NoSuchAttribute black.tif")
 
 # test -i:ch=...
 command += oiiotool ("--pattern fill:color=.6,.5,.4,.3,.2 64x64 5 -d uint8 -o const5.tif")
@@ -265,6 +269,24 @@ command += oiiotool (f"--create 2x2 1 -o {root_folder}/folder2/out.tif")
 # Validate -o sucessed with flag `--create-dir` and `out.tif` is valid and inside directory `folder1/folder2/`
 command += oiiotool (f"--create-dir --create 2x2 1 -o {root_folder}/folder2/out.tif")
 command += oiiotool (f"--info {root_folder}/folder2/out.tif")
+
+
+# in a tif the single channel doesn't really have a name so oiio gives it the name Y
+# so if you naively do --ch R you'll get a black image (with a warning which we capture in out.txt)
+command += oiiotool ("src/single_channel_tif.tif --ch R -o single_channel_black.tif")
+# using nchannels 1 will always do the right thing
+command += oiiotool ("src/single_channel_tif.tif --nchannels 1 -o single_channel_good.tif")
+# exrs have explicit channel names, but you don't need to know the name if you are using nchannels
+# so you can easily process a mix of frames without thinking about the name of the channels
+# this can also be accomplished with --ch 0, but --nchannels 1 is a bit more intuitive
+# and matches maketx
+command += oiiotool ("src/single_channel_y.exr --nchannels 1 -o single_channel_good_y.exr")
+command += oiiotool ("src/single_channel_r.exr --nchannels 1 -o single_channel_good_r.exr")
+
+# the info -v will print out the channel names and make sure they came out good in the output
+command += oiiotool ("--info -v single_channel_good_y.exr | grep 'channel list'")
+command += oiiotool ("--info -v single_channel_good_r.exr | grep 'channel list'")
+
 
 # To add more tests, just append more lines like the above and also add
 # the new 'feature.tif' (or whatever you call it) to the outputs list,
@@ -312,6 +334,10 @@ outputs = [
             "const5-rgb.tif",
             "box_over_missing2.tif",
             "box_over_missing3.tif",
+            "single_channel_black.tif",
+            "single_channel_good.tif",
+            "single_channel_good_y.exr",
+            "single_channel_good_r.exr",
             "out.txt" ]
 
 #print "Running this command:\n" + command + "\n"

@@ -195,26 +195,32 @@ void
 ImageSpec::default_channel_names() noexcept
 {
     channelnames.clear();
-    channelnames.reserve(nchannels);
     alpha_channel = -1;
     z_channel     = -1;
+    if (nchannels < 1)
+        return;  // early out for invalid channel counts
+    // Only name up to limits:channels, leave any excess unnamed
+    int nnames = nchannels;
+    if (limit_channels && nnames > limit_channels)
+        nnames = limit_channels;
+    channelnames.reserve(nnames);
     if (nchannels == 1) {  // Special case: 1-channel is named "Y"
         channelnames.emplace_back("Y");
         return;
     }
     // General case: name channels R, G, B, A, channel4, channel5, ...
-    if (nchannels >= 1)
+    if (nnames >= 1)
         channelnames.emplace_back("R");
-    if (nchannels >= 2)
+    if (nnames >= 2)
         channelnames.emplace_back("G");
-    if (nchannels >= 3)
+    if (nnames >= 3)
         channelnames.emplace_back("B");
-    if (nchannels >= 4) {
+    if (nnames >= 4) {
         channelnames.emplace_back("A");
         alpha_channel = 3;
     }
-    for (int c = 4; c < nchannels; ++c)
-        channelnames.push_back(Strutil::fmt::format("channel{}", c));
+    for (int c = 4; c < nnames; ++c)
+        channelnames.emplace_back(Strutil::fmt::format("channel{}", c));
 }
 
 
@@ -488,7 +494,7 @@ ImageSpec::find_attribute(string_view name, ParamValue& tmpparam,
     auto iter = extra_attribs.find(name, searchtype, casesensitive);
     if (iter != extra_attribs.end())
         return &(*iter);
-        // Check named items in the ImageSpec structs, not in extra_attrubs
+    // Check named items in the ImageSpec structs, not in extra_attrubs
 #define MATCH(n, t)                                 \
     (((!casesensitive && Strutil::iequals(name, n)) \
       || (casesensitive && name == n))              \

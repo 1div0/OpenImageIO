@@ -181,6 +181,20 @@ IffOutput::open(const std::string& name, const ImageSpec& spec, OpenMode mode)
 
     // zchannel
     bool has_z = m_spec.z_channel > 0;
+    if (m_spec.z_channel >= m_spec.nchannels) {
+        errorfmt("Invalid z_channel {} for {} channels", m_spec.z_channel,
+                 m_spec.nchannels);
+        return false;
+    }
+    // The RGBA chunk can only hold RGB or RGBA (the encoder and readers
+    // assume 3 or 4 color channels).
+    int ncolor = has_z ? m_spec.nchannels - 1 : m_spec.nchannels;
+    if (ncolor != 3 && ncolor != 4) {
+        errorfmt(
+            "Cannot write IFF file with {} color channels{} (only RGB, RGBA, RGBZ, RGBAZ supported)",
+            ncolor, has_z ? " plus Z" : "");
+        return false;
+    }
     if (has_z) {
         m_spec.channelformats.assign(m_spec.nchannels, base_format);
         m_spec.channelformats[m_spec.z_channel] = TypeDesc::FLOAT;
@@ -223,7 +237,7 @@ IffOutput::open(const std::string& name, const ImageSpec& spec, OpenMode mode)
     m_header.height       = m_spec.height;
     m_header.tiles        = xtiles * ytiles;
     m_header.rgba_bits    = m_spec.format == TypeDesc::UINT8 ? 8 : 16;
-    m_header.rgba_count   = has_z ? spec.nchannels - 1 : spec.nchannels;
+    m_header.rgba_count   = ncolor;
     m_header.author       = m_spec.get_string_attribute("Artist");
     m_header.date         = m_spec.get_string_attribute("DateTime");
     m_header.zbuffer      = has_z ? spec.nchannels - 1 : 0;
@@ -330,7 +344,7 @@ IffOutput::write_scanline(int y, int z, TypeDesc format, const void* data,
     data = to_native_scanline(format, data, xstride, scratch, m_dither, y, z);
     size_t scanlinesize = m_header.scanline_bytes();
     size_t offset       = scanlinesize * (y - m_header.y)
-                    + scanlinesize * m_header.height * (z - m_header.z);
+                          + scanlinesize * m_header.height * (z - m_header.z);
     memcpy(&m_buf[offset], data, scanlinesize);
     return false;
 }
@@ -551,18 +565,18 @@ IffOutput::close(void)
                             if (littleendian()) {
                                 uint8_t rgb16[]  = { 0, 2, 4, 1, 3, 5 };
                                 uint8_t rgba16[] = { 0, 2, 4, 7, 1, 3, 5, 6 };
-                                map              = (m_header.rgba_count == 3)
-                                                       ? std::vector<uint8_t>(rgb16,
+                                map = (m_header.rgba_count == 3)
+                                          ? std::vector<uint8_t>(rgb16,
                                                                  rgb16 + 6)
-                                                       : std::vector<uint8_t>(rgba16,
+                                          : std::vector<uint8_t>(rgba16,
                                                                  rgba16 + 8);
                             } else {
                                 uint8_t rgb16[]  = { 1, 3, 5, 0, 2, 4 };
                                 uint8_t rgba16[] = { 1, 3, 5, 7, 0, 2, 4, 6 };
-                                map              = (m_header.rgba_count == 3)
-                                                       ? std::vector<uint8_t>(rgb16,
+                                map = (m_header.rgba_count == 3)
+                                          ? std::vector<uint8_t>(rgb16,
                                                                  rgb16 + 6)
-                                                       : std::vector<uint8_t>(rgba16,
+                                          : std::vector<uint8_t>(rgba16,
                                                                  rgba16 + 8);
                             }
 

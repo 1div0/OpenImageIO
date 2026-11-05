@@ -16,6 +16,7 @@
 
 #include "exr_pvt.h"
 
+#include <OpenEXR/ImfCRgbaFile.h>
 #include <OpenEXR/openexr.h>
 
 #include "imageio_pvt.h"
@@ -65,9 +66,14 @@ oiio_exr_error_handler(exr_const_context_t ctxt, exr_result_t code,
 static int64_t
 oiio_exr_query_size_func(exr_const_context_t ctxt, void* userdata)
 {
+    // OpenEXR uses the file size to validate header attribute and chunk
+    // table sizes; -1 means unknown and disables those checks.
     oiioexr_filebuf_struct* fb = static_cast<oiioexr_filebuf_struct*>(userdata);
-    if (fb)
-        return static_cast<int64_t>(fb->m_io->tell());
+    if (fb && fb->m_io) {
+        size_t size = fb->m_io->size();
+        if (size > 0)
+            return static_cast<int64_t>(size);
+    }
     return -1;
 }
 
@@ -107,7 +113,8 @@ public:
                 || feature == "exif"  // Because of arbitrary_metadata
                 || feature == "ioproxy"
                 || feature == "iptc"  // Because of arbitrary_metadata
-                || feature == "multiimage" || feature == "mipmap");
+                || feature == "multiimage" || feature == "mipmap"
+                || feature == "thumbnail");
     }
     bool valid_file(const std::string& filename) const override;
     bool open(const std::string& name, ImageSpec& newspec,
@@ -144,6 +151,7 @@ public:
                                 int xend, int ybegin, int yend, int zbegin,
                                 int zend, int chbegin, int chend,
                                 DeepData& deepdata) override;
+    bool get_thumbnail(ImageBuf& thumb, int subimage) override;
 
     bool set_ioproxy(Filesystem::IOProxy* ioproxy) override
     {
@@ -153,9 +161,20 @@ public:
     }
 
 private:
-    const ImageSpec& init_part(int subimage, int miplevel);
+    const ImageSpec& init_part(int subimage, int miplevel, bool& ok);
+    bool read_cached_chunk(int subimage, int miplevel, int ybegin, int yend,
+                           int chbegin, int chend, int cbegin, int cend,
+                           size_t scanlinebytes, void* data);
     struct PartInfo {
+        // Set initialized once the header has been parsed into the fields
+        // below, and validated once that parsed spec has also passed
+        // seek_subimage()'s checks. Only a validated part may be handed out
+        // -- as the current subimage, from init_part() for a read, or from
+        // the spec() query that reads this cache without seeking. validated
+        // is published after the spec, so a reader that sees it set sees a
+        // spec that was checked.
         std::atomic_bool initialized;
+        std::atomic_bool validated;
         ImageSpec spec;
         int topwidth;                        ///< Width of top mip level
         int topheight;                       ///< Height of top mip level
@@ -168,12 +187,10 @@ private:
         std::vector<exr_pixel_type_t> pixeltype;  ///< Imf pixel type for each chan
         std::vector<int> chanbytes;  ///< Size (in bytes) of each channel
 
-        PartInfo()
-            : initialized(false)
-        {
-        }
+        PartInfo() : initialized(false), validated(false) {}
         PartInfo(const PartInfo& p)
             : initialized((bool)p.initialized)
+            , validated((bool)p.validated)
             , spec(p.spec)
             , topwidth(p.topwidth)
             , topheight(p.topheight)
@@ -206,19 +223,40 @@ private:
     exr_context_t m_exr_context = nullptr;
     oiioexr_filebuf_struct m_userdata;
 
+    ExrChunkCache m_chunkcache;
+
     std::unique_ptr<Filesystem::IOProxy> m_local_io;
     int m_nsubimages;                   ///< How many subimages are there?
     std::vector<float> m_missingcolor;  ///< Color for missing tile/scanline
     std::string m_filename;             // filename, if known
+    std::string m_file_color_interop_id;
 
     void init()
     {
+        // The cached part specs describe the file we're leaving behind, and
+        // with them gone nothing may index m_parts until open() refills it.
+        m_parts.clear();
+        m_nsubimages     = 0;
+        m_subimage       = -1;
+        m_miplevel       = -1;
         m_exr_context    = nullptr;
         m_userdata.m_img = this;
         m_userdata.m_io  = nullptr;
         m_local_io.reset();
         m_missingcolor.clear();
         m_filename.clear();
+        m_file_color_interop_id.clear();
+        m_chunkcache.clear();
+    }
+
+    // Forget which subimage/miplevel we're on, for when a seek picks one and
+    // then rejects it, so that nothing downstream mistakes the rejected
+    // subimage's spec for a validated one.
+    void invalidate_current()
+    {
+        m_subimage = -1;
+        m_miplevel = -1;
+        m_spec     = ImageSpec();
     }
 
     bool valid_file_or_proxy(const std::string& filename,
@@ -234,8 +272,7 @@ private:
     public:
         DecoderDestroyer(exr_const_context_t ctx,
                          exr_decode_pipeline_t* decoder)
-            : ctx(ctx)
-            , decoder(decoder) {};
+            : ctx(ctx), decoder(decoder) {};
         ~DecoderDestroyer() { exr_decoding_destroy(ctx, decoder); }
 
     private:
@@ -281,9 +318,9 @@ static std::map<std::string, std::string> cexr_tag_to_oiio_std {
     { "tiledesc", "" },
     { "tiles", "" },
     { "type", "" },
+    { "preview", "" },  // we have thumbnail_* trio instead
 
     // FIXME: Things to consider in the future:
-    // preview
     // screenWindowCenter
     // adoptedNeutral
     // renderingTransform, lookModTransform
@@ -294,7 +331,10 @@ static std::map<std::string, std::string> cexr_tag_to_oiio_std {
 
 
 
-OpenEXRCoreInput::OpenEXRCoreInput() { init(); }
+OpenEXRCoreInput::OpenEXRCoreInput()
+{
+    init();
+}
 
 
 
@@ -336,6 +376,21 @@ OpenEXRCoreInput::valid_file_or_proxy(const std::string& filename,
     return (rv == EXR_ERR_SUCCESS);
 }
 
+
+
+// Color space shared by all parts of the file, taken from the first part.
+static std::string
+file_color_interop_id(exr_context_t ctxt)
+{
+    int32_t length      = 0;
+    const char* interop = nullptr;
+    if (exr_attr_get_string(ctxt, 0, "colorInteropID", &length, &interop)
+            != EXR_ERR_SUCCESS
+        || !interop)
+        return std::string();
+
+    return std::string(interop, size_t(length));
+}
 
 
 bool
@@ -402,6 +457,7 @@ OpenEXRCoreInput::open(const std::string& name, ImageSpec& newspec,
         std::string e = m_userdata.m_io->error();
         errorfmt("Could not open \"{}\" ({})", name,
                  e.size() ? e : std::string("unknown error"));
+        close();
         return false;
     }
     m_userdata.m_io->seek(0);
@@ -419,8 +475,7 @@ OpenEXRCoreInput::open(const std::string& name, ImageSpec& newspec,
     exr_result_t rv = exr_start_read(&m_exr_context, name.c_str(), &cinit);
     if (rv != EXR_ERR_SUCCESS) {
         // the error handler would have already reported the error into us
-        m_local_io.reset();
-        m_userdata.m_io = nullptr;
+        close();
         return false;
     }
 #if ENABLE_EXR_DEBUG_PRINTS || !defined(NDEBUG) /* allow debugging */
@@ -429,14 +484,15 @@ OpenEXRCoreInput::open(const std::string& name, ImageSpec& newspec,
 #endif
     rv = exr_get_count(m_exr_context, &m_nsubimages);
     if (rv != EXR_ERR_SUCCESS) {
-        m_local_io.reset();
-        m_userdata.m_io = nullptr;
+        close();
         return false;
     }
 
     m_parts.resize(m_nsubimages);
     m_subimage = -1;
     m_miplevel = -1;
+
+    m_file_color_interop_id = file_color_interop_id(m_exr_context);
 
     // Set up for the first subimage ("part"). This will trigger reading
     // information about all the parts.
@@ -450,22 +506,36 @@ OpenEXRCoreInput::open(const std::string& name, ImageSpec& newspec,
 
 
 
+// Return the spec of the subimage we're about to read, having made sure it
+// has been parsed and has passed seek_subimage()'s validation. The read paths
+// below deliberately avoid seeking, so this is where a part they were handed
+// gets checked -- including the -1 that a rejected seek leaves behind and
+// that ImageInput::read_scanline() passes straight through. Sets `ok`, and
+// the returned spec is only meaningful when it is true.
 const ImageSpec&
-OpenEXRCoreInput::init_part(int subimage, int miplevel)
+OpenEXRCoreInput::init_part(int subimage, int miplevel, bool& ok)
 {
+    static const ImageSpec emptyspec;
+    ok = false;
+    if (subimage < 0 || subimage >= m_nsubimages) {
+        errorfmt("Invalid subimage {}", subimage);
+        return emptyspec;
+    }
     const PartInfo& part(m_parts[subimage]);
-    if (!part.initialized) {
-        // Only if this subimage hasn't yet been inventoried do we need
-        // to lock and seek, but that is only so we don't have to re-look values up
+    if (!part.validated) {
+        // Only if this subimage hasn't yet been inventoried and validated do
+        // we need to lock and seek, but that is only so we don't have to
+        // re-look values up
         lock_guard lock(*this);
-        if (!part.initialized) {
+        if (!part.validated) {
             if (!seek_subimage(subimage, miplevel)) {
                 errorfmt("Unable to initialize part");
-                return part.spec;
+                return emptyspec;
             }
         }
     }
 
+    ok = true;
     return part.spec;
 }
 
@@ -534,8 +604,11 @@ OpenEXRCoreInput::PartInfo::parse_header(OpenEXRCoreInput* in,
     spec.deep = (storage == EXR_STORAGE_DEEP_TILED
                  || storage == EXR_STORAGE_DEEP_SCANLINE);
 
-    if (levelmode != EXR_TILE_ONE_LEVEL)
+    if (levelmode != EXR_TILE_ONE_LEVEL) {
         spec.attribute("openexr:roundingmode", (int)roundingmode);
+        if (nmiplevels > 1)
+            spec.attribute("oiio:miplevels", nmiplevels);
+    }
 
     exr_envmap_t envmap;
     rv = exr_attr_get_envmap(ctxt, subimage, "envmap", &envmap);
@@ -558,6 +631,7 @@ OpenEXRCoreInput::PartInfo::parse_header(OpenEXRCoreInput* in,
     exr_compression_t comptype;
     rv = exr_get_compression(ctxt, subimage, &comptype);
     if (rv == EXR_ERR_SUCCESS) {
+        pvt::prime_htj2k_if_needed(comptype);
         const char* comp = NULL;
         switch (comptype) {
         case EXR_COMPRESSION_NONE: comp = "none"; break;
@@ -576,10 +650,34 @@ OpenEXRCoreInput::PartInfo::parse_header(OpenEXRCoreInput* in,
 #ifdef IMF_HTJ2K32_COMPRESSION
         case EXR_COMPRESSION_HTJ2K32: comp = "htj2k32"; break;
 #endif
+#ifdef IMF_LJ2K_COMPRESSION
+        case EXR_COMPRESSION_LJ2K: comp = "lj2k"; break;
+#endif
+#ifdef IMF_ZSTD_COMPRESSION
+        case EXR_COMPRESSION_ZSTD: comp = "zstd"; break;
+#endif
         default: break;
         }
-        if (comp)
+        if (comp) {
             spec.attribute("compression", comp);
+        } else {
+            in->errorfmt("Unknown compression code {}", int(comptype));
+            return false;
+        }
+    } else {
+        in->errorfmt("No compression information found");
+        return false;
+    }
+
+    if (spec.tile_width == 0) {
+        // Scanline file: advertise how many scanlines are packed into each
+        // compressed chunk, so that callers can align their reads to whole
+        // chunks (see ImageInput::read_image, read_scanlines).
+        int32_t scansperchunk = 1;
+        if (exr_get_scanlines_per_chunk(ctxt, subimage, &scansperchunk)
+                == EXR_ERR_SUCCESS
+            && scansperchunk > 1)
+            spec.attribute("oiio:RowsPerChunk", scansperchunk);
     }
 
     int32_t attrcount = 0;
@@ -793,6 +891,16 @@ OpenEXRCoreInput::PartInfo::parse_header(OpenEXRCoreInput* in,
         }
     }
 
+    // The header's "preview" is a small RGBA image. Extract dimensions only.
+    exr_attr_preview_t preview;
+    if (exr_attr_get_preview(ctxt, subimage, "preview", &preview)
+            == EXR_ERR_SUCCESS
+        && preview.width > 0 && preview.height > 0) {
+        spec.attribute("thumbnail_width", int(preview.width));
+        spec.attribute("thumbnail_height", int(preview.height));
+        spec.attribute("thumbnail_nchannels", 4);
+    }
+
     float aspect   = spec.get_float_attribute("PixelAspectRatio", 0.0f);
     float xdensity = spec.get_float_attribute("XResolution", 0.0f);
     if (xdensity) {
@@ -814,8 +922,15 @@ OpenEXRCoreInput::PartInfo::parse_header(OpenEXRCoreInput* in,
     // Try to figure out the color space for some unambiguous cases
     if (spec.get_int_attribute("acesImageContainerFlag") == 1) {
         spec.set_colorspace("lin_ap0_scene");
-    } else if (auto c = spec.find_attribute("colorInteropID", TypeString)) {
-        spec.set_colorspace(c->get_ustring());
+    } else {
+        // Follow the color interop forum recommendation for OpenEXR files,
+        // inheriting the colorInteropID from the first part.
+        string_view interop_id = spec.get_string_attribute("colorInteropID");
+        if (!interop_id.empty()) {
+            spec.set_colorspace(interop_id);
+        } else if (!in->m_file_color_interop_id.empty()) {
+            spec.set_colorspace(in->m_file_color_interop_id);
+        }
     }
 
     // Squash some problematic texture metadata if we suspect it's wrong
@@ -1098,25 +1213,38 @@ OpenEXRCoreInput::seek_subimage(int subimage, int miplevel)
     PartInfo& part(m_parts[subimage]);
     if (!part.initialized) {
         if (!part.parse_header(this, m_exr_context, subimage, miplevel)) {
-            errorfmt("Could not seek to subimage={}: unable to parse header",
-                     subimage, miplevel);
+            // Any errors in parse_header will already have called errorfmt
             return false;
         }
         part.initialized = true;
     }
 
-    m_subimage = subimage;
-
     if (miplevel < 0 || miplevel >= part.nmiplevels)  // out of range
         return false;
 
+    m_subimage = subimage;
     m_miplevel = miplevel;
     m_spec     = part.spec;
 
-    //! Add the number of miplevels as an attribute for the first miplevel.
-    //! TOFIX: adding the following attribute breaks unit tests
-    // if (m_miplevel == 0 && part.nmiplevels > 1)
-    //     m_spec.attribute("oiio:miplevels", part.nmiplevels);
+    // The checks below reject this subimage, so don't leave it as the
+    // current one with a spec that failed validation.
+    if (!check_open(m_spec, { 0, 1 << 30, 0, 1 << 30, 0, 1, 0, 1 << 12 })) {
+        invalidate_current();
+        return false;
+    }
+
+    // check_open's size cap still admits a dataWindow that is absurd for a tiny
+    // compressed file, so also bound the declared-vs-compressed ratio.
+    imagesize_t filesize = m_userdata.m_io ? m_userdata.m_io->size()
+                                           : Filesystem::file_size(m_filename);
+    if (!check_compression_ratio(m_spec, filesize)) {
+        invalidate_current();
+        return false;
+    }
+
+    // The part passed. Only now may init_part() and spec() use its cached
+    // spec without repeating this.
+    part.validated = true;
 
     if (miplevel == 0 && part.levelmode == EXR_TILE_ONE_LEVEL) {
         return true;
@@ -1140,11 +1268,11 @@ OpenEXRCoreInput::spec(int subimage, int miplevel)
     if (subimage < 0 || subimage >= m_nsubimages)
         return ret;  // invalid
     const PartInfo& part(m_parts[subimage]);
-    if (!part.initialized) {
-        // Only if this subimage hasn't yet been inventoried do we need
-        // to lock and seek.
+    if (!part.validated) {
+        // Only if this subimage hasn't yet been inventoried and validated do
+        // we need to lock and seek.
         lock_guard lock(*this);
-        if (!part.initialized) {
+        if (!part.validated) {
             if (!seek_subimage(subimage, miplevel))
                 return ret;
         }
@@ -1167,11 +1295,11 @@ OpenEXRCoreInput::spec_dimensions(int subimage, int miplevel)
     if (subimage < 0 || subimage >= m_nsubimages)
         return ret;  // invalid
     const PartInfo& part(m_parts[subimage]);
-    if (!part.initialized) {
-        // Only if this subimage hasn't yet been inventoried do we need
-        // to lock and seek.
+    if (!part.validated) {
+        // Only if this subimage hasn't yet been inventoried and validated do
+        // we need to lock and seek.
         lock_guard lock(*this);
-        if (!seek_subimage(subimage, miplevel))
+        if (!part.validated && !seek_subimage(subimage, miplevel))
             return ret;
     }
     if (miplevel < 0 || miplevel >= part.nmiplevels)
@@ -1203,7 +1331,10 @@ OpenEXRCoreInput::read_native_scanline(int subimage, int miplevel, int y, int z,
         return false;
     }
 
-    const ImageSpec& spec = init_part(subimage, miplevel);
+    bool part_ok          = false;
+    const ImageSpec& spec = init_part(subimage, miplevel, part_ok);
+    if (!part_ok)
+        return false;
 
     return read_native_scanlines(subimage, miplevel, y, y + 1, z, 0,
                                  spec.nchannels, data);
@@ -1221,10 +1352,40 @@ OpenEXRCoreInput::read_native_scanlines(int subimage, int miplevel, int ybegin,
         return false;
     }
 
-    const ImageSpec& spec = init_part(subimage, miplevel);
+    bool part_ok          = false;
+    const ImageSpec& spec = init_part(subimage, miplevel, part_ok);
+    if (!part_ok)
+        return false;
 
     return read_native_scanlines(subimage, miplevel, ybegin, yend, z, 0,
                                  spec.nchannels, data);
+}
+
+
+
+// Serve scanlines [ybegin,yend) out of the chunk [cbegin,cend), which is a
+// full chunk of the file, decoding that chunk if we don't already have it in
+// hand. Only called when the request is a proper subset of the chunk.
+bool
+OpenEXRCoreInput::read_cached_chunk(int subimage, int miplevel, int ybegin,
+                                    int yend, int chbegin, int chend,
+                                    int cbegin, int cend, size_t scanlinebytes,
+                                    void* data)
+{
+    if (m_chunkcache.fetch(subimage, miplevel, cbegin, cend, chbegin, chend,
+                           ybegin, yend, scanlinebytes, data))
+        return true;
+
+    // Cache miss. Decode the whole chunk. This recursive call asks for
+    // exactly one full chunk, so it won't come back here.
+    default_init_vector<uint8_t> chunk(scanlinebytes * size_t(cend - cbegin));
+    if (!read_native_scanlines(subimage, miplevel, cbegin, cend, 0, chbegin,
+                               chend, chunk.data()))
+        return false;
+    memcpy(data, chunk.data() + scanlinebytes * size_t(ybegin - cbegin),
+           scanlinebytes * size_t(yend - ybegin));
+    m_chunkcache.adopt(subimage, miplevel, cbegin, cend, chbegin, chend, chunk);
+    return true;
 }
 
 
@@ -1243,7 +1404,10 @@ OpenEXRCoreInput::read_native_scanlines(int subimage, int miplevel, int ybegin,
     // NB: to prevent locking, we use the SUBIMAGE spec, so the mip
     // information is not valid!!!! instead, we will use the library
     // which has an internal thread-safe cache of the sizes if needed
-    const ImageSpec& spec = init_part(subimage, miplevel);
+    bool part_ok          = false;
+    const ImageSpec& spec = init_part(subimage, miplevel, part_ok);
+    if (!part_ok)
+        return false;
 
     chend = clamp(chend, chbegin + 1, spec.nchannels);
 
@@ -1260,10 +1424,26 @@ OpenEXRCoreInput::read_native_scanlines(int subimage, int miplevel, int ybegin,
            m_userdata.m_io->filename(), subimage, miplevel, ybegin, yend,
            yend - ybegin, chbegin, chend - 1, pixelbytes, scanlinebytes,
            scansperchunk);
-    int endy        = spec.y + spec.height;
-    yend            = std::min(endy, yend);
+    int endy = spec.y + spec.height;
+    yend     = std::min(endy, yend);
+    if (ybegin >= yend)
+        return true;
+
     int ychunkstart = spec.y
                       + round_down_to_multiple(ybegin - spec.y, scansperchunk);
+
+    // If the request is only part of a single chunk, go through the chunk
+    // cache: decoding a whole chunk to hand back a few of its scanlines is
+    // expensive, and a client that reads a scanline (or any other sub-chunk
+    // swath) at a time will ask for the rest of that chunk next.
+    if (scansperchunk > 1 && ybegin >= spec.y) {
+        int ychunkend = std::min(ychunkstart + scansperchunk, endy);
+        if (yend <= ychunkend && (ybegin > ychunkstart || yend < ychunkend))
+            return read_cached_chunk(subimage, miplevel, ybegin, yend, chbegin,
+                                     chend, ychunkstart, ychunkend,
+                                     scanlinebytes, data);
+    }
+
     std::atomic<bool> ok(true);
     parallel_for_chunked(
         ychunkstart, yend, scansperchunk,
@@ -1403,7 +1583,10 @@ OpenEXRCoreInput::read_native_tile(int subimage, int miplevel, int x, int y,
     // NB: to prevent locking, we use the SUBIMAGE spec, so the mip
     // information not valid!!!! instead, we will use the library
     // which has an internal thread-safe cache of the sizes
-    const ImageSpec& spec = init_part(subimage, miplevel);
+    bool part_ok          = false;
+    const ImageSpec& spec = init_part(subimage, miplevel, part_ok);
+    if (!part_ok)
+        return false;
     exr_result_t rv;
 
     int32_t tilew = spec.tile_width;
@@ -1489,7 +1672,10 @@ OpenEXRCoreInput::read_native_tiles(int subimage, int miplevel, int xbegin,
         return false;
     }
 
-    const ImageSpec& spec = init_part(subimage, miplevel);
+    bool part_ok          = false;
+    const ImageSpec& spec = init_part(subimage, miplevel, part_ok);
+    if (!part_ok)
+        return false;
 
     return read_native_tiles(subimage, miplevel, xbegin, xend, ybegin, yend,
                              zbegin, zend, 0, spec.nchannels, data);
@@ -1511,7 +1697,10 @@ OpenEXRCoreInput::read_native_tiles(int subimage, int miplevel, int xbegin,
     // NB: to prevent locking, we use the SUBIMAGE spec, so the mip
     // information not valid!!!! instead, we will use the library
     // which has an internal thread-safe cache of the sizes
-    const ImageSpec& spec = init_part(subimage, miplevel);
+    bool part_ok          = false;
+    const ImageSpec& spec = init_part(subimage, miplevel, part_ok);
+    if (!part_ok)
+        return false;
 
     int32_t tilew = spec.tile_width;
     int32_t tileh = spec.tile_height;
@@ -1532,13 +1721,18 @@ OpenEXRCoreInput::read_native_tiles(int subimage, int miplevel, int xbegin,
                                       * size_t((xend - xbegin + tilew - 1)
                                                / tilew));
 
+    // Destination row stride is the caller's requested rectangle width, not
+    // the padded whole-tile width (would overrun the buffer on a partial edge
+    // tile) and not the level-clamped width (would pack rows too tightly for
+    // a valid tile-aligned xend past the edge, per ImageSpec::valid_tile_range).
+    int requested_xend   = xend;
+    size_t scanlinebytes = size_t(requested_xend - xbegin) * pixelbytes;
+
     xend        = std::min(xend, spec.x + levw);
     yend        = std::min(yend, spec.y + levh);
     zend        = std::min(zend, spec.z + spec.depth);
     int nxtiles = (xend - xbegin + tilew - 1) / tilew;
     int nytiles = (yend - ybegin + tileh - 1) / tileh;
-
-    size_t scanlinebytes = size_t(nxtiles) * size_t(tilew) * pixelbytes;
 
     DBGEXR(
         "exr rnt {}:{}:{} ({}-{}|{}x{})[{}-{}] -> t {}, {} n {}, {} pb {} sb {} tsz {}x{}\n",
@@ -1676,12 +1870,12 @@ realloc_deepdata(exr_decode_pipeline_t* decode)
     int chans        = ud->nchans;
     size_t fullwidth = ud->fullwidth;
     size_t xoff      = ud->xoff;
-    ud->linepointers.resize(w * h * chans);
+    ud->linepointers.resize(size_t(w) * size_t(h) * size_t(chans));
     if (ud->firstisfullread) {
         ud->deepdata->set_all_samples(
             cspan<unsigned int>((const uint32_t*)decode->sample_count_table,
                                 (const uint32_t*)decode->sample_count_table
-                                    + w * h));
+                                    + size_t(w) * size_t(h)));
         ud->deepdata->get_pointers(ud->linepointers);
     } else {
         // this is super slow, read the sample counts up front and set the counts once
@@ -1691,12 +1885,12 @@ realloc_deepdata(exr_decode_pipeline_t* decode)
                 for (int x = 0; x < w; ++x)
                     ud->deepdata->set_samples(
                         (y + ud->cury) * fullwidth + xoff + x,
-                        decode->sample_count_table[y * w + x]);
+                        decode->sample_count_table[size_t(y) * w + x]);
         }
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
                 for (int c = 0; c < chans; ++c)
-                    ud->linepointers[(y * w + x) * chans + c]
+                    ud->linepointers[(size_t(y) * w + x) * chans + c]
                         = ud->deepdata->data_ptr((y + ud->cury) * fullwidth
                                                      + xoff + x,
                                                  c, 0);
@@ -1716,7 +1910,7 @@ realloc_deepdata(exr_decode_pipeline_t* decode)
                 curchan.user_bytes_per_element = ud->deepdata->samplesize();
                 curchan.user_pixel_stride      = size_t(chans) * sizeof(void*);
                 curchan.user_line_stride       = (size_t(w) * size_t(chans)
-                                            * sizeof(void*));
+                                                  * sizeof(void*));
                 chanoffset += 1;
                 break;
             }
@@ -1741,7 +1935,10 @@ OpenEXRCoreInput::read_native_deep_scanlines(int subimage, int miplevel,
     // NB: to prevent locking, we use the SUBIMAGE spec, so the mip
     // information is not valid!!!! instead, we will use the library
     // which has an internal thread-safe cache of the sizes if needed
-    const ImageSpec& spec = init_part(subimage, miplevel);
+    bool part_ok          = false;
+    const ImageSpec& spec = init_part(subimage, miplevel, part_ok);
+    if (!part_ok)
+        return false;
 
     chend = clamp(chend, chbegin + 1, spec.nchannels);
 
@@ -1908,8 +2105,11 @@ OpenEXRCoreInput::read_native_deep_tiles(int subimage, int miplevel, int xbegin,
     // NB: to prevent locking, we use the SUBIMAGE spec, so the mip
     // information not valid!!!! instead, we will use the library
     // which has an internal thread-safe cache of the sizes
-    const ImageSpec& spec = init_part(subimage, miplevel);
-    exr_result_t rv       = EXR_ERR_SUCCESS;
+    bool part_ok          = false;
+    const ImageSpec& spec = init_part(subimage, miplevel, part_ok);
+    if (!part_ok)
+        return false;
+    exr_result_t rv = EXR_ERR_SUCCESS;
 
     int32_t tilew = spec.tile_width;
     int32_t tileh = spec.tile_height;
@@ -1987,7 +2187,7 @@ OpenEXRCoreInput::read_native_deep_tiles(int subimage, int miplevel, int xbegin,
                 } else {
                     uint32_t* allsampdata = all_samples.data()
                                             + ty * width * tileh;
-                    int sw = tilew;
+                    int sw                = tilew;
                     if ((size_t(tx) * size_t(tilew) + size_t(tilew)) > width)
                         sw = width - (tx * tilew);
                     int nlines = tileh;
@@ -2017,10 +2217,11 @@ OpenEXRCoreInput::read_native_deep_tiles(int subimage, int miplevel, int xbegin,
             exr_decode_pipeline_t decoder = EXR_DECODE_PIPELINE_INITIALIZER;
             DecoderDestroyer dd(m_exr_context, &decoder);
             // Note: the decoder will be destroyed by dd exiting scope
-            exr_result_t rv
-                = exr_read_tile_chunk_info(m_exr_context, subimage,
-                                           firstxtile + tx, firstytile + ty,
-                                           miplevel, miplevel, &cinfo);
+            exr_result_t rv = exr_read_tile_chunk_info(m_exr_context, subimage,
+                                                       firstxtile + tx,
+                                                       firstytile + ty,
+                                                       miplevel, miplevel,
+                                                       &cinfo);
             if (rv == EXR_ERR_SUCCESS)
                 rv = exr_decoding_initialize(m_exr_context, subimage, &cinfo,
                                              &decoder);
@@ -2046,6 +2247,30 @@ OpenEXRCoreInput::read_native_deep_tiles(int subimage, int miplevel, int xbegin,
         return false;
     }
 
+    return true;
+}
+
+
+
+bool
+OpenEXRCoreInput::get_thumbnail(ImageBuf& thumb, int subimage)
+{
+    lock_guard lock(*this);
+    if (!m_exr_context || subimage < 0 || subimage >= m_nsubimages)
+        return false;
+
+    exr_attr_preview_t preview;
+    if (exr_attr_get_preview(m_exr_context, subimage, "preview", &preview)
+        != EXR_ERR_SUCCESS)
+        return false;
+    if (preview.width < 1 || preview.height < 1 || !preview.rgba)
+        return false;
+
+    // An EXR preview is always 4 channels of 8 bit RGBA, gamma 2.2 encoded
+    ImageSpec thumbspec(int(preview.width), int(preview.height), 4, TypeUInt8);
+    thumb.reset(thumbspec);
+    memcpy(thumb.localpixels(), preview.rgba,
+           size_t(preview.width) * size_t(preview.height) * 4);
     return true;
 }
 

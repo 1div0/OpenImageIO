@@ -34,4 +34,27 @@ command += info_command ("src/crash-005c.psd", failureok=True)
 command += info_command ("src/crash-8a15.psd", failureok=True)
 # Corruption where bad zip compression data caused a buffer overrun
 command += info_command (OIIO_TESTSUITE_IMAGEDIR + "/corrupt_20260312a.psd", failureok=True)
-
+# Corruption where invalid layer resolution caused a huge allocation
+command += info_command ("src/crash-layerres.psd", failureok=True)
+# Corruption where eof was hit in the end of a string read
+command += info_command ("src/crash-eofstring.psd", failureok=True)
+# Corruption where short per-channel rows could overrun interleaving
+command += info_command ("src/crash-rowbounds-f999.psd", failureok=True)
+# Tiny file declaring a huge composite (decompression bomb) is rejected
+command += info_command ("src/crash-bomb-30000.psd", failureok=True)
+# Corrupt thumbnail resource length underflowed into a multi-GB allocation
+command += info_command ("src/crash-thumb-oom.psd", failureok=True)
+# Layer channel declaring more data than the file holds
+command += info_command ("src/crash-chanlen.psd", failureok=True)
+# Same, but a PSB whose 64-bit channel length has the sign bit set
+command += info_command ("src/crash-chanlen-psb.psb", failureok=True)
+# Both a normal layer info section and an Lr16 block (used to assert)
+command += info_command ("src/crash-dup-layerinfo.psd", failureok=True)
+# Layer whose data-window origin (top) is huge but small in size, so origin +
+# size overflows the int scanline coordinates used by the read path. Per-layer
+# specs bypass check_open(), so the reader guards the origin itself.
+command += info_command ("src/crash-layer-origin.psd", failureok=True)
+# Layer whose channel records omit a channel its color mode requires
+command += info_command ("src/crash-missing-chan.psd", failureok=True)
+# PSB merged image whose 32-bit RLE row lengths far exceed the file size
+command += info_command ("src/crash-rlelen-psb.psb", failureok=True)

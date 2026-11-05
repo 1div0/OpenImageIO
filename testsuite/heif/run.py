@@ -32,5 +32,37 @@ command += info_command("mono-10bit.avif", safematch=True)
 command += oiiotool("--pattern fill:color=0.5,0.5,0.5 47x31 3 -o odd-size.avif")
 command += info_command("odd-size.avif", safematch=True)
 
+# Test reading an irot-transformed image with oiio:reorient=0, which asks
+# for the raw stored pixels without applying the transformation. The spec
+# must describe the stored (unrotated) plane, the orientation must be
+# reported via the "Orientation" attribute, and rotating the raw pixels
+# back must reproduce the default auto-reoriented read exactly. The test
+# image is a deliberately asymmetric pattern (see oiiotool-xform and
+# orientation1.tif) so that a wrong rotation direction is plainly visible
+# when the files are viewed or compared.
+rotated = os.path.join(imagedir, "rotated-90cw.heic")
+
+###############
+# redirect this section of commands to out-reorient.txt
+redirect_push("out-reorient.txt")
+command += oiiotool("--info -v --no-metamatch \"DateTime|Software|ImageHistory|CICP\" --iconfig oiio:reorient 0 " + rotated)
+command += oiiotool("--iconfig oiio:reorient 0 " + rotated + " -d uint8 -o reorient0.tif")
+command += oiiotool(rotated + " -d uint8 -o oriented.tif")
+command += oiiotool("reorient0.tif --rotate90 -o reorient0-rotated.tif")
+command += oiiotool("--info -v --no-metamatch \"DateTime|Software|ImageHistory|CICP\" reorient0.tif")
+command += oiiotool("reorient0-rotated.tif oriented.tif --diff")
+redirect_pop()
+###############
+
+# Damaged file: test-10bit.avif with the ipma entry for item 1 renumbered,
+# so the primary item has no properties. libheif's C++ wrapper throws from
+# get_image_handle(), which used to escape open() and abort.
+# https://github.com/AcademySoftwareFoundation/OpenImageIO/issues/5550
+redirect_push("out-damaged.txt")
+redirect += " 2>&1 "    # the error goes to stderr
+command += info_command(os.path.join(imagedir, "damaged-noprops.avif"),
+                        failureok=True)
+redirect_pop()
+
 # avif conversion is expected to fail if libheif is built without AV1 support
 failureok = 1

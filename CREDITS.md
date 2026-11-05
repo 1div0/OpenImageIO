@@ -1,11 +1,12 @@
 This is a list of all the contributors to OpenImageIO, sorted alphabetically
 by first name.
 
-If you know of somebody that I missed or have corrections, please email:
-lg@openimageio.org
+If you know of somebody that I missed or have corrections, please contact
+the project.
 
 * Aamir Raza
 * Aaron Colwell
+* Abhirup Bhattacharyya
 * Adam Mains
 * Akihiro Yamasaki
 * Alan Jones
@@ -34,6 +35,9 @@ lg@openimageio.org
 * Anthony Nemoff
 * Aras Pranckevičius
 * Arkady Shapkin
+* Asish Kumar
+* Aurele Boquet
+* Ayush Singh
 * Basile Fraboni
 * Basileios Anastasatos
 * Bastien Montagne
@@ -47,6 +51,7 @@ lg@openimageio.org
 * Brecht Van Lommel
 * Brent Davis
 * Brian Hall
+* Brian R Hanke
 * Brice Gros
 * Campbell Barton
 * Carine Touraille
@@ -85,14 +90,18 @@ lg@openimageio.org
 * Dominik Bartkiewicz
 * Dominik Wójt
 * Don Olmstead
+* Dongju Lee
+* Doug Walker
 * Duncan Chan
 * Dustin Rodrigues
 * Edgar Velazquez-Armendariz
 * Eloi Du Bois
 * Elvic Liang
 * Emil Dohne
+* Ethan Lin
 * Fabien Castan
 * Fabien Servant
+* Faisal
 * Fredrik Averpil
 * Frédéric Devernay
 * Gaurav Bansal
@@ -103,17 +112,20 @@ lg@openimageio.org
 * Gregor Mueckl
 * Grégoire De Lillo
 * Guillaume Chatelet
+* Hannah Gulka
 * Hanspeter Niederstrasser
 * Harry Mallon
 * Heiko Becker
 * Henri Fousse
 * Hugh Macdonald
+* Hunter
 * Imarz
 * Irena Damsky
 * Ismael Cortes
 * Jackson Sun
 * Jan Hettenkofer
 * Jan Honsbrok
+* Jeevan Mohan Pawar
 * Jens Lindgren
 * Jep Hill
 * Jeph Alapat
@@ -122,6 +134,7 @@ lg@openimageio.org
 * Jeremy Selan
 * Jesse Yurkovich
 * Jim Hourihan
+* Jinnie Kim
 * Joachim Reichel
 * Johannes Unterguggenberger
 * John Burnett
@@ -137,21 +150,25 @@ lg@openimageio.org
 * Justina Mikonyte
 * Kaarrot
 * Kazuki Takahashi
+* Ken McGaugh
 * Kevin Brightwell
 * Kimball Thurston
 * Konrad Kleine
 * Krzysztof Blicharski
 * Larry Gritz (project leader)
+* Lauren Zhang
 * LazyDodo
 * Leonid Onokhov
 * Leszek Godlewski
 * Li Ji
+* Loïc Vital
 * Lucas Panian
 * Lucille Caillaud
 * Lukas Schrangl
 * Lukasz Maliszewski
 * Luke Emrose
 * Lumina Wang
+* Luna Kim
 * Lydia Zheng
 * M Joonas Pihlaja
 * Malcolm Humphreys
@@ -159,13 +176,17 @@ lg@openimageio.org
 * Manuel Leonhardt
 * Marcos Fajardo
 * Marie Fetiveau
+* Marta Feriani
 * Mariusz Szczepanczyk
 * Mark Boorer
 * Mark Visser
 * Massimo Paladin
+* Matt Van Horn
 * Matteo F. Vescovi
 * Matthew E. Levine
 * Max Liani
+* Mixie / Maxi741cv
+* Maxwell Iverson
 * Mel Massadian
 * Merwan Achibet
 * Michael Cho
@@ -175,10 +196,14 @@ lg@openimageio.org
 * Mikael Sundell
 * Mike Root
 * Morteza Ramezanali
+* Nafisa Baker
 * Nandan Dubey
+* Nathan Gray
 * Nathan Rusch
 * Nicholas Yue
 * Nick Black
+* Nick D'Ademo
+* Nick Shelton
 * Nicolas Burtnyk
 * Nixon Kwok
 * Noah Rahm (designer of our logo!)
@@ -203,6 +228,7 @@ lg@openimageio.org
 * Pino Toscano
 * Povilas Kanapickas
 * Puneet Jain
+* Qi-fly
 * Radu Arjocu
 * Ramon Montoya
 * Ray Molenkamp
@@ -211,6 +237,7 @@ lg@openimageio.org
 * Robert Matusewicz
 * Roeland Schoukens
 * Roman Zulak
+* rose413
 * Rui Chen
 * Rui Li
 * Russell Greene
@@ -242,6 +269,7 @@ lg@openimageio.org
 * Tim Grant
 * Todica Ionut
 * Tom Knowles
+* Tom Royls
 * Troy James Sobotka
 * Valery Angelique
 * Vanessa Valderrama
@@ -259,6 +287,7 @@ lg@openimageio.org
 * Yann Lanthony
 * Zach Lewis
 * Ziad Khouri
+* Zitong Yang
 * zomgrolf
 
 

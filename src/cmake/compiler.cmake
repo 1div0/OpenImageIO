@@ -185,7 +185,6 @@ endif ()
 if (CMAKE_COMPILER_IS_GNUCC AND NOT (CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_APPLECLANG))
     # gcc specific options
     add_compile_options ("-Wno-unused-local-typedefs")
-    add_compile_options ("-Wno-unused-result")
     add_compile_options ("-Wno-aligned-new")
     add_compile_options ("-Wno-noexcept-type")
 endif ()
@@ -317,12 +316,94 @@ endif ()
 ###########################################################################
 # SIMD and machine architecture options.
 #
-# The USE_SIMD option may be set to a comma-separated list of machine /
-# instruction set options, such as "avx3,f16c". The list will be parsed and
-# the proper compiler directives added to generate code for those ISA
-# capabilities.
+# USE_SIMD is a comma-separated list of ISA features to generate code for,
+# e.g. "avx2,f16c". Also usable as an env var or `make USE_SIMD=...`.
 #
-set_cache (USE_SIMD "" "Use SIMD directives (0, sse2, sse3, ssse3, sse4.1, sse4.2, avx, avx2, avx512f, f16c, aes)")
+# Default: x86_64 -> "x86-64-v2" (SSE4.2 + POPCNT + CMPXCHG16B; every x86-64
+# CPU since ~2009). Other arches -> "" (compiler default, which already has
+# NEON on ARMv8-A). "0" disables SIMD everywhere. Lower it (e.g. "sse2") to
+# run on pre-2009 x86_64; raise it to "x86-64-v3" (CPUs since ~2013) or
+# "x86-64-v4" (~2017, AVX-512) to go faster on newer hardware.
+#
+# The psABI level names are shorthands for a fixed set of feature tokens
+# (and add -march=x86-64-vN when the compiler knows it):
+#   x86-64-v2 = sse4.2,popcnt,cx16
+#   x86-64-v3 = v2 + avx,avx2,bmi,bmi2,f16c,fma,lzcnt,movbe
+#   x86-64-v4 = v3 + avx512f,avx512bw,avx512cd,avx512dq,avx512vl
+# Since no CPU ships one of these features without the rest of its level, a
+# bare "avx" is promoted to v2 and "avx2" to v3 (so you can't under-specify).
+# "avx512*" only promotes to v3, not v4: AVX-512 CPUs differ in which avx512
+# subsets they carry, so ask for "x86-64-v4" explicitly if you want it.
+#
+# Tokens for the wrong CPU family are ignored, so a CI matrix may pass
+# "avx2,f16c" to an ARM build harmlessly.
+
+# Which CPU family(s) are we targeting? On Apple, CMAKE_OSX_ARCHITECTURES,
+# when set, overrides CMAKE_SYSTEM_PROCESSOR and may name more than one
+# architecture (a universal binary).
+if (CMAKE_OSX_ARCHITECTURES)
+    set (_simd_target_archs "${CMAKE_OSX_ARCHITECTURES}")
+else ()
+    set (_simd_target_archs "${CMAKE_SYSTEM_PROCESSOR}")
+endif ()
+set (SIMD_TARGET_X86_64 OFF)
+set (SIMD_TARGET_X86_32 OFF)
+set (SIMD_TARGET_ARM64 OFF)
+foreach (_arch ${_simd_target_archs})
+    string (TOLOWER "${_arch}" _arch)
+    if (_arch MATCHES "^(x86_64|amd64|x64)$")
+        set (SIMD_TARGET_X86_64 ON)
+    elseif (_arch MATCHES "^(i.86|x86)$")
+        set (SIMD_TARGET_X86_32 ON)
+    elseif (_arch MATCHES "^(arm64.*|aarch64)$")
+        set (SIMD_TARGET_ARM64 ON)
+    endif ()
+endforeach ()
+message (VERBOSE "SIMD target archs = ${_simd_target_archs}"
+                 " (x86_64=${SIMD_TARGET_X86_64} x86_32=${SIMD_TARGET_X86_32}"
+                 " arm64=${SIMD_TARGET_ARM64})")
+
+if (SIMD_TARGET_X86_64)
+    set (_simd_default "x86-64-v2")
+else ()
+    set (_simd_default "")
+endif ()
+set_cache (USE_SIMD "${_simd_default}"
+           "Use SIMD directives (0, x86-64-v2, x86-64-v3, x86-64-v4, sse2, sse3, ssse3, sse4.1, sse4.2, popcnt, cx16, avx, avx2, avx512f, f16c, fma, aes, neon)")
+unset (_simd_default)
+
+# Tokens we recognize as naming an x86 or an ARM ISA feature. Anything not on
+# either list is passed through to the compiler as before.
+set (_simd_x86_features sse2 sse3 ssse3 sse4.1 sse4.2 avx avx2
+                        avx512f avx512dq avx512bw avx512vl avx512cd avx512ifma
+                        f16c fma aes popcnt cx16 bmi bmi2 lzcnt movbe)
+
+# Feature tokens each psABI level expands to (see USE_SIMD notes above). The
+# "fma" token in v3/v4 also flips on -ffp-contract=off below, so the compiler
+# won't silently contract a*b+c even though FMA is available for madd().
+set (_simd_x86_64_v2_features sse4.2 popcnt cx16)
+set (_simd_x86_64_v3_features ${_simd_x86_64_v2_features}
+                              avx avx2 bmi bmi2 f16c fma lzcnt movbe)
+set (_simd_x86_64_v4_features ${_simd_x86_64_v3_features}
+                              avx512f avx512bw avx512cd avx512dq avx512vl)
+
+# For a universal binary we must attach the per-family flags to just the one
+# slice they apply to. Apple's clang has -Xarch_<arch> for exactly this.
+set (_simd_x86_xarch "")
+set (_simd_arm_xarch "")
+set (_simd_skip_x86 OFF)
+if (SIMD_TARGET_X86_64 AND SIMD_TARGET_ARM64)
+    if (APPLE)
+        set (_simd_x86_xarch "-Xarch_x86_64")
+        set (_simd_arm_xarch "-Xarch_arm64")
+    else ()
+        # No way to qualify a flag per-slice, so a global -msse4.2 would be
+        # handed to the ARM compilation too. Better to add nothing.
+        set (_simd_skip_x86 ON)
+        message (STATUS "Multi-architecture build: omitting x86 SIMD flags")
+    endif ()
+endif ()
+
 set (SIMD_COMPILE_FLAGS "")
 message (STATUS "Compiling with SIMD level ${USE_SIMD}")
 if (NOT USE_SIMD STREQUAL "")
@@ -331,38 +412,107 @@ if (NOT USE_SIMD STREQUAL "")
     else ()
         set(_highest_msvc_arch 0)
         string (REPLACE "," ";" SIMD_FEATURE_LIST "${USE_SIMD}")
+
+        # Promote a bare avx/avx2/avx512* to the psABI level it guarantees.
+        foreach (feature ${SIMD_FEATURE_LIST})
+            if (feature STREQUAL "avx")
+                list (APPEND SIMD_FEATURE_LIST "x86-64-v2")
+            elseif (feature STREQUAL "avx2" OR feature MATCHES "^avx512")
+                list (APPEND SIMD_FEATURE_LIST "x86-64-v3")
+            endif ()
+        endforeach ()
+
+        # Expand each x86-64-vN token to its feature list, plus -march=x86-64-vN
+        # when the compiler accepts it.
+        foreach (_lvl v2 v3 v4)
+            if (NOT "x86-64-${_lvl}" IN_LIST SIMD_FEATURE_LIST)
+                continue ()
+            endif ()
+            list (REMOVE_ITEM SIMD_FEATURE_LIST "x86-64-${_lvl}")
+            list (APPEND SIMD_FEATURE_LIST ${_simd_x86_64_${_lvl}_features})
+            if (SIMD_TARGET_X86_64 AND NOT _simd_skip_x86
+                AND (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG))
+                # Compilers older than gcc 11 / clang 12 don't know the psABI
+                # level names, so probe before using one. For a universal
+                # build the flag must be qualified with -Xarch_x86_64, or the
+                # arm64 slice rejects it, so probe the qualified form.
+                include (CheckCXXSourceCompiles)
+                set (_simd_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+                set (CMAKE_REQUIRED_FLAGS "${_simd_x86_xarch} -march=x86-64-${_lvl}")
+                check_cxx_source_compiles ("int main() { return 0; }"
+                                           OIIO_COMPILER_SUPPORTS_X86_64_${_lvl})
+                set (CMAKE_REQUIRED_FLAGS "${_simd_saved_required_flags}")
+                unset (_simd_saved_required_flags)
+                if (OIIO_COMPILER_SUPPORTS_X86_64_${_lvl})
+                    list (APPEND SIMD_COMPILE_FLAGS ${_simd_x86_xarch} "-march=x86-64-${_lvl}")
+                endif ()
+            endif ()
+        endforeach ()
+        list (REMOVE_DUPLICATES SIMD_FEATURE_LIST)
+
         foreach (feature ${SIMD_FEATURE_LIST})
             message (VERBOSE "SIMD feature: ${feature}")
-            if (MSVC OR CMAKE_COMPILER_IS_INTEL)
-                if (feature STREQUAL "sse2")
-                    list (APPEND SIMD_COMPILE_FLAGS "/D__SSE2__")
+            if (feature IN_LIST _simd_x86_features)
+                if (NOT (SIMD_TARGET_X86_64 OR SIMD_TARGET_X86_32))
+                    message (STATUS "  Ignoring SIMD feature '${feature}' (not an x86 target)")
+                    continue ()
                 endif ()
-                if (feature STREQUAL "sse4.1")
-                    list (APPEND SIMD_COMPILE_FLAGS "/D__SSE2__" "/D__SSE4_1__")
+                if (_simd_skip_x86)
+                    continue ()
                 endif ()
-                if (feature STREQUAL "sse4.2")
-                    list (APPEND SIMD_COMPILE_FLAGS "/D__SSE2__" "/D__SSE4_2__")
+                if (MSVC OR CMAKE_COMPILER_IS_INTEL)
+                    # The SSE levels are handled unconditionally below. Here we
+                    # only need to track the highest /arch: level requested.
+                    if (feature STREQUAL "avx" AND _highest_msvc_arch LESS 1)
+                        set(_highest_msvc_arch 1)
+                    endif ()
+                    if (feature STREQUAL "avx2" AND _highest_msvc_arch LESS 2)
+                        set(_highest_msvc_arch 2)
+                    endif ()
+                    if (feature STREQUAL "avx512f" AND _highest_msvc_arch LESS 3)
+                        set(_highest_msvc_arch 3)
+                    endif ()
+                else ()
+                    list (APPEND SIMD_COMPILE_FLAGS ${_simd_x86_xarch} "-m${feature}")
                 endif ()
-                if (feature STREQUAL "avx" AND _highest_msvc_arch LESS 1)
-                    set(_highest_msvc_arch 1)
+                if (feature STREQUAL "fma" AND (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG))
+                    # If fma is requested, for numerical accuracy sake, turn it
+                    # off by default except when we explicitly use madd. At some
+                    # future time, we should look at this again carefully and
+                    # see if we want to use it more widely by ffp-contract=fast.
+                    add_compile_options ("-ffp-contract=off")
                 endif ()
-                if (feature STREQUAL "avx2" AND _highest_msvc_arch LESS 2)
-                    set(_highest_msvc_arch 2)
+            elseif (feature STREQUAL "neon" OR feature MATCHES "^(armv|apple-|m(arch|cpu|tune)=)")
+                if (NOT SIMD_TARGET_ARM64)
+                    message (STATUS "  Ignoring SIMD feature '${feature}' (not an ARM target)")
+                    continue ()
                 endif ()
-                if (feature STREQUAL "avx512f" AND _highest_msvc_arch LESS 3)
-                    set(_highest_msvc_arch 3)
+                if (feature STREQUAL "neon")
+                    # NEON is mandatory on ARMv8-A; nothing to ask the
+                    # compiler for. Accepted so that it can be named
+                    # explicitly for symmetry with the x86 tokens.
+                elseif (feature MATCHES "^armv")
+                    list (APPEND SIMD_COMPILE_FLAGS ${_simd_arm_xarch} "-march=${feature}")
+                elseif (feature MATCHES "^apple-")
+                    list (APPEND SIMD_COMPILE_FLAGS ${_simd_arm_xarch} "-mcpu=${feature}")
+                else () # already in march=/mcpu=/mtune= form
+                    list (APPEND SIMD_COMPILE_FLAGS ${_simd_arm_xarch} "-${feature}")
                 endif ()
             else ()
-                list (APPEND SIMD_COMPILE_FLAGS "-m${feature}")
-            endif ()
-            if (feature STREQUAL "fma" AND (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG))
-                # If fma is requested, for numerical accuracy sake, turn it
-                # off by default except when we explicitly use madd. At some
-                # future time, we should look at this again carefully and
-                # see if we want to use it more widely by ffp-contract=fast.
-                add_compile_options ("-ffp-contract=off")
+                # Unrecognized token: pass it through the way we always have.
+                if (NOT (MSVC OR CMAKE_COMPILER_IS_INTEL))
+                    list (APPEND SIMD_COMPILE_FLAGS "-m${feature}")
+                endif ()
             endif ()
         endforeach()
+
+        if ((MSVC OR CMAKE_COMPILER_IS_INTEL) AND SIMD_TARGET_X86_64)
+            # MSVC makes every intrinsic through AVX2 available regardless of
+            # the /arch: setting, and it never predefines the __SSE*__ macros
+            # that simd.h keys off. Since all x86-64 hardware is SSE4.2 or
+            # better, just say so.
+            list (APPEND SIMD_COMPILE_FLAGS "/D__SSE2__" "/D__SSE4_1__" "/D__SSE4_2__")
+        endif ()
 
         # Only add a single /arch flag representing the highest level of support.
         if (MSVC OR CMAKE_COMPILER_IS_INTEL)
@@ -378,8 +528,17 @@ if (NOT USE_SIMD STREQUAL "")
         endif ()
         unset(_highest_msvc_arch)
     endif ()
+    message (VERBOSE "SIMD compile flags: ${SIMD_COMPILE_FLAGS}")
     add_compile_options (${SIMD_COMPILE_FLAGS})
 endif ()
+unset (_simd_target_archs)
+unset (_simd_x86_features)
+unset (_simd_x86_64_v2_features)
+unset (_simd_x86_64_v3_features)
+unset (_simd_x86_64_v4_features)
+unset (_simd_x86_xarch)
+unset (_simd_arm_xarch)
+unset (_simd_skip_x86)
 
 
 ###########################################################################
@@ -459,6 +618,7 @@ endif ()
 # Sanitizer options
 #
 set_cache (SANITIZE "" "Build code using sanitizer (address, thread, undefined)")
+set_option (${PROJ_NAME}_BUILD_FUZZ_TARGETS "Build libFuzzer fuzz targets (requires clang)" OFF)
 if (SANITIZE AND (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG))
     message (STATUS "Compiling for sanitizer=${SANITIZE}")
     string (REPLACE "," ";" SANITIZE_FEATURE_LIST ${SANITIZE})
@@ -468,6 +628,12 @@ if (SANITIZE AND (CMAKE_COMPILER_IS_GNUCC OR CMAKE_COMPILER_IS_CLANG))
         add_link_options (-fsanitize=${feature})
     endforeach()
     add_compile_options (-g -fno-omit-frame-pointer)
+    if (${PROJ_NAME}_BUILD_FUZZ_TARGETS AND CMAKE_COMPILER_IS_CLANG)
+        # Coverage-instrument the libraries, not just the fuzz harness, so
+        # libFuzzer can see which paths through the readers it reached.
+        # The sanitizer runtime supplies the callbacks for non-fuzz links.
+        add_compile_options (-fsanitize=fuzzer-no-link)
+    endif ()
     if (CMAKE_COMPILER_IS_GNUCC)
         # turn on glibcxx extra annotations to find vector writes past end
         add_compile_definitions (_GLIBCXX_SANITIZE_VECTOR=1)
@@ -505,6 +671,12 @@ else ()
 endif ()
 set_cache (${PROJ_NAME}_HARDENING ${${PROJ_NAME}_HARDENING_DEFAULT}
            "Turn on security hardening features 0=none, 1=fast, 2=extensive, 3=debug")
+# libc++ hardening modes are supported starting with libc++ 18, which is
+# first shipped by LLVM clang 18 and Apple clang 17.
+if (CLANG_VERSION_STRING VERSION_GREATER_EQUAL 18.0
+    OR APPLECLANG_VERSION_STRING VERSION_GREATER_EQUAL 17.0)
+    set (_libcpp_has_hardening_modes TRUE)
+endif ()
 # Implementation:
 add_compile_definitions (${PROJ_NAME}_HARDENING_DEFAULT=${${PROJ_NAME}_HARDENING})
 if (${PROJ_NAME}_HARDENING GREATER_EQUAL 1)
@@ -521,16 +693,21 @@ if (${PROJ_NAME}_HARDENING GREATER_EQUAL 1)
     # Defining _FORTIFY_SOURCE provides buffer overflow checks in modern gcc &
     # clang with some compiler-assisted deduction of buffer lengths) for the
     # many C functions such as memcpy, strcpy, sprintf, etc. But it requires
-    # optimization, so we don't do it for debug builds.
-    if ((CMAKE_COMPILER_IS_CLANG OR (GCC_VERSION VERSION_GREATER_EQUAL 14))
-         AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # optimization, so we don't do it for debug builds. It is also incompatible
+    # with the address and memory sanitizers, which predefine _FORTIFY_SOURCE=0
+    # themselves; defining it again would be ineffective and trigger a
+    # -Wmacro-redefined error, so we skip it when such a sanitizer is enabled.
+    if ((CMAKE_COMPILER_IS_CLANG OR CMAKE_COMPILER_IS_APPLECLANG OR
+         GCC_VERSION VERSION_GREATER_EQUAL 14)
+         AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug"
+         AND NOT SANITIZE MATCHES "address|memory")
         add_compile_definitions (_FORTIFY_SOURCE=${${PROJ_NAME}_HARDENING})
     endif ()
 endif ()
 if (${PROJ_NAME}_HARDENING EQUAL 1)
     # Setting _LIBCPP_HARDENING_MODE enables various hardening features in
     # clang/llvm's libc++ 18.0 and later.
-    if (OIIO_CLANG_VERSION VERSION_GREATER_EQUAL 18.0 OR OIIO_APPLE_CLANG_VERSION VERSION_GREATER_EQUAL 18.0)
+    if (_libcpp_has_hardening_modes)
         add_compile_definitions (_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST)
     endif ()
 elseif (${PROJ_NAME}_HARDENING EQUAL 2)
@@ -539,7 +716,7 @@ elseif (${PROJ_NAME}_HARDENING EQUAL 2)
         # I've had trouble turning this on in older gcc
         add_compile_definitions (_GLIBCXX_ASSERTIONS)
     endif ()
-    if (OIIO_CLANG_VERSION VERSION_GREATER_EQUAL 18.0 OR OIIO_APPLE_CLANG_VERSION VERSION_GREATER_EQUAL 18.0)
+    if (_libcpp_has_hardening_modes)
         add_compile_definitions (_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE)
     endif ()
 elseif (${PROJ_NAME}_HARDENING EQUAL 3)
@@ -550,10 +727,11 @@ elseif (${PROJ_NAME}_HARDENING EQUAL 3)
         # N.B. _GLIBCXX_DEBUG changes ABI, so don't do this:
         #   add_compile_definitions (_GLIBCXX_DEBUG)
     endif ()
-    if (OIIO_CLANG_VERSION VERSION_GREATER_EQUAL 18.0 OR OIIO_APPLE_CLANG_VERSION VERSION_GREATER_EQUAL 18.0)
+    if (_libcpp_has_hardening_modes)
         add_compile_definitions (_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG)
     endif ()
 endif ()
+unset (_libcpp_has_hardening_modes)
 
 
 ###########################################################################
@@ -609,15 +787,10 @@ endif ()
 # Note: skip all of this checking, setup, and cmake-format target if this
 # is being built as a subproject.
 if (PROJECT_IS_TOP_LEVEL)
-    set (CLANG_FORMAT_EXE_HINT "" CACHE PATH "clang-format executable's directory (will search if not specified")
-    set (CLANG_FORMAT_INCLUDES "src/*.h" "src/*.cpp testsuite/*.cpp testsuite/*.h"
+    set_cache (CLANG_FORMAT_EXE_HINT "" "clang-format executable's directory (will search if not specified")
+    set (CLANG_FORMAT_INCLUDES "src/*.h" "src/*.cpp" "testsuite/*.cpp" "testsuite/*.h"
         CACHE STRING "Glob patterns to include for clang-format")
-    set (CLANG_FORMAT_EXCLUDES "*pugixml*" "*SHA1*" "*/farmhash.cpp"
-                               "src/dpx.imageio/libdpx/*"
-                               "src/cineon.imageio/libcineon/*"
-                               "src/dds.imageio/bcdec.h"
-                               "src/gif.imageio/gif.h"
-                               "src/libutil/stb_sprintf.h"
+    set (CLANG_FORMAT_EXCLUDES ""
          CACHE STRING "Glob patterns to exclude for clang-format")
     find_program (CLANG_FORMAT_EXE
                   NAMES clang-format bin/clang-format

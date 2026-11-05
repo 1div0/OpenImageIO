@@ -157,9 +157,9 @@ ImageBufAlgo::deepen(ImageBuf& dst, const ImageBuf& src, float zvalue, ROI roi,
     force_spec.set_format(TypeDesc::FLOAT);
     force_spec.channelformats.clear();
     for (int c = 0; c < nc; ++c) {
-        if (force_spec.channelnames[c] == "Z")
+        if (force_spec.channel_name(c) == "Z")
             force_spec.z_channel = c;
-        else if (force_spec.channelnames[c] == "Zback")
+        else if (force_spec.channel_name(c) == "Zback")
             zback_channel = c;
     }
     bool add_z_channel = (force_spec.z_channel < 0);
@@ -338,7 +338,13 @@ ImageBufAlgo::deep_merge(ImageBuf& dst, const ImageBuf& A, const ImageBuf& B,
                 int Bpixel   = B.pixelindex(x, y, z, true);
                 OIIO_DASSERT(dstpixel >= 0);
                 // OIIO_UNUSED_OK int oldcap = dstdd.capacity (dstpixel);
-                dstdd.merge_deep_pixels(dstpixel, Bdd, Bpixel);
+
+                // Cast to int64_t so this calls the bool overload,
+                // not the DEPRECATED(3.2) void one.
+                bool ok_dd = dstdd.merge_deep_pixels(int64_t(dstpixel), Bdd,
+                                                     int64_t(Bpixel));
+                if (!ok_dd)
+                    return false;
                 // OIIO_DASSERT (oldcap == dstdd.capacity(dstpixel) &&
                 //          "Broken: we did not preallocate enough capacity");
                 if (occlusion_cull)
@@ -402,7 +408,9 @@ ImageBufAlgo::deep_holdout(ImageBuf& dst, const ImageBuf& src,
         if (srcpixel < 0)
             continue;  // Nothing in this pixel
         int dstpixel = dst.pixelindex(x, y, z, true);
-        dstdd.copy_deep_pixel(dstpixel, srcdd, srcpixel);
+        bool ok      = dstdd.copy_deep_pixel(dstpixel, srcdd, srcpixel);
+        if (!ok)
+            return false;
         int threshpixel = thresh.pixelindex(x, y, z, true);
         if (threshpixel < 0)
             continue;  // No threshold mask for this pixel

@@ -15,14 +15,23 @@ OIIO_PLUGIN_NAMESPACE_BEGIN
 namespace webp_pvt {
 
 
+// Layout of the start of any webp file
+struct WebpHead {
+    char RIFF[4];  // should contain "RIFF"
+    uint32_t file_size;
+    char WEBP[4];  // should contain "WEBP"
+};
+
+
+
 static bool
 webp_exif_payload_has_tiff_header(cspan<uint8_t> exif)
 {
-    const size_t exif_header_size = 6;
-    const bool has_exif_header    = exif.size() >= exif_header_size
-                                 && exif[0] == 'E' && exif[1] == 'x'
-                                 && exif[2] == 'i' && exif[3] == 'f'
-                                 && exif[4] == 0 && exif[5] == 0;
+    const size_t exif_header_size   = 6;
+    const bool has_exif_header      = exif.size() >= exif_header_size
+                                      && exif[0] == 'E' && exif[1] == 'x'
+                                      && exif[2] == 'i' && exif[3] == 'f'
+                                      && exif[4] == 0 && exif[5] == 0;
     const size_t tiff_header_offset = has_exif_header ? exif_header_size : 0;
     return exif.size() >= tiff_header_offset + sizeof(TIFFHeader);
 }
@@ -99,9 +108,12 @@ WebpInput::valid_file(Filesystem::IOProxy* ioproxy) const
     if (!ioproxy || ioproxy->mode() != Filesystem::IOProxy::Mode::Read)
         return false;
 
-    uint8_t header[64] {};
-    const size_t numRead = ioproxy->pread(header, sizeof(header), 0);
-    return WebPGetInfo(header, numRead, nullptr, nullptr);
+    WebpHead head;
+    return ioproxy->pread(&head, sizeof(head), 0) == sizeof(head)
+           && head.RIFF[0] == 'R' && head.RIFF[1] == 'I'  //
+           && head.RIFF[2] == 'F' && head.RIFF[3] == 'F'  //
+           && head.WEBP[0] == 'W' && head.WEBP[1] == 'E'  //
+           && head.WEBP[2] == 'B' && head.WEBP[3] == 'P';
 }
 
 
@@ -129,6 +141,7 @@ WebpInput::open(const std::string& name, ImageSpec& spec,
     m_image_size = io->size();
     if (m_image_size == size_t(-1)) {
         errorfmt("Failed to get size for \"{}\"", m_filename);
+        close();
         return false;
     }
 
@@ -195,8 +208,14 @@ WebpInput::open(const std::string& name, ImageSpec& spec,
     if (m_demux_flags & EXIF_FLAG
         && WebPDemuxGetChunk(m_demux, "EXIF", 1, &chunk_iter)) {
         cspan<uint8_t> exif_span(chunk_iter.chunk.bytes, chunk_iter.chunk.size);
-        if (webp_exif_payload_has_tiff_header(exif_span))
-            decode_exif(exif_span, m_spec);
+        if (webp_exif_payload_has_tiff_header(exif_span)) {
+            bool ok = decode_exif(exif_span, m_spec);
+            if (!ok && OIIO::get_int_attribute("imageinput:strict")) {
+                errorfmt("Could not decode Exif");
+                close();
+                return false;
+            }
+        }
         WebPDemuxReleaseChunkIterator(&chunk_iter);
     }
     if (m_demux_flags & XMP_FLAG
@@ -220,8 +239,18 @@ WebpInput::open(const std::string& name, ImageSpec& spec,
         if (!ok && OIIO::get_int_attribute("imageinput:strict")) {
             errorfmt("Possible corrupt file, could not decode ICC profile: {}\n",
                      errormsg);
+            close();
             return false;
         }
+    }
+
+    // Validate the declared canvas extents and the implied uncompressed size
+    // BEFORE allocating the decoded-image buffer, so a malformed header cannot
+    // drive a large allocation.
+    if (!check_open(m_spec, { 0, (1 << 14) - 1, 0, (1 << 14) - 1, 0, 1, 0, 4 })
+        || !check_compression_ratio(m_spec, m_image_size)) {
+        close();
+        return false;
     }
 
     // Make space for the decoded image

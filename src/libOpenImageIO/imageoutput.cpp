@@ -26,22 +26,43 @@
 
 
 OIIO_NAMESPACE_3_1_BEGIN
+
+
+// How many scanlines does this file want to be written at a time? Formats
+// that store scanlines in indivisible groups say so in "oiio:RowsPerChunk"
+// when they open the file for writing. If the format doesn't say, pick 64.
+static int
+safe_rows_per_chunk(const ImageSpec& spec)
+{
+    int rpc = spec.get_int_attribute("oiio:RowsPerChunk", 0);
+    return rpc > 0 ? rpc : 64;
+}
+
+
 using namespace pvt;
 using namespace OIIO::pvt;
 
 
-// store an error message per thread, for a specific ImageInput
-static thread_local tsl::robin_map<uint64_t, std::string> output_error_messages;
+// Store an error message per thread, for a specific ImageOutput (keyed by
+// the ImageOutput's unique id). Wrapped in a small struct carrying an "alive"
+// flag set false by its own destructor, so that an ImageOutput destroyed
+// during thread/program teardown -- after this thread_local has already been
+// destroyed (the static destruction order fiasco) -- can detect that and skip
+// touching the dead map.
+namespace {
+struct OutputErrorMessages {
+    tsl::robin_map<uint64_t, std::string> map;
+    bool alive = true;
+    ~OutputErrorMessages() { alive = false; }
+};
+}  // namespace
+static thread_local OutputErrorMessages output_error_messages;
 static std::atomic_int64_t output_next_id(0);
 
 
 class ImageOutput::Impl {
 public:
-    Impl()
-        : m_id(++output_next_id)
-        , m_threads(OIIO::pvt::oiio_threads)
-    {
-    }
+    Impl() : m_id(++output_next_id), m_threads(OIIO::pvt::oiio_threads) {}
 
     // Unneeded?
     //  // So we can lock this ImageOutput for the thread-safe methods.
@@ -85,8 +106,7 @@ ImageOutput::operator delete(void* ptr)
 
 
 
-ImageOutput::ImageOutput()
-    : m_impl(new Impl, impl_deleter)
+ImageOutput::ImageOutput() : m_impl(new Impl, impl_deleter)
 {
 }
 
@@ -94,10 +114,14 @@ ImageOutput::ImageOutput()
 
 ImageOutput::~ImageOutput()
 {
-    // Erase any leftover errors from this thread
-    // TODO: can we clear other threads' errors?
-    // TODO: potentially unsafe due to the static destruction order fiasco
-    // output_error_messages.erase(this);
+    // Erase any leftover error for this ImageOutput so the per-thread map does
+    // not grow without bound when many outputs are created. Guard against the
+    // static destruction order fiasco: if the thread_local map has already
+    // been destroyed, its 'alive' flag is false and we must not touch it.
+    // TODO: this only clears the entry if we are destroyed on the same thread
+    // that accumulated the error; cross-thread errors still leak.
+    if (output_error_messages.alive)
+        output_error_messages.map.erase(m_impl->m_id);
 }
 
 
@@ -150,7 +174,7 @@ bool
 ImageOutput::write_scanline(int y, TypeDesc format,
                             const image_span<const std::byte>& data)
 {
-    if (y < 0 || y >= m_spec.height) {
+    if (y < m_spec.y || y >= (m_spec.y + m_spec.height)) {
         errorfmt("write_scanlines: Invalid scanline index {}", y);
         return false;
     }
@@ -190,7 +214,8 @@ bool
 ImageOutput::write_scanlines(int ybegin, int yend, TypeDesc format,
                              const image_span<const std::byte>& data)
 {
-    if (ybegin < 0 || yend > m_spec.height || ybegin >= yend) {
+    if (ybegin < m_spec.y || yend > (m_spec.y + m_spec.height)
+        || ybegin >= yend) {
         errorfmt("write_scanlines: Invalid scanline range {}-{}", ybegin, yend);
         return false;
     }
@@ -392,7 +417,7 @@ ImageOutput::append_error(string_view message) const
 {
     if (message.size() && message.back() == '\n')
         message.remove_suffix(1);
-    std::string& err_str = output_error_messages[m_impl->m_id];
+    std::string& err_str = output_error_messages.map[m_impl->m_id];
     OIIO_DASSERT(
         err_str.size() < 1024 * 1024 * 16
         && "Accumulated error messages > 16MB. Try checking return codes!");
@@ -449,7 +474,7 @@ ImageOutput::to_native_rectangle(int xbegin, int xend, int ybegin, int yend,
                        && supports("channelformats");
     // native_data is true if the user is passing data in the native format
     bool native_data           = (format == TypeDesc::UNKNOWN
-                        || (format == m_spec.format && !perchanfile));
+                                  || (format == m_spec.format && !perchanfile));
     stride_t input_pixel_bytes = native_data ? native_pixel_bytes
                                              : stride_t(format.size()
                                                         * m_spec.nchannels);
@@ -530,11 +555,11 @@ ImageOutput::to_native_rectangle(int xbegin, int xend, int ybegin, int yend,
                                      ? 0
                                      : rectangle_pixels * input_pixel_bytes;
     contiguoussize             = (contiguoussize + 3)
-                     & (~3);  // Round up to 4-byte boundary
+                                 & (~3);  // Round up to 4-byte boundary
     OIIO_DASSERT((contiguoussize & 3) == 0);
     imagesize_t floatsize = rectangle_values * sizeof(float);
     bool do_dither        = (dither && format.size() > 1
-                      && m_spec.format.basetype == TypeDesc::UINT8);
+                             && m_spec.format.basetype == TypeDesc::UINT8);
     scratch.resize(contiguoussize + floatsize + native_rectangle_bytes);
 
     // Force contiguity if not already present
@@ -664,8 +689,8 @@ ImageOutput::write_image(TypeDesc format, const void* data, stride_t xstride,
         }
     } else {  // Scanline image
         // Split into reasonable chunks -- try to use around 64 MB, but
-        // round up to a multiple of the TIFF rows per strip (or 64).
-        int rps   = m_spec.get_int_attribute("tiff:RowsPerStrip", 64);
+        // round up to a multiple of the file's rows per chunk (or 64).
+        int rps   = safe_rows_per_chunk(m_spec);
         int chunk = std::max(1, (1 << 26) / int(m_spec.scanline_bytes(true)));
         chunk     = round_to_multiple(chunk, rps);
 
@@ -676,12 +701,12 @@ ImageOutput::write_image(TypeDesc format, const void* data, stride_t xstride,
                                    && m_spec.get_string_attribute(
                                           "openexr:lineOrder")
                                           == "decreasingY";
-        const int numChunks  = m_spec.height > 0
-                                   ? 1 + ((m_spec.height - 1) / chunk)
-                                   : 0;
-        const int yLoopStart = isDecreasingY ? (numChunks - 1) * chunk : 0;
-        const int yDelta     = isDecreasingY ? -chunk : chunk;
-        const int yLoopEnd   = yLoopStart + numChunks * yDelta;
+        const int numChunks      = m_spec.height > 0
+                                       ? 1 + ((m_spec.height - 1) / chunk)
+                                       : 0;
+        const int yLoopStart     = isDecreasingY ? (numChunks - 1) * chunk : 0;
+        const int yDelta         = isDecreasingY ? -chunk : chunk;
+        const int yLoopEnd       = yLoopStart + numChunks * yDelta;
 
         for (int z = 0; z < m_spec.depth; ++z)
             for (int y = yLoopStart; y != yLoopEnd && ok; y += yDelta) {
@@ -765,6 +790,19 @@ ImageOutput::copy_image(ImageInput* in)
     // FIXME -- a smarter implementation would read scanlines or tiles at
     // a time, to minimize mem footprint.
     bool native = supports("channelformats") && inspec.channelformats.size();
+    // The native (per-channel, no-conversion) copy is only valid if this
+    // output actually stores each channel in the same format the input
+    // supplies. If the output remaps any channel (e.g. OpenEXR promoting
+    // uint16 to half), a raw native copy would reinterpret the bytes rather
+    // than convert them, so fall back to the converting path in that case.
+    if (native) {
+        const ImageSpec& outspec(spec());
+        for (int c = 0; c < inspec.nchannels; ++c)
+            if (inspec.channelformat(c) != outspec.channelformat(c)) {
+                native = false;
+                break;
+            }
+    }
     TypeDesc format = native ? TypeDesc::UNKNOWN : inspec.format;
     std::unique_ptr<char[]> pixels(new char[inspec.image_bytes(native)]);
     bool ok = in->read_image(in->current_subimage(), in->current_miplevel(), 0,
@@ -794,8 +832,8 @@ ImageOutput::copy_to_image_buffer(int xbegin, int xend, int ybegin, int yend,
     stride_t buf_ystride = buf_xstride * spec.width;
     stride_t buf_zstride = buf_ystride * spec.height;
     stride_t offset      = (xbegin - spec.x) * buf_xstride
-                      + (ybegin - spec.y) * buf_ystride
-                      + (zbegin - spec.z) * buf_zstride;
+                           + (ybegin - spec.y) * buf_ystride
+                           + (zbegin - spec.z) * buf_zstride;
     int width = xend - xbegin, height = yend - ybegin, depth = zend - zbegin;
     imagesize_t npixels = imagesize_t(width) * imagesize_t(height)
                           * imagesize_t(depth);
@@ -859,8 +897,8 @@ ImageOutput::copy_tile_to_image_buffer(int x, int y, int z, TypeDesc format,
 bool
 ImageOutput::has_error() const
 {
-    auto iter = output_error_messages.find(m_impl->m_id);
-    if (iter == output_error_messages.end())
+    auto iter = output_error_messages.map.find(m_impl->m_id);
+    if (iter == output_error_messages.map.end())
         return false;
     return iter.value().size() > 0;
 }
@@ -871,11 +909,11 @@ std::string
 ImageOutput::geterror(bool clear) const
 {
     std::string e;
-    auto iter = output_error_messages.find(m_impl->m_id);
-    if (iter != output_error_messages.end()) {
+    auto iter = output_error_messages.map.find(m_impl->m_id);
+    if (iter != output_error_messages.map.end()) {
         e = iter.value();
         if (clear)
-            output_error_messages.erase(iter);
+            output_error_messages.map.erase(iter);
     }
     return e;
 }
@@ -1064,6 +1102,12 @@ ImageOutput::check_open(OpenMode mode, const ImageSpec& userspec, ROI range,
                  m_spec.nchannels);
         return false;
     }
+    // Writers may use these as pixel indices, so ignore any that don't
+    // refer to an actual channel.
+    if (m_spec.alpha_channel < 0 || m_spec.alpha_channel >= m_spec.nchannels)
+        m_spec.alpha_channel = -1;
+    if (m_spec.z_channel < 0 || m_spec.z_channel >= m_spec.nchannels)
+        m_spec.z_channel = -1;
     // Nix unsupported per-channel formats
     if (m_spec.channelformats.size()) {
         if (std::all_of(m_spec.channelformats.begin(),
@@ -1151,6 +1195,15 @@ ImageOutput::check_open(OpenMode mode, const ImageSpec& userspec, ROI range,
     if (m_spec.extra_attribs.contains("ioproxy") && !supports("ioproxy")) {
         errorfmt("{} does not support the IOProxy", format_name());
         return false;
+    }
+
+    // Don't write thumbnail_* metadata to a format that can't embed a
+    // thumbnail, where they'd describe one that isn't there.
+    if (!supports("thumbnail")) {
+        m_spec.erase_attribute("thumbnail_width");
+        m_spec.erase_attribute("thumbnail_height");
+        m_spec.erase_attribute("thumbnail_nchannels");
+        m_spec.erase_attribute("thumbnail_image");
     }
 
     return true;  // all is ok

@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // https://github.com/AcademySoftwareFoundation/OpenImageIO
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #include <OpenImageIO/half.h>
 
@@ -64,6 +66,7 @@ int enable_hwy = 0;  // Not enabled at build time
 int limit_channels(1024);
 int limit_imagesize_MB(std::min(32 * 1024,
                                 int(Sysutil::physical_memory() >> 20)));
+int limit_resolution(1 << 20);  // max pixels along any single dimension
 int imageinput_strict(0);
 ustring font_searchpath(Sysutil::getenv("OPENIMAGEIO_FONTS"));
 ustring plugin_searchpath(OIIO_DEFAULT_PLUGIN_SEARCHPATH);
@@ -186,6 +189,7 @@ hw_simd_caps()
     if (cpu_has_f16c())        caps.emplace_back ("f16c");
     if (cpu_has_popcnt())      caps.emplace_back ("popcnt");
     if (cpu_has_rdrand())      caps.emplace_back ("rdrand");
+    if (cpu_has_neon())        caps.emplace_back ("neon");
     return Strutil::join (caps, ",");
     // clang-format on
 }
@@ -373,6 +377,10 @@ attribute(string_view name, TypeDesc type, const void* val)
 
     // Things below here need to buarded by the attrib_mutex
     std::lock_guard lock(attrib_mutex);
+    if (name == "debug" && type == TypeInt) {
+        oiio_print_debug = *(const int*)val;
+        return true;
+    }
     if (name == "read_chunk" && type == TypeInt) {
         oiio_read_chunk = *(const int*)val;
         return true;
@@ -427,6 +435,10 @@ attribute(string_view name, TypeDesc type, const void* val)
         limit_imagesize_MB = *(const int*)val;
         return true;
     }
+    if (name == "limits:resolution" && type == TypeInt) {
+        limit_resolution = *(const int*)val;
+        return true;
+    }
     if (name == "oiio:print_uncaught_errors" && type == TypeInt) {
         oiio_print_uncaught_errors = *(const int*)val;
         return true;
@@ -447,10 +459,6 @@ attribute(string_view name, TypeDesc type, const void* val)
         oiio_use_tbb = *(const int*)val;
         return true;
     }
-    if (name == "debug" && type == TypeInt) {
-        oiio_print_debug = *(const int*)val;
-        return true;
-    }
     if (name == "log_times" && type == TypeInt) {
         oiio_log_times = *(const int*)val;
         return true;
@@ -469,6 +477,10 @@ attribute(string_view name, TypeDesc type, const void* val)
     }
     if (name == "try_all_readers" && type == TypeInt) {
         oiio_try_all_readers = *(const int*)val;
+        return true;
+    }
+    if (name == "ustring:cleanup" && type == TypeInt) {
+        oiio_ustring_cleanup = *(const int*)val;
         return true;
     }
 
@@ -511,6 +523,10 @@ getattribute(string_view name, TypeDesc type, void* val)
 
     // Things below here need to buarded by the attrib_mutex
     std::lock_guard lock(attrib_mutex);
+    if (name == "debug" && type == TypeInt) {
+        *(int*)val = oiio_print_debug;
+        return true;
+    }
     if (name == "read_chunk" && type == TypeInt) {
         *(int*)val = oiio_read_chunk;
         return true;
@@ -617,6 +633,10 @@ getattribute(string_view name, TypeDesc type, void* val)
         *(int*)val = limit_imagesize_MB;
         return true;
     }
+    if (name == "limits:resolution" && type == TypeInt) {
+        *(int*)val = limit_resolution;
+        return true;
+    }
     if (name == "tiff:multithread" && type == TypeInt) {
         *(int*)val = tiff_multithread;
         return true;
@@ -649,8 +669,8 @@ getattribute(string_view name, TypeDesc type, void* val)
         *(int*)val = oiio_use_tbb;
         return true;
     }
-    if (name == "debug" && type == TypeInt) {
-        *(int*)val = oiio_print_debug;
+    if (name == "ustring:cleanup" && type == TypeInt) {
+        *(int*)val = oiio_ustring_cleanup;
         return true;
     }
     if (name == "log_times" && type == TypeInt) {
@@ -936,6 +956,14 @@ OIIO_NAMESPACE_END
 OIIO_NAMESPACE_3_1_BEGIN
 
 
+static inline bool
+is_aligned_for(const void* p, TypeDesc type)
+{
+    return (uintptr_t(p) % std::max(size_t(type.basesize()), size_t(1))) == 0;
+}
+
+
+
 bool
 convert_pixel_values(TypeDesc src_type, const void* src, TypeDesc dst_type,
                      void* dst, int n)
@@ -943,6 +971,25 @@ convert_pixel_values(TypeDesc src_type, const void* src, TypeDesc dst_type,
     // If no conversion is necessary, just memcpy
     if ((src_type == dst_type || dst_type.basetype == TypeDesc::UNKNOWN)) {
         memcpy(dst, src, n * src_type.size());
+        return true;
+    }
+
+    // Per-channel formats pack channels of differing sizes, so values in a
+    // native pixel need not be aligned for their type. Convert those via
+    // aligned temporaries.
+    if (!is_aligned_for(src, src_type) || !is_aligned_for(dst, dst_type)) {
+        size_t srcbytes = size_t(n) * src_type.size();
+        size_t dstbytes = size_t(n) * dst_type.size();
+        size_t srcpad   = round_to_multiple(srcbytes, sizeof(std::max_align_t));
+        size_t nblocks  = (srcpad + dstbytes + sizeof(std::max_align_t) - 1)
+                          / sizeof(std::max_align_t);
+        std::max_align_t* tmp;
+        OIIO_ALLOCATE_STACK_OR_HEAP(tmp, std::max_align_t, nblocks);
+        char* tmpdst = (char*)tmp + srcpad;
+        memcpy(tmp, src, srcbytes);
+        if (!convert_pixel_values(src_type, tmp, dst_type, tmpdst, n))
+            return false;
+        memcpy(dst, tmpdst, dstbytes);
         return true;
     }
 
@@ -1014,15 +1061,23 @@ convert_image(int nchannels, int width, int height, int depth, const void* src,
         for (int y = 0; y < height; ++y) {
             const char* f = (const char*)src
                             + (z * src_zstride + y * src_ystride);
-            char* t = (char*)dst + (z * dst_zstride + y * dst_ystride);
+            char* t       = (char*)dst + (z * dst_zstride + y * dst_ystride);
             if (contig) {
                 // Special case: pixels within each row are contiguous
                 // in both src and dst and we're copying all channels.
                 // Be efficient by converting each scanline as a single
                 // unit.  (Note that within convert_pixel_values, a memcpy
-                // will be used if the formats are identical.)
-                result &= convert_pixel_values(src_type, f, dst_type, t,
-                                               nchannels * width);
+                // will be used if the formats are identical.) A huge row
+                // goes in batches that fit convert_pixel_values' int count.
+                for (int64_t n = int64_t(nchannels) * width; n > 0;) {
+                    int batch = int(
+                        std::min<int64_t>(n, std::numeric_limits<int>::max()));
+                    result &= convert_pixel_values(src_type, f, dst_type, t,
+                                                   batch);
+                    f += batch * stride_t(src_type.size());
+                    t += batch * stride_t(dst_type.size());
+                    n -= batch;
+                }
             } else {
                 // General case -- anything goes with strides.
                 for (int x = 0; x < width; ++x) {
@@ -1048,9 +1103,8 @@ parallel_convert_image(int nchannels, int width, int height, int depth,
 {
     if (nthreads <= 0)
         nthreads = oiio_threads;
-    nthreads
-        = clamp(int((int64_t(width) * height * depth * nchannels) / 100000), 1,
-                nthreads);
+    nthreads = clamp(int((int64_t(width) * height * depth * nchannels) / 100000),
+                     1, nthreads);
     if (nthreads <= 1)
         return convert_image(nchannels, width, height, depth, src, src_type,
                              src_xstride, src_ystride, src_zstride, dst,
@@ -1091,7 +1145,7 @@ copy_image(int nchannels, int width, int height, int depth, const void* src,
         for (int y = 0; y < height; ++y) {
             const char* f = (const char*)src
                             + (z * src_zstride + y * src_ystride);
-            char* t = (char*)dst + (z * dst_zstride + y * dst_ystride);
+            char* t       = (char*)dst + (z * dst_zstride + y * dst_ystride);
             if (contig) {
                 // Special case: pixels within each row are contiguous
                 // in both src and dst and we're copying all channels.
@@ -1303,7 +1357,7 @@ premult(int nchannels, int width, int height, int depth, int chbegin, int chend,
         TypeDesc datatype, void* data, stride_t xstride, stride_t ystride,
         stride_t zstride, int alpha_channel, int z_channel)
 {
-    if (alpha_channel < 0 || alpha_channel > nchannels)
+    if (alpha_channel < 0 || alpha_channel >= nchannels)
         return;  // nothing to do
     ImageSpec::auto_stride(xstride, ystride, zstride, datatype.size(),
                            nchannels, width, height);
@@ -1459,3 +1513,18 @@ image_span_within_span(const image_span<const std::byte>& ispan,
 
 
 OIIO_NAMESPACE_3_1_END
+
+
+// A symbol is put in each namespace so that we can double check is in the
+// namespace we think it's in.
+OIIO_NAMESPACE_3_1_BEGIN
+const int oiio_3_1_namespace_canary = 0;
+OIIO_NAMESPACE_3_1_END
+
+OIIO_NAMESPACE_3_2_BEGIN
+const int oiio_3_2_namespace_canary = 0;
+OIIO_NAMESPACE_3_2_END
+
+OIIO_NAMESPACE_BEGIN
+const int oiio_current_namespace_canary = 0;
+OIIO_NAMESPACE_END

@@ -185,7 +185,7 @@ IBA_channels(ImageBuf& dst, const ImageBuf& src, py::tuple channelorder_,
              py::tuple newchannelnames_, bool shuffle_channel_names,
              int nthreads)
 {
-    size_t nchannels = (size_t)len(channelorder_);
+    size_t nchannels = (size_t)py::len(channelorder_);
     if (nchannels < 1) {
         dst.errorfmt("No channels selected");
         return false;
@@ -195,11 +195,11 @@ IBA_channels(ImageBuf& dst, const ImageBuf& src, py::tuple channelorder_,
     for (size_t i = 0; i < nchannels; ++i) {
         auto orderi = channelorder_[i];
         if (py::isinstance<py::int_>(orderi)) {
-            channelorder[i] = orderi.cast<py::int_>();
+            channelorder[i] = py::cast<int>(orderi);
         } else if (py::isinstance<py::float_>(orderi)) {
-            channelvalues[i] = orderi.cast<py::float_>();
+            channelvalues[i] = py::cast<float>(orderi);
         } else if (py::isinstance<py::str>(orderi)) {
-            std::string chname = orderi.cast<py::str>();
+            std::string chname = oiio_py::str_to_stdstring(orderi);
             for (int c = 0; c < src.nchannels(); ++c) {
                 if (src.spec().channelnames[c] == chname)
                     channelorder[i] = c;
@@ -1218,6 +1218,56 @@ IBA_saturate_ret(const ImageBuf& src, float scale = 0.0f, int firstchannel = 0,
 
 
 
+static ParamValueList
+decorr_stretch_params(int firstchannel, int nchannels, float scale, float sigma,
+                      py::object mean, float percentile,
+                      const std::string& mode)
+{
+    ParamValueList params;
+    params["firstchannel"] = firstchannel;
+    params["nchannels"]    = nchannels;
+    params["scale"]        = scale;
+    params["sigma"]        = sigma;
+    params["percentile"]   = percentile;
+    if (mode.size())
+        params["mode"] = mode;
+    if (!mean.is_none())
+        params["mean"] = py::cast<float>(mean);
+    return params;
+}
+
+
+bool
+IBA_decorr_stretch(ImageBuf& dst, const ImageBuf& src, int firstchannel = 0,
+                   int nchannels = 0, float scale = 1.0f, float sigma = 0.0f,
+                   py::object mean = py::none(), float percentile = 0.0f,
+                   const std::string& mode = "", ROI roi = ROI::All(),
+                   int nthreads = 0)
+{
+    ParamValueList params = decorr_stretch_params(firstchannel, nchannels,
+                                                  scale, sigma, mean,
+                                                  percentile, mode);
+    py::gil_scoped_release gil;
+    return ImageBufAlgo::decorr_stretch(dst, src, params, roi, nthreads);
+}
+
+
+ImageBuf
+IBA_decorr_stretch_ret(const ImageBuf& src, int firstchannel = 0,
+                       int nchannels = 0, float scale = 1.0f,
+                       float sigma = 0.0f, py::object mean = py::none(),
+                       float percentile = 0.0f, const std::string& mode = "",
+                       ROI roi = ROI::All(), int nthreads = 0)
+{
+    ParamValueList params = decorr_stretch_params(firstchannel, nchannels,
+                                                  scale, sigma, mean,
+                                                  percentile, mode);
+    py::gil_scoped_release gil;
+    return ImageBufAlgo::decorr_stretch(src, params, roi, nthreads);
+}
+
+
+
 bool
 IBA_contrast_remap(ImageBuf& dst, const ImageBuf& src, py::object black_,
                    py::object white_, py::object min_, py::object max_,
@@ -1339,8 +1389,7 @@ IBA_FLIP_diff_ret(const ImageBuf& ref, const ImageBuf& test, int hdr = 1,
     if (ppd > 0.0f)
         opts["ppd"] = ppd;
     py::gil_scoped_release gil;
-    return ImageBufAlgo::experimental::FLIP_diff(ref, test, opts, roi,
-                                                 nthreads);
+    return ImageBufAlgo::FLIP_diff(ref, test, opts, roi, nthreads);
 }
 
 static bool
@@ -1358,17 +1407,15 @@ IBA_FLIP_diff(ImageBuf& dst, const ImageBuf& ref, const ImageBuf& test,
     if (ppd > 0.0f)
         opts["ppd"] = ppd;
     py::gil_scoped_release gil;
-    return ImageBufAlgo::experimental::FLIP_diff(dst, ref, test, opts, roi,
-                                                 nthreads);
+    return ImageBufAlgo::FLIP_diff(dst, ref, test, opts, roi, nthreads);
 }
 
 float
 IBA_FLIP_ppd(float monitor_distance_m = 0.7f, float screen_width_px = 3840.0f,
              float screen_width_m = 0.7f)
 {
-    return ImageBufAlgo::experimental::FLIP_ppd(monitor_distance_m,
-                                                screen_width_px,
-                                                screen_width_m);
+    return ImageBufAlgo::FLIP_ppd(monitor_distance_m, screen_width_px,
+                                  screen_width_m);
 }
 
 
@@ -2460,7 +2507,7 @@ IBA_demosaic_ret(const ImageBuf& src, const std::string& pattern = "",
     params["layout"]             = layout;
     params["white_balance_mode"] = white_balance_mode;
 
-    if (!white_balance.is(py::none())) {
+    if (!white_balance.is_none()) {
         params.add_or_replace(
             ParamValue("white_balance", TypeFloat, wb.size(), wb.data()));
     }
@@ -2487,7 +2534,7 @@ IBA_demosaic(ImageBuf& dst, const ImageBuf& src,
     params["layout"]             = layout;
     params["white_balance_mode"] = white_balance_mode;
 
-    if (!white_balance.is(py::none())) {
+    if (!white_balance.is_none()) {
         params.add_or_replace(
             ParamValue("white_balance", TypeFloat, wb.size(), wb.data()));
     }
@@ -2496,57 +2543,17 @@ IBA_demosaic(ImageBuf& dst, const ImageBuf& src,
     return ImageBufAlgo::demosaic(dst, src, params, roi, nthreads);
 }
 
-void
-declare_imagebufalgo(py::module& m)
+
+// The ImageBufAlgo methods are declared in several separate functions,
+// grouped like the sections of the ImageBufAlgo documentation. As one
+// enormous function, some compilers (notably MSVC 2022) took a very long
+// time to optimize it.
+
+static OIIO_NOINLINE void
+declare_iba_patterns(py::class_<IBA_dummy>& iba)
 {
-    using namespace pybind11::literals;
-    using py::arg;
-
-    py::enum_<ImageBufAlgo::NonFiniteFixMode>(m, "NonFiniteFixMode")
-        .value("NONFINITE_NONE", ImageBufAlgo::NONFINITE_NONE)
-        .value("NONFINITE_BLACK", ImageBufAlgo::NONFINITE_BLACK)
-        .value("NONFINITE_BOX3", ImageBufAlgo::NONFINITE_BOX3)
-        .export_values();
-
-    py::enum_<ImageBufAlgo::MakeTextureMode>(m, "MakeTextureMode")
-        .value("MakeTxTexture", ImageBufAlgo::MakeTxTexture)
-        .value("MakeTxShadow", ImageBufAlgo::MakeTxShadow)
-        .value("MakeTxEnvLatl", ImageBufAlgo::MakeTxEnvLatl)
-        .value("MakeTxEnvLatlFromLightProbe",
-               ImageBufAlgo::MakeTxEnvLatlFromLightProbe)
-        .value("MakeTxBumpWithSlopes", ImageBufAlgo::MakeTxBumpWithSlopes)
-        .export_values();
-
-    py::class_<ImageBufAlgo::PixelStats>(m, "PixelStats")
-        .def(py::init<>())
-        .def_readonly("min", &ImageBufAlgo::PixelStats::min)
-        .def_readonly("max", &ImageBufAlgo::PixelStats::max)
-        .def_readonly("avg", &ImageBufAlgo::PixelStats::avg)
-        .def_readonly("stddev", &ImageBufAlgo::PixelStats::stddev)
-        .def_readonly("nancount", &ImageBufAlgo::PixelStats::nancount)
-        .def_readonly("infcount", &ImageBufAlgo::PixelStats::infcount)
-        .def_readonly("finitecount", &ImageBufAlgo::PixelStats::finitecount)
-        .def_readonly("sum", &ImageBufAlgo::PixelStats::sum)
-        .def_readonly("sum2", &ImageBufAlgo::PixelStats::sum2);
-
-    py::class_<ImageBufAlgo::CompareResults>(m, "CompareResults")
-        .def(py::init<>())
-        .def_readonly("meanerror", &ImageBufAlgo::CompareResults::meanerror)
-        .def_readonly("rms_error", &ImageBufAlgo::CompareResults::rms_error)
-        .def_readonly("PSNR", &ImageBufAlgo::CompareResults::PSNR)
-        .def_readonly("maxerror", &ImageBufAlgo::CompareResults::maxerror)
-        .def_readonly("maxx", &ImageBufAlgo::CompareResults::maxx)
-        .def_readonly("maxy", &ImageBufAlgo::CompareResults::maxy)
-        .def_readonly("maxz", &ImageBufAlgo::CompareResults::maxz)
-        .def_readonly("maxc", &ImageBufAlgo::CompareResults::maxc)
-        .def_readonly("nwarn", &ImageBufAlgo::CompareResults::nwarn)
-        .def_readonly("nfail", &ImageBufAlgo::CompareResults::nfail)
-        .def_readonly("error", &ImageBufAlgo::CompareResults::error);
-
-    // Put this all inside "ImageBufAlgo"
-    py::class_<IBA_dummy>(m, "ImageBufAlgo")
-        .def_static("zero", &IBA_zero, "dst"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
+    iba.def_static("zero", &IBA_zero, "dst"_a, "roi"_a = ROI::All(),
+                   "nthreads"_a = 0)
         .def_static("zero", &IBA_zero_ret, "roi"_a, "nthreads"_a = 0)
 
         .def_static("fill", &IBA_fill, "dst"_a, "values"_a,
@@ -2582,9 +2589,33 @@ declare_imagebufalgo(py::module& m)
 
         .def_static("bluenoise_image", &ImageBufAlgo::bluenoise_image)
 
-        .def_static("channels", &IBA_channels, "dst"_a, "src"_a,
-                    "channelorder"_a, "newchannelnames"_a = py::tuple(),
-                    "shuffle_channel_names"_a = false, "nthreads"_a = 0)
+        .def_static("render_point", &IBA_render_point, "dst"_a, "x"_a, "y"_a,
+                    "color"_a = py::none())
+
+        .def_static("render_line", &IBA_render_line, "dst"_a, "x1"_a, "y1"_a,
+                    "x2"_a, "y2"_a, "color"_a = py::none(),
+                    "skip_first_point"_a = false)
+
+        .def_static("render_box", &IBA_render_box, "dst"_a, "x1"_a, "y1"_a,
+                    "x2"_a, "y2"_a, "color"_a = py::none(), "fill"_a = false)
+
+        .def_static("render_text", &IBA_render_text, "dst"_a, "x"_a, "y"_a,
+                    "text"_a, "fontsize"_a = 16, "fontname"_a = "",
+                    "textcolor"_a = py::tuple(), "alignx"_a = "left",
+                    "aligny"_a = "baseline", "shadow"_a = 0,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("text_size", &IBA_text_size, "text"_a, "fontsize"_a = 16,
+                    "fontname"_a = "");
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_transformations(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("channels", &IBA_channels, "dst"_a, "src"_a,
+                   "channelorder"_a, "newchannelnames"_a = py::tuple(),
+                   "shuffle_channel_names"_a = false, "nthreads"_a = 0)
         .def_static("channels", &IBA_channels_ret, "src"_a, "channelorder"_a,
                     "newchannelnames"_a       = py::tuple(),
                     "shuffle_channel_names"_a = false, "nthreads"_a = 0)
@@ -2592,28 +2623,6 @@ declare_imagebufalgo(py::module& m)
         .def_static("channel_append", IBA_channel_append, "dst"_a, "A"_a, "B"_a,
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
         .def_static("channel_append", IBA_channel_append_ret, "A"_a, "B"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("deepen", IBA_deepen, "dst"_a, "src"_a, "zvalue"_a = 1.0f,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("deepen", IBA_deepen_ret, "src"_a, "zvalue"_a = 1.0f,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("flatten", IBA_flatten, "dst"_a, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("flatten", IBA_flatten_ret, "src"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("deep_merge", IBA_deep_merge, "dst"_a, "A"_a, "B"_a,
-                    "occlusion_cull"_a = true, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("deep_merge", IBA_deep_merge_ret, "A"_a, "B"_a,
-                    "occlusion_cull"_a = true, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("deep_holdout", IBA_deep_holdout, "dst"_a, "src"_a,
-                    "holdout"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("deep_holdout", IBA_deep_holdout_ret, "src"_a, "holdout"_a,
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
 
         .def_static("copy", IBA_copy, "dst"_a, "src"_a,
@@ -2677,8 +2686,78 @@ declare_imagebufalgo(py::module& m)
                     "xshift"_a, "yshift"_a, "zshift"_a = 0,
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
 
-        .def_static("add", &IBA_add_images, "dst"_a, "A"_a, "B"_a,
+        .def_static("warp", &IBA_warp, "dst"_a, "src"_a, "M"_a,
+                    "filtername"_a = "", "filterwidth"_a = 0.0f,
+                    "recompute_roi"_a = false, "wrap"_a = "default",
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("warp", &IBA_warp_ret, "src"_a, "M"_a, "filtername"_a = "",
+                    "filterwidth"_a = 0.0f, "recompute_roi"_a = false,
+                    "wrap"_a = "default", "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("rotate", &IBA_rotate, "dst"_a, "src"_a, "angle"_a,
+                    "filtername"_a = "", "filterwidth"_a = 0.0f,
+                    "recompute_roi"_a = false, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("rotate", &IBA_rotate2, "dst"_a, "src"_a, "angle"_a,
+                    "center_x"_a, "center_y"_a, "filtername"_a = "",
+                    "filterwidth"_a = 0.0f, "recompute_roi"_a = false,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("rotate", &IBA_rotate_ret, "src"_a, "angle"_a,
+                    "filtername"_a = "", "filterwidth"_a = 0.0f,
+                    "recompute_roi"_a = false, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("rotate", &IBA_rotate2_ret, "src"_a, "angle"_a,
+                    "center_x"_a, "center_y"_a, "filtername"_a = "",
+                    "filterwidth"_a = 0.0f, "recompute_roi"_a = false,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("resize", &IBA_resize, "dst"_a, "src"_a,
+                    "filtername"_a = "", "filterwidth"_a = 0.0f,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("resize", &IBA_resize_ret, "src"_a, "filtername"_a = "",
+                    "filterwidth"_a = 0.0f, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("resample", &IBA_resample, "dst"_a, "src"_a,
+                    "interpolate"_a = true, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("resample", &IBA_resample_ret, "src"_a,
+                    "interpolate"_a = true, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("st_warp", &IBA_st_warp, "dst"_a, "src"_a, "stbuf"_a,
+                    "filtername"_a = "", "filterwidth"_a = 0.0f, "chan_s"_a = 0,
+                    "chan_t"_a = 1, "flip_s"_a = false, "flip_t"_a = false,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("st_warp", &IBA_st_warp_ret, "src"_a, "stbuf"_a,
+                    "filtername"_a = "", "filterwidth"_a = 0.0f, "chan_s"_a = 0,
+                    "chan_t"_a = 1, "flip_s"_a = false, "flip_t"_a = false,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("fit", &IBA_fit, "dst"_a, "src"_a, "filtername"_a = "",
+                    "filterwidth"_a = 0.0f, "fillmode"_a = "letterbox",
+                    "exact"_a = false, "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("fit", &IBA_fit_ret, "src"_a, "filtername"_a = "",
+                    "filterwidth"_a = 0.0f, "fillmode"_a = "letterbox",
+                    "exact"_a = false, "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("demosaic", &IBA_demosaic, "dst"_a, "src"_a,
+                    "pattern"_a = "", "algorithm"_a = "", "layout"_a = "",
+                    "white_balance_mode"_a = "", "white_balance"_a = py::none(),
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("demosaic", &IBA_demosaic_ret, "src"_a, "pattern"_a = "",
+                    "algorithm"_a = "", "layout"_a = "",
+                    "white_balance_mode"_a = "", "white_balance"_a = py::none(),
+                    "roi"_a = ROI::All(), "nthreads"_a = 0);
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_arithmetic1(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("add", &IBA_add_images, "dst"_a, "A"_a, "B"_a,
+                   "roi"_a = ROI::All(), "nthreads"_a = 0)
         .def_static("add", IBA_add_color, "dst"_a, "A"_a, "B"_a,
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
         .def_static("add", &IBA_add_images_ret, "A"_a, "B"_a,
@@ -2768,9 +2847,33 @@ declare_imagebufalgo(py::module& m)
         .def_static("channel_sum", &IBA_channel_sum_weight_ret, "src"_a,
                     "weight"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
 
-        .def_static("color_map", &IBA_color_map_name, "dst"_a, "src"_a,
-                    "srcchannel"_a, "mapname"_a, "roi"_a = ROI::All(),
+        .def_static("normalize", &IBA_normalize, "dst"_a, "src"_a,
+                    "inCenter"_a = 0.0f, "outCenter"_a = 0.0f, "scale"_a = 1.0f,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("normalize", &IBA_normalize_ret, "src"_a,
+                    "inCenter"_a = 0.0f, "outCenter"_a = 0.0f, "scale"_a = 1.0f,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("over", &IBA_over, "dst"_a, "A"_a, "B"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("over", &IBA_over_ret, "A"_a, "B"_a, "roi"_a = ROI::All(),
                     "nthreads"_a = 0)
+
+        .def_static("zover", &IBA_zover, "dst"_a, "A"_a, "B"_a,
+                    "z_zeroisinf"_a = false, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("zover", &IBA_zover_ret, "A"_a, "B"_a,
+                    "z_zeroisinf"_a = false, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0);
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_arithmetic2(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("color_map", &IBA_color_map_name, "dst"_a, "src"_a,
+                   "srcchannel"_a, "mapname"_a, "roi"_a = ROI::All(),
+                   "nthreads"_a = 0)
         .def_static("color_map", &IBA_color_map_values, "dst"_a, "src"_a,
                     "srcchannel"_a, "nknots"_a, "channels"_a, "knots"_a,
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
@@ -2790,21 +2893,6 @@ declare_imagebufalgo(py::module& m)
                     "useluma"_a = false, "roi"_a = ROI::All(), "nthreads"_a = 0)
         .def_static("rangeexpand", &IBA_rangeexpand_ret, "src"_a,
                     "useluma"_a = false, "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("premult", &IBA_premult, "dst"_a, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("premult", &IBA_premult_ret, "src"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("unpremult", &IBA_unpremult, "dst"_a, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("unpremult", &IBA_unpremult_ret, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("repremult", &IBA_repremult, "dst"_a, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("repremult", &IBA_repremult_ret, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
 
         .def_static("min", &IBA_min_images, "dst"_a, "A"_a, "B"_a,
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
@@ -2856,6 +2944,193 @@ declare_imagebufalgo(py::module& m)
         .def_static("saturate", &IBA_saturate_ret, "src"_a, "scale"_a = 0.0f,
                     "firstchannel"_a = 0, "roi"_a = ROI::All(),
                     "nthreads"_a = 0)
+
+        .def_static("decorr_stretch", &IBA_decorr_stretch, "dst"_a, "src"_a,
+                    "firstchannel"_a = 0, "nchannels"_a = 0, "scale"_a = 1.0f,
+                    "sigma"_a = 0.0f, "mean"_a = py::none(),
+                    "percentile"_a = 0.0f, "mode"_a = "", "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("decorr_stretch", &IBA_decorr_stretch_ret, "src"_a,
+                    "firstchannel"_a = 0, "nchannels"_a = 0, "scale"_a = 1.0f,
+                    "sigma"_a = 0.0f, "mean"_a = py::none(),
+                    "percentile"_a = 0.0f, "mode"_a = "", "roi"_a = ROI::All(),
+                    "nthreads"_a = 0);
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_comparisons(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("computePixelStats", &IBA_computePixelStats, "src"_a,
+                   "stats"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("computePixelStats", &IBA_computePixelStats_ret, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("compare", &IBA_compare, "A"_a, "B"_a, "failthresh"_a,
+                    "warnthresh"_a, "result"_a, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("compare", &IBA_compare_ret, "A"_a, "B"_a, "failthresh"_a,
+                    "warnthresh"_a, "failrelative"_a = 0.0f,
+                    "warnrelative"_a = 0.0f, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("compare", &IBA_compare_ret_old, "A"_a, "B"_a,
+                    "failthresh"_a, "warnthresh"_a, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("compare_Yee", &IBA_compare_Yee, "A"_a, "B"_a, "result"_a,
+                    "luminance"_a = 100, "fov"_a = 45, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("FLIP_diff", &IBA_FLIP_diff_ret, "ref"_a, "test"_a,
+                    "hdr"_a = 1, "maxluminance"_a = 2.0f,
+                    "medianluminance"_a = 0.18f, "ppd"_a = 0.0f,
+                    "tonemapper"_a = "aces", "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("FLIP_diff", &IBA_FLIP_diff, "dst"_a, "ref"_a, "test"_a,
+                    "hdr"_a = 1, "maxluminance"_a = 2.0f,
+                    "medianluminance"_a = 0.18f, "ppd"_a = 0.0f,
+                    "tonemapper"_a = "aces", "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("FLIP_ppd", &IBA_FLIP_ppd, "monitor_distance_m"_a = 0.7f,
+                    "screen_width_px"_a = 3840.0f, "screen_width_m"_a = 0.7f)
+
+        .def_static("isConstantColor", &IBA_isConstantColor, "src"_a,
+                    "threshold"_a = 0.0f, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("isConstantChannel", &IBA_isConstantChannel, "src"_a,
+                    "channel"_a, "val"_a, "threshold"_a = 0.0f,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("isMonochrome", &IBA_isMonochrome, "src"_a,
+                    "threshold"_a = 0.0f, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        // color_count
+        .def_static("color_range_check", &IBA_color_range_check, "src"_a,
+                    "low"_a, "high"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("nonzero_region", &IBA_nonzero_region, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("computePixelHashSHA1", &IBA_computePixelHashSHA1, "src"_a,
+                    "extrainfo"_a = "", "roi"_a = ROI::All(), "blocksize"_a = 0,
+                    "nthreads"_a = 0)
+
+        .def_static("histogram", &IBA_histogram, "src"_a, "channel"_a = 0,
+                    "bins"_a = 256, "min"_a = 0.0f, "max"_a = 1.0f,
+                    "ignore_empty"_a = false, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0);
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_convolutions(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("make_kernel", &IBA_make_kernel, "dst"_a, "name"_a,
+                   "width"_a, "height"_a, "depth"_a = 1.0f,
+                   "normalize"_a = true)
+        .def_static("make_kernel", &IBA_make_kernel_ret, "name"_a, "width"_a,
+                    "height"_a, "depth"_a = 1.0f, "normalize"_a = true)
+
+        .def_static("convolve", &IBA_convolve, "dst"_a, "src"_a, "kernel"_a,
+                    "normalze"_a = true, "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("convolve", &IBA_convolve_ret, "src"_a, "kernel"_a,
+                    "normalze"_a = true, "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("laplacian", &IBA_laplacian, "dst"_a, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("laplacian", &IBA_laplacian_ret, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("fft", &IBA_fft, "dst"_a, "src"_a, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("fft", &IBA_fft_ret, "src"_a, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("ifft", &IBA_ifft, "dst"_a, "src"_a, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("ifft", &IBA_ifft_ret, "src"_a, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("polar_to_complex", &IBA_polar_to_complex, "dst"_a, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("polar_to_complex", &IBA_polar_to_complex_ret, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("complex_to_polar", &IBA_complex_to_polar, "dst"_a, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("complex_to_polar", &IBA_complex_to_polar_ret, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0);
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_enhancement(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("unsharp_mask", &IBA_unsharp_mask, "dst"_a, "src"_a,
+                   "kernel"_a = "gaussian", "width"_a = 3.0f,
+                   "contrast"_a = 1.0f, "threshold"_a = 0.0f,
+                   "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("unsharp_mask", &IBA_unsharp_mask_ret, "src"_a,
+                    "kernel"_a = "gaussian", "width"_a = 3.0f,
+                    "contrast"_a = 1.0f, "threshold"_a = 0.0f,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("median_filter", &IBA_median_filter, "dst"_a, "src"_a,
+                    "width"_a = 3, "height"_a = -1, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("median_filter", &IBA_median_filter_ret, "src"_a,
+                    "width"_a = 3, "height"_a = -1, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("fixNonFinite", &IBA_fixNonFinite, "dst"_a, "src"_a,
+                    "mode"_a = ImageBufAlgo::NONFINITE_BOX3,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("fixNonFinite", &IBA_fixNonFinite_ret, "src"_a,
+                    "mode"_a = ImageBufAlgo::NONFINITE_BOX3,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("fillholes_pushpull", &IBA_fillholes_pushpull, "dst"_a,
+                    "src"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("fillholes_pushpull", &IBA_fillholes_pushpull_ret, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0);
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_morphological(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("dilate", &IBA_dilate, "dst"_a, "src"_a, "width"_a = 3,
+                   "height"_a = -1, "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("dilate", &IBA_dilate_ret, "src"_a, "width"_a = 3,
+                    "height"_a = -1, "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("erode", &IBA_erode, "dst"_a, "src"_a, "width"_a = 3,
+                    "height"_a = -1, "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("erode", &IBA_erode_ret, "src"_a, "width"_a = 3,
+                    "height"_a = -1, "roi"_a = ROI::All(), "nthreads"_a = 0);
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_colors(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("premult", &IBA_premult, "dst"_a, "src"_a,
+                   "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("premult", &IBA_premult_ret, "src"_a, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+
+        .def_static("unpremult", &IBA_unpremult, "dst"_a, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("unpremult", &IBA_unpremult_ret, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+
+        .def_static("repremult", &IBA_repremult, "dst"_a, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("repremult", &IBA_repremult_ret, "src"_a,
+                    "roi"_a = ROI::All(), "nthreads"_a = 0)
 
         .def_static("colorconvert", &IBA_colorconvert, "dst"_a, "src"_a,
                     "fromspace"_a, "tospace"_a, "unpremult"_a = true,
@@ -2924,7 +3199,6 @@ declare_imagebufalgo(py::module& m)
                     "context_key"_a = "", "context_value"_a = "",
                     "colorconfig"_a = "", "roi"_a = ROI::All(),
                     "nthreads"_a = 0)
-
         // DEPRECATED
         .def_static("ociodisplay", &IBA_ociodisplay_dep, "dst"_a, "src"_a,
                     "display"_a, "view"_a, "fromspace"_a, "looks"_a,
@@ -2979,251 +3253,122 @@ declare_imagebufalgo(py::module& m)
                     "unpremult"_a = true, "inverse"_a = false,
                     "context_key"_a = "", "context_value"_a = "",
                     "colorconfig"_a = "", "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
+                    "nthreads"_a = 0);
+}
 
-        .def_static("computePixelStats", &IBA_computePixelStats, "src"_a,
-                    "stats"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("computePixelStats", &IBA_computePixelStats_ret, "src"_a,
+
+static OIIO_NOINLINE void
+declare_iba_deep(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("deepen", IBA_deepen, "dst"_a, "src"_a, "zvalue"_a = 1.0f,
+                   "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("deepen", IBA_deepen_ret, "src"_a, "zvalue"_a = 1.0f,
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
 
-        .def_static("compare", &IBA_compare, "A"_a, "B"_a, "failthresh"_a,
-                    "warnthresh"_a, "result"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("compare", &IBA_compare_ret, "A"_a, "B"_a, "failthresh"_a,
-                    "warnthresh"_a, "failrelative"_a = 0.0f,
-                    "warnrelative"_a = 0.0f, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("compare", &IBA_compare_ret_old, "A"_a, "B"_a,
-                    "failthresh"_a, "warnthresh"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("compare_Yee", &IBA_compare_Yee, "A"_a, "B"_a, "result"_a,
-                    "luminance"_a = 100, "fov"_a = 45, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("FLIP_diff", &IBA_FLIP_diff_ret, "ref"_a, "test"_a,
-                    "hdr"_a = 1, "maxluminance"_a = 2.0f,
-                    "medianluminance"_a = 0.18f, "ppd"_a = 0.0f,
-                    "tonemapper"_a = "aces", "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("FLIP_diff", &IBA_FLIP_diff, "dst"_a, "ref"_a, "test"_a,
-                    "hdr"_a = 1, "maxluminance"_a = 2.0f,
-                    "medianluminance"_a = 0.18f, "ppd"_a = 0.0f,
-                    "tonemapper"_a = "aces", "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("FLIP_ppd", &IBA_FLIP_ppd, "monitor_distance_m"_a = 0.7f,
-                    "screen_width_px"_a = 3840.0f, "screen_width_m"_a = 0.7f)
-
-        .def_static("isConstantColor", &IBA_isConstantColor, "src"_a,
-                    "threshold"_a = 0.0f, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("isConstantChannel", &IBA_isConstantChannel, "src"_a,
-                    "channel"_a, "val"_a, "threshold"_a = 0.0f,
+        .def_static("flatten", IBA_flatten, "dst"_a, "src"_a,
                     "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("isMonochrome", &IBA_isMonochrome, "src"_a,
-                    "threshold"_a = 0.0f, "roi"_a = ROI::All(),
+        .def_static("flatten", IBA_flatten_ret, "src"_a, "roi"_a = ROI::All(),
                     "nthreads"_a = 0)
 
-        // color_count
-
-        .def_static("color_range_check", &IBA_color_range_check, "src"_a,
-                    "low"_a, "high"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("nonzero_region", &IBA_nonzero_region, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("computePixelHashSHA1", &IBA_computePixelHashSHA1, "src"_a,
-                    "extrainfo"_a = "", "roi"_a = ROI::All(), "blocksize"_a = 0,
+        .def_static("deep_merge", IBA_deep_merge, "dst"_a, "A"_a, "B"_a,
+                    "occlusion_cull"_a = true, "roi"_a = ROI::All(),
+                    "nthreads"_a = 0)
+        .def_static("deep_merge", IBA_deep_merge_ret, "A"_a, "B"_a,
+                    "occlusion_cull"_a = true, "roi"_a = ROI::All(),
                     "nthreads"_a = 0)
 
-        .def_static("warp", &IBA_warp, "dst"_a, "src"_a, "M"_a,
-                    "filtername"_a = "", "filterwidth"_a = 0.0f,
-                    "recompute_roi"_a = false, "wrap"_a = "default",
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("warp", &IBA_warp_ret, "src"_a, "M"_a, "filtername"_a = "",
-                    "filterwidth"_a = 0.0f, "recompute_roi"_a = false,
-                    "wrap"_a = "default", "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("rotate", &IBA_rotate, "dst"_a, "src"_a, "angle"_a,
-                    "filtername"_a = "", "filterwidth"_a = 0.0f,
-                    "recompute_roi"_a = false, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("rotate", &IBA_rotate2, "dst"_a, "src"_a, "angle"_a,
-                    "center_x"_a, "center_y"_a, "filtername"_a = "",
-                    "filterwidth"_a = 0.0f, "recompute_roi"_a = false,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("rotate", &IBA_rotate_ret, "src"_a, "angle"_a,
-                    "filtername"_a = "", "filterwidth"_a = 0.0f,
-                    "recompute_roi"_a = false, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("rotate", &IBA_rotate2_ret, "src"_a, "angle"_a,
-                    "center_x"_a, "center_y"_a, "filtername"_a = "",
-                    "filterwidth"_a = 0.0f, "recompute_roi"_a = false,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("resize", &IBA_resize, "dst"_a, "src"_a,
-                    "filtername"_a = "", "filterwidth"_a = 0.0f,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("resize", &IBA_resize_ret, "src"_a, "filtername"_a = "",
-                    "filterwidth"_a = 0.0f, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("resample", &IBA_resample, "dst"_a, "src"_a,
-                    "interpolate"_a = true, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("resample", &IBA_resample_ret, "src"_a,
-                    "interpolate"_a = true, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("st_warp", &IBA_st_warp, "dst"_a, "src"_a, "stbuf"_a,
-                    "filtername"_a = "", "filterwidth"_a = 0.0f, "chan_s"_a = 0,
-                    "chan_t"_a = 1, "flip_s"_a = false, "flip_t"_a = false,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("st_warp", &IBA_st_warp_ret, "src"_a, "stbuf"_a,
-                    "filtername"_a = "", "filterwidth"_a = 0.0f, "chan_s"_a = 0,
-                    "chan_t"_a = 1, "flip_s"_a = false, "flip_t"_a = false,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("fit", &IBA_fit, "dst"_a, "src"_a, "filtername"_a = "",
-                    "filterwidth"_a = 0.0f, "fillmode"_a = "letterbox",
-                    "exact"_a = false, "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("fit", &IBA_fit_ret, "src"_a, "filtername"_a = "",
-                    "filterwidth"_a = 0.0f, "fillmode"_a = "letterbox",
-                    "exact"_a = false, "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("make_kernel", &IBA_make_kernel, "dst"_a, "name"_a,
-                    "width"_a, "height"_a, "depth"_a = 1.0f,
-                    "normalize"_a = true)
-        .def_static("make_kernel", &IBA_make_kernel_ret, "name"_a, "width"_a,
-                    "height"_a, "depth"_a = 1.0f, "normalize"_a = true)
-
-        .def_static("convolve", &IBA_convolve, "dst"_a, "src"_a, "kernel"_a,
-                    "normalze"_a = true, "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("convolve", &IBA_convolve_ret, "src"_a, "kernel"_a,
-                    "normalze"_a = true, "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("unsharp_mask", &IBA_unsharp_mask, "dst"_a, "src"_a,
-                    "kernel"_a = "gaussian", "width"_a = 3.0f,
-                    "contrast"_a = 1.0f, "threshold"_a = 0.0f,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("unsharp_mask", &IBA_unsharp_mask_ret, "src"_a,
-                    "kernel"_a = "gaussian", "width"_a = 3.0f,
-                    "contrast"_a = 1.0f, "threshold"_a = 0.0f,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("median_filter", &IBA_median_filter, "dst"_a, "src"_a,
-                    "width"_a = 3, "height"_a = -1, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("median_filter", &IBA_median_filter_ret, "src"_a,
-                    "width"_a = 3, "height"_a = -1, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("dilate", &IBA_dilate, "dst"_a, "src"_a, "width"_a = 3,
-                    "height"_a = -1, "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("dilate", &IBA_dilate_ret, "src"_a, "width"_a = 3,
-                    "height"_a = -1, "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("erode", &IBA_erode, "dst"_a, "src"_a, "width"_a = 3,
-                    "height"_a = -1, "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("erode", &IBA_erode_ret, "src"_a, "width"_a = 3,
-                    "height"_a = -1, "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("laplacian", &IBA_laplacian, "dst"_a, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("laplacian", &IBA_laplacian_ret, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("fft", &IBA_fft, "dst"_a, "src"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("fft", &IBA_fft_ret, "src"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("ifft", &IBA_ifft, "dst"_a, "src"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("ifft", &IBA_ifft_ret, "src"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("polar_to_complex", &IBA_polar_to_complex, "dst"_a, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("polar_to_complex", &IBA_polar_to_complex_ret, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("complex_to_polar", &IBA_complex_to_polar, "dst"_a, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("complex_to_polar", &IBA_complex_to_polar_ret, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("fixNonFinite", &IBA_fixNonFinite, "dst"_a, "src"_a,
-                    "mode"_a = ImageBufAlgo::NONFINITE_BOX3,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("fixNonFinite", &IBA_fixNonFinite_ret, "src"_a,
-                    "mode"_a = ImageBufAlgo::NONFINITE_BOX3,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("normalize", &IBA_normalize, "dst"_a, "src"_a,
-                    "inCenter"_a = 0.0f, "outCenter"_a = 0.0f, "scale"_a = 1.0f,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("normalize", &IBA_normalize_ret, "src"_a,
-                    "inCenter"_a = 0.0f, "outCenter"_a = 0.0f, "scale"_a = 1.0f,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("fillholes_pushpull", &IBA_fillholes_pushpull, "dst"_a,
-                    "src"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("fillholes_pushpull", &IBA_fillholes_pushpull_ret, "src"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("over", &IBA_over, "dst"_a, "A"_a, "B"_a,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("over", &IBA_over_ret, "A"_a, "B"_a, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("zover", &IBA_zover, "dst"_a, "A"_a, "B"_a,
-                    "z_zeroisinf"_a = false, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-        .def_static("zover", &IBA_zover_ret, "A"_a, "B"_a,
-                    "z_zeroisinf"_a = false, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("render_point", &IBA_render_point, "dst"_a, "x"_a, "y"_a,
-                    "color"_a = py::none())
-
-        .def_static("render_line", &IBA_render_line, "dst"_a, "x1"_a, "y1"_a,
-                    "x2"_a, "y2"_a, "color"_a = py::none(),
-                    "skip_first_point"_a = false)
-
-        .def_static("render_box", &IBA_render_box, "dst"_a, "x1"_a, "y1"_a,
-                    "x2"_a, "y2"_a, "color"_a = py::none(), "fill"_a = false)
-
-        .def_static("render_text", &IBA_render_text, "dst"_a, "x"_a, "y"_a,
-                    "text"_a, "fontsize"_a = 16, "fontname"_a = "",
-                    "textcolor"_a = py::tuple(), "alignx"_a = "left",
-                    "aligny"_a = "baseline", "shadow"_a = 0,
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-
-        .def_static("text_size", &IBA_text_size, "text"_a, "fontsize"_a = 16,
-                    "fontname"_a = "")
-
-        .def_static("histogram", &IBA_histogram, "src"_a, "channel"_a = 0,
-                    "bins"_a = 256, "min"_a = 0.0f, "max"_a = 1.0f,
-                    "ignore_empty"_a = false, "roi"_a = ROI::All(),
-                    "nthreads"_a = 0)
-
-        .def_static("make_texture", &IBA_make_texture_filename, "mode"_a,
-                    "filename"_a, "outputfilename"_a, "config"_a = ImageSpec())
-        .def_static("make_texture", &IBA_make_texture_ib, "mode"_a, "buf"_a,
-                    "outputfilename"_a, "config"_a = ImageSpec())
-
-        .def_static("demosaic", &IBA_demosaic, "dst"_a, "src"_a,
-                    "pattern"_a = "", "algorithm"_a = "", "layout"_a = "",
-                    "white_balance_mode"_a = "", "white_balance"_a = py::none(),
-                    "roi"_a = ROI::All(), "nthreads"_a = 0)
-        .def_static("demosaic", &IBA_demosaic_ret, "src"_a, "pattern"_a = "",
-                    "algorithm"_a = "", "layout"_a = "",
-                    "white_balance_mode"_a = "", "white_balance"_a = py::none(),
+        .def_static("deep_holdout", IBA_deep_holdout, "dst"_a, "src"_a,
+                    "holdout"_a, "roi"_a = ROI::All(), "nthreads"_a = 0)
+        .def_static("deep_holdout", IBA_deep_holdout_ret, "src"_a, "holdout"_a,
                     "roi"_a = ROI::All(), "nthreads"_a = 0);
+}
+
+
+static OIIO_NOINLINE void
+declare_iba_misc(py::class_<IBA_dummy>& iba)
+{
+    iba.def_static("make_texture", &IBA_make_texture_filename, "mode"_a,
+                   "filename"_a, "outputfilename"_a, "config"_a = ImageSpec())
+        .def_static("make_texture", &IBA_make_texture_ib, "mode"_a, "buf"_a,
+                    "outputfilename"_a, "config"_a = ImageSpec());
+}
+
+
+void
+declare_imagebufalgo(py_module& m)
+{
+    py::enum_<ImageBufAlgo::NonFiniteFixMode> nonfinite_fix_mode(
+        m, "NonFiniteFixMode");
+    nonfinite_fix_mode.value("NONFINITE_NONE", ImageBufAlgo::NONFINITE_NONE)
+        .value("NONFINITE_BLACK", ImageBufAlgo::NONFINITE_BLACK)
+        .value("NONFINITE_BOX3", ImageBufAlgo::NONFINITE_BOX3);
+#if !defined(OIIO_PY_BACKEND_NANOBIND)
+    nonfinite_fix_mode.export_values();
+#else
+    m.attr("NONFINITE_NONE")  = py::cast(ImageBufAlgo::NONFINITE_NONE);
+    m.attr("NONFINITE_BLACK") = py::cast(ImageBufAlgo::NONFINITE_BLACK);
+    m.attr("NONFINITE_BOX3")  = py::cast(ImageBufAlgo::NONFINITE_BOX3);
+#endif
+
+    py::enum_<ImageBufAlgo::MakeTextureMode> make_texture_mode(
+        m, "MakeTextureMode");
+    make_texture_mode.value("MakeTxTexture", ImageBufAlgo::MakeTxTexture)
+        .value("MakeTxShadow", ImageBufAlgo::MakeTxShadow)
+        .value("MakeTxEnvLatl", ImageBufAlgo::MakeTxEnvLatl)
+        .value("MakeTxEnvLatlFromLightProbe",
+               ImageBufAlgo::MakeTxEnvLatlFromLightProbe)
+        .value("MakeTxBumpWithSlopes", ImageBufAlgo::MakeTxBumpWithSlopes);
+#if !defined(OIIO_PY_BACKEND_NANOBIND)
+    make_texture_mode.export_values();
+#else
+    m.attr("MakeTxTexture") = py::cast(ImageBufAlgo::MakeTxTexture);
+    m.attr("MakeTxShadow")  = py::cast(ImageBufAlgo::MakeTxShadow);
+    m.attr("MakeTxEnvLatl") = py::cast(ImageBufAlgo::MakeTxEnvLatl);
+    m.attr("MakeTxEnvLatlFromLightProbe") = py::cast(
+        ImageBufAlgo::MakeTxEnvLatlFromLightProbe);
+    m.attr("MakeTxBumpWithSlopes") = py::cast(
+        ImageBufAlgo::MakeTxBumpWithSlopes);
+#endif
+
+    py::class_<ImageBufAlgo::PixelStats>(m, "PixelStats")
+        .def(py::init<>())
+        .OIIO_PY_RO("min", &ImageBufAlgo::PixelStats::min)
+        .OIIO_PY_RO("max", &ImageBufAlgo::PixelStats::max)
+        .OIIO_PY_RO("avg", &ImageBufAlgo::PixelStats::avg)
+        .OIIO_PY_RO("stddev", &ImageBufAlgo::PixelStats::stddev)
+        .OIIO_PY_RO("nancount", &ImageBufAlgo::PixelStats::nancount)
+        .OIIO_PY_RO("infcount", &ImageBufAlgo::PixelStats::infcount)
+        .OIIO_PY_RO("finitecount", &ImageBufAlgo::PixelStats::finitecount)
+        .OIIO_PY_RO("sum", &ImageBufAlgo::PixelStats::sum)
+        .OIIO_PY_RO("sum2", &ImageBufAlgo::PixelStats::sum2);
+
+    py::class_<ImageBufAlgo::CompareResults>(m, "CompareResults")
+        .def(py::init<>())
+        .OIIO_PY_RO("meanerror", &ImageBufAlgo::CompareResults::meanerror)
+        .OIIO_PY_RO("rms_error", &ImageBufAlgo::CompareResults::rms_error)
+        .OIIO_PY_RO("PSNR", &ImageBufAlgo::CompareResults::PSNR)
+        .OIIO_PY_RO("maxerror", &ImageBufAlgo::CompareResults::maxerror)
+        .OIIO_PY_RO("maxx", &ImageBufAlgo::CompareResults::maxx)
+        .OIIO_PY_RO("maxy", &ImageBufAlgo::CompareResults::maxy)
+        .OIIO_PY_RO("maxz", &ImageBufAlgo::CompareResults::maxz)
+        .OIIO_PY_RO("maxc", &ImageBufAlgo::CompareResults::maxc)
+        .OIIO_PY_RO("nwarn", &ImageBufAlgo::CompareResults::nwarn)
+        .OIIO_PY_RO("nfail", &ImageBufAlgo::CompareResults::nfail)
+        .OIIO_PY_RO("error", &ImageBufAlgo::CompareResults::error);
+
+    // Put this all inside "ImageBufAlgo"
+    py::class_<IBA_dummy> iba(m, "ImageBufAlgo");
+    declare_iba_patterns(iba);
+    declare_iba_transformations(iba);
+    declare_iba_arithmetic1(iba);
+    declare_iba_arithmetic2(iba);
+    declare_iba_comparisons(iba);
+    declare_iba_convolutions(iba);
+    declare_iba_enhancement(iba);
+    declare_iba_morphological(iba);
+    declare_iba_colors(iba);
+    declare_iba_deep(iba);
+    declare_iba_misc(iba);
 }
 
 }  // namespace PyOpenImageIO

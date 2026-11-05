@@ -3,6 +3,7 @@
 // https://github.com/AcademySoftwareFoundation/OpenImageIO
 
 #include <OpenImageIO/fmath.h>
+#include <OpenImageIO/strutil.h>
 
 #include "fits_pvt.h"
 
@@ -84,7 +85,7 @@ FitsOutput::write_scanline(int y, int /*z*/, TypeDesc format, const void* data,
 {
     if (m_spec.width == 0 && m_spec.height == 0)
         return true;
-    if (y > m_spec.height) {
+    if (y < 0 || y >= m_spec.height) {
         errorfmt("Attempt to write too many scanlines to {}", m_filename);
         close();
         return false;
@@ -94,10 +95,6 @@ FitsOutput::write_scanline(int y, int /*z*/, TypeDesc format, const void* data,
 
     std::vector<unsigned char> data_tmp(m_spec.scanline_bytes(), 0);
     memcpy(&data_tmp[0], data, m_spec.scanline_bytes());
-
-    // computing scanline offset
-    long scanline_off = (m_spec.height - y) * m_spec.scanline_bytes();
-    fseek(m_fd, scanline_off, SEEK_CUR);
 
     // in FITS image data is stored in big-endian so we have to switch to
     // big-endian on little-endian machines
@@ -115,12 +112,37 @@ FitsOutput::write_scanline(int y, int /*z*/, TypeDesc format, const void* data,
                         data_tmp.size() / sizeof(double));
     }
 
-    size_t byte_count = fwrite(&data_tmp[0], 1, data_tmp.size(), m_fd);
+    if (m_spec.nchannels == 1) {
+        // computing scanline offset
+        long scanline_off = (m_spec.height - 1 - y) * m_spec.scanline_bytes();
+        fseek(m_fd, scanline_off, SEEK_CUR);
+        size_t byte_count = fwrite(&data_tmp[0], 1, data_tmp.size(), m_fd);
+        fsetpos(m_fd, &m_filepos);
+        return byte_count == data_tmp.size();
+    }
 
+    // Channels are stored as separate contiguous width x height planes
+    // (NAXIS3 = nchannels), the only real-world FITS color-cube convention,
+    // so de-interleave this scanline and write each channel's row into its
+    // own plane.
+    size_t comp_size   = m_spec.format.size();
+    size_t row_bytes   = size_t(m_spec.width) * comp_size;
+    size_t plane_bytes = row_bytes * size_t(m_spec.height);
+    long row_off       = (m_spec.height - 1 - y) * long(row_bytes);
+    std::vector<unsigned char> chan_row(row_bytes);
+    bool ok = true;
+    for (int c = 0; c < m_spec.nchannels; ++c) {
+        for (int x = 0; x < m_spec.width; ++x)
+            memcpy(&chan_row[size_t(x) * comp_size],
+                   &data_tmp[(size_t(x) * m_spec.nchannels + c) * comp_size],
+                   comp_size);
+        fsetpos(m_fd, &m_filepos);
+        fseek(m_fd, long(c * plane_bytes) + row_off, SEEK_CUR);
+        size_t byte_count = fwrite(&chan_row[0], 1, row_bytes, m_fd);
+        ok &= (byte_count == row_bytes);
+    }
     fsetpos(m_fd, &m_filepos);
-
-    //byte_count == data.size --> all written
-    return byte_count == data_tmp.size();
+    return ok;
 }
 
 
@@ -153,6 +175,14 @@ FitsOutput::close(void)
         std::vector<unsigned char>().swap(m_tilebuffer);
     }
 
+    // FITS requires the data to be zero-padded to a whole block
+    if (Filesystem::fseek(m_fd, 0, SEEK_END) == 0) {
+        size_t pad = (HEADER_SIZE - Filesystem::ftell(m_fd) % HEADER_SIZE)
+                     % HEADER_SIZE;
+        std::vector<char> zeros(pad, 0);
+        ok &= (fwrite(zeros.data(), 1, pad, m_fd) == pad);
+    }
+
     fclose(m_fd);
     init();
     return ok;
@@ -169,6 +199,16 @@ FitsOutput::create_fits_header(void)
     //we add all keywords stored in ImageSpec to the FITS file
     for (size_t i = 0; i < m_spec.extra_attribs.size(); ++i) {
         std::string keyname = m_spec.extra_attribs[i].name().string();
+
+        // "oiio:" attributes, and ones prefixed with the name of another
+        // format, are hints rather than metadata to store.
+        if (Strutil::istarts_with(keyname, "oiio:"))
+            continue;
+        if (size_t colon = keyname.find(':'); colon != std::string::npos) {
+            std::string prefix = Strutil::lower(keyname.substr(0, colon));
+            if (prefix != format_name() && is_imageio_format_name(prefix))
+                continue;
+        }
 
         std::string value;
         TypeDesc attr_format = m_spec.extra_attribs[i].type();
@@ -264,16 +304,16 @@ FitsOutput::create_basic_header(std::string& header)
         axes += 1;
     header += create_card("NAXIS", num2str(axes));
 
-    // now we save NAXIS1 and NAXIS2
-    // this keywords represents width and height
+    // now we save NAXIS1, NAXIS2 (and NAXIS3 for multi-channel images)
     if (m_spec.nchannels == 1) {
         header += create_card("NAXIS1", num2str(m_spec.width));
         header += create_card("NAXIS2", num2str(m_spec.height));
     } else {
-        // 3D image for color
-        header += create_card("NAXIS1", num2str(m_spec.nchannels));
-        header += create_card("NAXIS2", num2str(m_spec.width));
-        header += create_card("NAXIS3", num2str(m_spec.height));
+        // One full-resolution plane per channel (NAXIS3 = nchannels), the
+        // only real-world FITS color-cube convention.
+        header += create_card("NAXIS1", num2str(m_spec.width));
+        header += create_card("NAXIS2", num2str(m_spec.height));
+        header += create_card("NAXIS3", num2str(m_spec.nchannels));
     }
 }
 

@@ -332,10 +332,7 @@ bresenham2d(FUNC func, int x1, int y1, int x2, int y2, bool skip_first = false)
 template<typename T> struct IB_drawer {
     IB_drawer(ImageBuf::Iterator<T, float>& r_, cspan<float> color_,
               float alpha_, ROI roi_)
-        : r(r_)
-        , color(color_)
-        , alpha(alpha_)
-        , roi(roi_)
+        : r(r_), color(color_), alpha(alpha_), roi(roi_)
     {
     }
 
@@ -468,12 +465,7 @@ ImageBufAlgo::render_box(ImageBuf& dst, int x1, int y1, int x2, int y2,
 // Convenient helper struct to bundle a 3-int describing a block size.
 struct Dim3 {
     int x, y, z;
-    Dim3(int x, int y = 1, int z = 1)
-        : x(x)
-        , y(y)
-        , z(z)
-    {
-    }
+    Dim3(int x, int y = 1, int z = 1) : x(x), y(y), z(z) {}
 };
 
 
@@ -816,7 +808,7 @@ enumerate_fonts()
     for (auto s : font_dir_envvars)
         fontpath_add_from_searchpath(Sysutil::getenv(s));
 
-        // Add system font directories
+    // Add system font directories
 #ifdef _WIN32
     fontpath_add_one_dir(std::string(Sysutil::getenv("SystemRoot")) + "/Fonts");
     fontpath_add_one_dir(std::string(Sysutil::getenv("LOCALAPPDATA"))

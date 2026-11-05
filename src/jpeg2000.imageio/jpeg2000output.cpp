@@ -66,6 +66,7 @@ private:
     bool m_convert_alpha;  //< Do we deassociate alpha?
     std::vector<unsigned char> m_tilebuffer;
     std::vector<unsigned char> m_scratch;
+    std::vector<uint8_t> m_icc_profile;
 
 
 #ifdef USE_OPENJPH
@@ -81,6 +82,7 @@ private:
         m_codec         = NULL;
         m_stream        = NULL;
         m_convert_alpha = true;
+        m_icc_profile.clear();
 
         ioproxy_clear();
     }
@@ -185,7 +187,7 @@ bool
 Jpeg2000Output::open(const std::string& name, const ImageSpec& spec,
                      OpenMode mode)
 {
-    if (!check_open(mode, spec, { 0, 1 << 20, 0, 1 << 20, 0, 1, 0, 4 },
+    if (!check_open(mode, spec, { 0, 1 << 30, 0, 1 << 30, 0, 1, 0, 4 },
                     uint64_t(OpenChecks::Disallow2Channel)))
         return false;
 
@@ -288,8 +290,9 @@ Jpeg2000Output::write_scanline(int y, int z, TypeDesc format, const void* data,
                                stride_t xstride)
 {
     y -= m_spec.y;
-    if (y > m_spec.height) {
-        errorfmt("Attempt to write too many scanlines to {}", m_filename);
+    if (y < 0 || y >= m_spec.height) {
+        errorfmt("Attempt to write scanline {} outside the image to {}",
+                 y + m_spec.y, m_filename);
         return false;
     }
 
@@ -348,9 +351,14 @@ Jpeg2000Output::write_tile(int x, int y, int z, TypeDesc format,
 bool
 Jpeg2000Output::close()
 {
-    if (!m_stream) {  // Already closed
+    // m_stream only exists after save_image(), which tiled output has not
+    // yet reached, so test for the images instead.
+    bool is_open = m_image != nullptr;
+#ifdef USE_OPENJPH
+    is_open |= m_jph_image != nullptr;
+#endif
+    if (!is_open)  // Already closed
         return true;
-    }
 
     bool ok = true;
     if (m_spec.tile_width) {
@@ -371,6 +379,13 @@ Jpeg2000Output::close()
 #endif
 
     if (m_image) {
+        // opj_image_destroy() calls free() on icc_profile_buf, but that memory
+        // is owned by m_icc_profile. Clear the OpenJPEG side's pointer first so
+        // it does not free memory it doesn't own (to prevent double-free).
+        if (m_image->icc_profile_buf) {
+            m_image->icc_profile_buf = NULL;
+            m_image->icc_profile_len = 0;
+        }
         opj_image_destroy(m_image);
         m_image = NULL;
     }
@@ -467,24 +482,22 @@ Jpeg2000Output::create_jpeg2000_image()
     m_image->x1 = m_compression_parameters.image_offset_x0
                   + (m_spec.width - 1) * m_compression_parameters.subsampling_dx
                   + 1;
-    m_image->y1
-        = m_compression_parameters.image_offset_y0
-          + (m_spec.height - 1) * m_compression_parameters.subsampling_dy + 1;
+    m_image->y1 = m_compression_parameters.image_offset_y0
+                  + (m_spec.height - 1)
+                        * m_compression_parameters.subsampling_dy
+                  + 1;
 
-#if 0
-    // FIXME: I seem to get crashes with OpenJpeg 2.x in the presence of ICC
-    // profiles. I have no idea why. It seems like losing the ability to
-    // write ICC profiles is the lesser evil compared to either restricting
-    // ourselves to OpenJpeg 1.5 or living with crashes. I'm at the limit of
-    // my knowledge of OpenJPEG, which frankly has a poor API and abysmal
-    // documentation. So I'll leave the repair of this for later. If
-    // someboody comes along that desperately needs JPEG2000 and ICC
-    // profiles, maybe they will be motivated enough to track down the
-    // problem.
-    const ParamValue *icc = m_spec.find_attribute ("ICCProfile");
-    if (icc && icc->type().basetype == TypeDesc::UINT8 && icc->type().arraylen > 0) {
-        m_image->icc_profile_len = icc->type().arraylen;
-        m_image->icc_profile_buf = (unsigned char *) icc->data();
+#if OIIO_OPJ_VERSION >= 20504
+    // OpenJPEG versions before 2.5.4 fail to write the ICC profile
+    // (assertion in opj_jp2_write_colr).
+    //
+    // NOTE: openjpeg does not copy the profile and m_image outlives this
+    // function, so the bytes are kept in a member rather than a local.
+    m_icc_profile = get_colorspace_icc_profile(m_spec);
+    if (m_icc_profile.size()) {
+        m_image->icc_profile_len = decltype(m_image->icc_profile_len)(
+            m_icc_profile.size());
+        m_image->icc_profile_buf = (unsigned char*)m_icc_profile.data();
     }
 #endif
 
@@ -534,7 +547,7 @@ Jpeg2000Output::copy_scanline(int y, int /*z*/, const void* data)
 {
     int bits                  = sizeof(T) * 8;
     const T* scanline         = static_cast<const T*>(data);
-    const size_t scanline_pos = (y - m_spec.y) * m_spec.width;
+    const size_t scanline_pos = size_t(y) * m_spec.width;
     for (int i = 0, j = 0; i < m_spec.width; i++) {
         for (int c = 0; c < m_spec.nchannels; ++c) {
             unsigned int val = scanline[j++];
@@ -672,9 +685,7 @@ Jpeg2000Output::get_progression_order(const std::string& progression_order)
 struct size_list_interpreter : public ojph::cli_interpreter::arg_inter_base {
     size_list_interpreter(const int max_num_elements, int& num_elements,
                           ojph::size* list)
-        : max_num_eles(max_num_elements)
-        , sizelist(list)
-        , num_eles(num_elements)
+        : max_num_eles(max_num_elements), sizelist(list), num_eles(num_elements)
     {
     }
 

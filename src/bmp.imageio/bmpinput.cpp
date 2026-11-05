@@ -41,8 +41,8 @@ private:
     std::vector<bmp_pvt::color_table> m_colortable;
     std::vector<unsigned char> fscanline;       // temp space: read from file
     std::vector<unsigned char> m_uncompressed;  // uncompressed palette image
-    uint32_t m_right_shifts[3];
-    uint32_t m_bit_counts[3];
+    uint32_t m_right_shifts[4];
+    uint32_t m_bit_counts[4];
     bool m_allgray;
 
     void init(void)
@@ -182,12 +182,18 @@ BmpInput::open(const std::string& name, ImageSpec& newspec,
     //     m_dib_header.size, m_dib_header.size, m_dib_header.width,
     //     m_dib_header.height, m_dib_header.cplanes, m_dib_header.bpp);
 
-    const int nchannels = (m_dib_header.bpp == 32) ? 4 : 3;
-    const int height    = (m_dib_header.height >= 0) ? m_dib_header.height
-                                                     : -m_dib_header.height;
-    m_spec = ImageSpec(m_dib_header.width, height, nchannels, TypeDesc::UINT8);
-    if (!check_open(m_spec, { 0, 1 << 16, 0, 1 << 16, 0, 1, 0, 4 }))
+    const int nchannels  = (m_dib_header.bpp == 32) ? 4 : 3;
+    const int64_t height = (m_dib_header.height >= 0)
+                               ? int64_t(m_dib_header.height)
+                               : -int64_t(m_dib_header.height);
+
+    m_spec = ImageSpec(m_dib_header.width, int(height), nchannels,
+                       TypeDesc::UINT8);
+    if (!check_open(m_spec, { 0, 1 << 16, 0, 1 << 16, 0, 1, 0, 4 })
+        || !check_compression_ratio(m_spec, ioproxy()->size())) {
+        close();
         return false;
+    }
 
     if (m_dib_header.hres > 0 && m_dib_header.vres > 0) {
         m_spec.attribute("XResolution", (int)m_dib_header.hres);
@@ -205,6 +211,7 @@ BmpInput::open(const std::string& name, ImageSpec& newspec,
     calc_shifts(m_dib_header.red_mask, m_bit_counts[0], m_right_shifts[0]);
     calc_shifts(m_dib_header.green_mask, m_bit_counts[1], m_right_shifts[1]);
     calc_shifts(m_dib_header.blue_mask, m_bit_counts[2], m_right_shifts[2]);
+    calc_shifts(m_dib_header.alpha_mask, m_bit_counts[3], m_right_shifts[3]);
 
     // computing size of one scanline - this is the size of one scanline that
     // is stored in the file, not in the memory
@@ -220,8 +227,10 @@ BmpInput::open(const std::string& name, ImageSpec& newspec,
         break;
     case 8:
         m_padded_scanline_size = (m_spec.width + 3) & ~3;
-        if (!read_color_table())
+        if (!read_color_table()) {
+            close();
             return false;
+        }
         m_allgray = monodetect && color_table_is_all_gray();
         if (m_allgray) {
             m_spec.nchannels = 1;  // make it look like a 1-channel image
@@ -231,17 +240,22 @@ BmpInput::open(const std::string& name, ImageSpec& newspec,
     case 4:
         swidth                 = (m_spec.width + 1) / 2;
         m_padded_scanline_size = (swidth + 3) & ~3;
-        if (!read_color_table())
+        if (!read_color_table()) {
+            close();
             return false;
+        }
         break;
     case 1:
         swidth                 = (m_spec.width + 7) / 8;
         m_padded_scanline_size = (swidth + 3) & ~3;
-        if (!read_color_table())
+        if (!read_color_table()) {
+            close();
             return false;
+        }
         break;
     default:
         errorfmt("Unsupported BMP bit depth: {}", m_dib_header.bpp);
+        close();
         return false;
     }
     if (m_dib_header.bpp <= 16)
@@ -257,6 +271,7 @@ BmpInput::open(const std::string& name, ImageSpec& newspec,
         errorfmt(
             "BMP error: bad BPP ({}) for palette image -- presumed corrupt file",
             m_dib_header.bpp);
+        close();
         return false;
     }
 
@@ -387,7 +402,7 @@ BmpInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
     if (!seek_subimage(subimage, miplevel))
         return false;
 
-    if (y < 0 || y > m_spec.height)
+    if (y < 0 || y >= m_spec.height)
         return false;
 
     size_t scanline_bytes = m_spec.scanline_bytes();
@@ -425,11 +440,49 @@ BmpInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
     if (m_dib_header.height >= 0)
         y = m_spec.height - y - 1;
     const int64_t scanline_off = y * m_padded_scanline_size;
+    const int64_t scanline_pos = int64_t(m_bmp_header.offset) + scanline_off;
+
+    // A corrupt header can place the scanline outside the file. The IOProxy
+    // will reject such a read, but validate the position explicitly so we
+    // fail cleanly instead of relying on a bad seek being caught downstream.
+    if (m_padded_scanline_size < 0 || scanline_pos < 0
+        || scanline_pos + m_padded_scanline_size > int64_t(ioproxy()->size())) {
+        errorfmt("Invalid scanline position in BMP file");
+        return false;
+    }
 
     fscanline.resize(m_padded_scanline_size);
-    ioseek(m_bmp_header.offset + scanline_off);
+    ioseek(scanline_pos);
     if (!ioread(fscanline.data(), m_padded_scanline_size)) {
         return false;  // Read failed
+    }
+
+    if (m_dib_header.bpp == 32 && m_dib_header.compression == 3
+        && (m_dib_header.size == WINDOWS_V4
+            || m_dib_header.size == WINDOWS_V5)) {
+        for (unsigned int i = 0, j = 0; j < scanline_bytes; i += 4, j += 4) {
+            uint32_t pixel = *(uint32_t*)&fscanline[i];
+            mscanline[j + 0]
+                = (uint8_t)bit_range_convert((pixel & m_dib_header.red_mask)
+                                                 >> m_right_shifts[0],
+                                             m_bit_counts[0], 8);
+            mscanline[j + 1]
+                = (uint8_t)bit_range_convert((pixel & m_dib_header.green_mask)
+                                                 >> m_right_shifts[1],
+                                             m_bit_counts[1], 8);
+            mscanline[j + 2]
+                = (uint8_t)bit_range_convert((pixel & m_dib_header.blue_mask)
+                                                 >> m_right_shifts[2],
+                                             m_bit_counts[2], 8);
+            if (m_dib_header.alpha_mask == 0) {
+                mscanline[j + 3] = 255;
+            } else {
+                mscanline[j + 3] = (uint8_t)bit_range_convert(
+                    (pixel & m_dib_header.alpha_mask) >> m_right_shifts[3],
+                    m_bit_counts[3], 8);
+            }
+        }
+        return true;
     }
 
     // in each case we process only first m_spec.scanline_bytes () bytes

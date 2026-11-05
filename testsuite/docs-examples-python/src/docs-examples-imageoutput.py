@@ -102,10 +102,63 @@ def tiles_write() -> None:
         # END-imageoutput-tiles
 
 
+def copy_write() -> None:
+    from OpenImageIO import ImageInput, ImageOutput
+
+    # BEGIN-imageoutput-copy
+    # Open the input file
+    inp = ImageInput.open("input.exr")
+
+    # Make an output spec, identical to the input except for metadata
+    out_spec = inp.spec()
+    out_spec.attribute("ImageDescription", "My Title")
+
+    # Create the output file and copy the image
+    out = ImageOutput.create("output.exr")
+    out.open("output.exr", out_spec)
+    out.copy_image(inp)
+
+    # Clean up
+    out.close()
+    inp.close()
+    # END-imageoutput-copy
+
+
+def channel_names_basic() -> None:
+    print('example_channel_names_basic')
+    width = 320
+    length = 240
+    
+    # BEGIN-imageoutput-channelnamesbasic
+    channels = 3  # RGB
+    spec = oiio.ImageSpec(width, length, channels, 'uint8')
+    spec.channelnames = ('R', 'G', 'B')
+    # END-imageoutput-channelnamesbasic
+    print(' '.join(spec.channelnames))
+
+
+def channel_names_8() -> None:
+    print('example_channel_names_8')
+    width = 320
+    length = 240
+
+    # BEGIN-imageoutput-channelnames8
+    channels = 8
+    spec = oiio.ImageSpec(width, length, channels, 'uint8')
+    spec.channelnames = ('R', 'G', 'B', 'opacityR', 'opacityG', 'opacityB',
+                        'texture_s', 'texture_t')
+    # END-imageoutput-channelnames8
+    print(spec.nchannels)
+    print(' '.join(spec.channelnames))
+
 
 if __name__ == '__main__':
+    print("docs-examples-imageoutput.py")
     # Each example function needs to get called here, or it won't execute
     # as part of the test.
     simple_write()
     scanlines_write()
     tiles_write()
+    copy_write()
+    channel_names_basic()
+    channel_names_8()

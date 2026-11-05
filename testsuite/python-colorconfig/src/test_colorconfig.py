@@ -14,6 +14,15 @@ import numpy as np
 TEST_CONFIG_PATH: Path = Path(__file__).parent/"oiio_test_v0.9.2.ocio"
 
 try:
+    # Regression test: default_colorconfig() returns a non-copyable singleton
+    # reference and must use a reference return-value policy (without it,
+    # callers can get a copy/wrapper that is not the shared instance, or the
+    # binding can fail for non-copyable ColorConfig).
+    default_a = oiio.ColorConfig.default_colorconfig()
+    default_b = oiio.ColorConfig.default_colorconfig()
+    print ("default_colorconfig same instance =", default_a is default_b)
+    print ("default_colorconfig usable =", default_a.getNumColorSpaces() > 0)
+
     config = oiio.ColorConfig()
     print ("getNumColorSpaces =", config.getNumColorSpaces())
     print ("getColorSpaceNames =", config.getColorSpaceNames())
@@ -48,11 +57,29 @@ try:
     print ("equivalent('scene_linear', 'lin_srgb'):", config.equivalent("scene_linear", "lin_srgb"))
     print ("equivalent('ACEScg', 'scene_linear'):", config.equivalent("ACEScg", "scene_linear"))
     print ("equivalent('lnf', 'scene_linear'):", config.equivalent("lnf", "scene_linear"))
+    print ("get_color_interop_id('ACES2065-1') = ", config.get_color_interop_id("ACES2065-1"))
     print ("get_color_interop_id('ACEScg') = ", config.get_color_interop_id("ACEScg"))
     print ("get_color_interop_id('lin_srgb') = ", config.get_color_interop_id("lin_srgb"))
     print ("get_color_interop_id([1, 13, 1, 1]) = ", config.get_color_interop_id([1, 13, 1, 1]))
+    print ("resolve('srgb_rec709_display'):", config.resolve("srgb_rec709_display"))
+    print ("equivalent('srgb_rec709_display', 'srgb_rec709_scene'):", config.equivalent("srgb_rec709_display", "srgb_rec709_scene"))
+    print (f"get_color_interop_id('sRGB - Display') = '{config.get_color_interop_id('sRGB - Display')}'")
+    print ("get_color_interop_id('g24_rec709_scene') = ", config.get_color_interop_id("g24_rec709_scene"))
+    print ("get_color_interop_id('g24_rec709_display') = ", config.get_color_interop_id("g24_rec709_display"))
     print ("get_cicp('pq_rec2020_display') = ", config.get_cicp("pq_rec2020_display"))
+    print ("get_cicp('g24_rec709_display') = ", config.get_cicp("g24_rec709_display"))
+    print ("get_cicp('g24_rec709_scene') = ", config.get_cicp("g24_rec709_scene"))
     print ("get_cicp('unknown_interop_id') = ", config.get_cicp("unknown_interop_id"))
+    print ("isColorSpaceLinear('scene_linear') = ", config.isColorSpaceLinear('scene_linear'))
+    print ("isColorSpaceLinear('srgb') = ", config.isColorSpaceLinear('srgb'))
+    print ("isData('scene_linear') = ", config.isData('scene_linear'))
+    print ("isData('Raw') = ", config.isData('Raw'))
+    print ("equivalent('ACEScg', 'Raw'):", config.equivalent("ACEScg", "Raw"))
+    print ("getColorSpaceFromFilepath('in_acescg.exr') =", config.getColorSpaceFromFilepath("in_acescg.exr"))
+    print ("getColorSpaceFromFilepath('in_srgb_tx.exr') =", config.getColorSpaceFromFilepath("in_srgb_tx.exr"))
+    print ("getColorSpaceFromFilepath('in_raw.exr') =", config.getColorSpaceFromFilepath("in_raw.exr"))
+    print ("getColorSpaceFromFilepath('none.exr') =", config.getColorSpaceFromFilepath("none.exr"))
+    print ("getColorSpaceFromFilepath('noclue.exr') =", config.getColorSpaceFromFilepath("noclue.exr"))
     print ("")
 
     config = oiio.ColorConfig(str(TEST_CONFIG_PATH))
@@ -80,6 +107,9 @@ try:
     print (f"ociodisplay #4 (forwards look):                     {buf.get_pixels(oiio.HALF)}     ({buf.spec()['oiio:ColorSpace']})")
     buf = oiio.ImageBufAlgo.ociodisplay(buf, "", "", colorconfig=str(TEST_CONFIG_PATH), looks="-ACES 1.3 Reference Gamut Compression, +ACES 1.3 Reference Gamut Compression")
     print (f"ociodisplay #5 (inverse look + forwards look):      {buf.get_pixels(oiio.HALF)}     ({buf.spec()['oiio:ColorSpace']})")
+    for name in ("ACEScg", "g24_rec709_display", "srgb_tx", "Raw", "no_such_space"):
+        xy = config.get_chromaticities(name)
+        print (f"'{name}': get_transfer_function_gamma={config.get_transfer_function_gamma(name):g} get_chromaticities={xy and [round(v, 5) for v in xy]}")
     print ("")
 
     print ("Done.")

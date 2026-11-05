@@ -153,9 +153,9 @@ inline std::tuple<hn::Vec<D>, hn::Vec<D>, hn::Vec<D>, hn::Vec<D>>
 LoadInterleaved4PromoteN(D d, const SrcT* ptr, size_t count);
 
 template<class D, typename DstT, typename VecMathT, typename VecAlphaLaneT>
-inline void
-StoreInterleaved4RgbAlphaPassthrough(D d, DstT* ptr, VecMathT r, VecMathT g,
-                                     VecMathT b, VecAlphaLaneT a_passthrough);
+inline void StoreInterleaved4RgbAlphaPassthrough(D d, DstT* ptr, VecMathT r,
+                                                 VecMathT g, VecMathT b,
+                                                 VecAlphaLaneT a_passthrough);
 
 // -----------------------------------------------------------------------
 // Load and Promote
@@ -963,7 +963,7 @@ hwy_binary_perpixel_op(ImageBuf& R, const ImageBuf& A, const ImageBuf& B,
     ImageBufAlgo::parallel_image(roi, nthreads, [&, op](ROI roi) {
         const int nchannels = roi.nchannels();
         const size_t n      = static_cast<size_t>(roi.width())
-                         * static_cast<size_t>(nchannels);
+                              * static_cast<size_t>(nchannels);
         for (int y = roi.ybegin; y < roi.yend; ++y) {
             Rtype* r_row       = RoiRowPtr<Rtype>(Rv, y, roi);
             const Atype* a_row = RoiRowPtr<Atype>(Av, y, roi);
@@ -990,7 +990,7 @@ hwy_ternary_perpixel_op(ImageBuf& R, const ImageBuf& A, const ImageBuf& B,
     ImageBufAlgo::parallel_image(roi, nthreads, [&, op](ROI roi) {
         const int nchannels = roi.nchannels();
         const size_t n      = static_cast<size_t>(roi.width())
-                         * static_cast<size_t>(nchannels);
+                              * static_cast<size_t>(nchannels);
         for (int y = roi.ybegin; y < roi.yend; ++y) {
             Rtype* r_row         = RoiRowPtr<Rtype>(Rv, y, roi);
             const ABCtype* a_row = RoiRowPtr<ABCtype>(Av, y, roi);
@@ -1017,7 +1017,7 @@ hwy_binary_native_int_perpixel_op(ImageBuf& R, const ImageBuf& A,
     ImageBufAlgo::parallel_image(roi, nthreads, [&, op](ROI roi) {
         const int nchannels = roi.nchannels();
         const size_t n      = static_cast<size_t>(roi.width())
-                         * static_cast<size_t>(nchannels);
+                              * static_cast<size_t>(nchannels);
         for (int y = roi.ybegin; y < roi.yend; ++y) {
             T* r_row       = RoiRowPtr<T>(Rv, y, roi);
             const T* a_row = RoiRowPtr<T>(Av, y, roi);
@@ -1100,7 +1100,7 @@ hwy_binary_perpixel_op_rgba_rgb_roi(ImageBuf& R, const ImageBuf& A,
                 (void)ba;
 
                 using DstLaneT = HwyLaneTypeT<Rtype>;
-                auto d_dstlane = hn::Rebind<DstLaneT, decltype(d)>();
+                auto d_dstlane = hn::Rebind<DstLaneT, hn::ScalableTag<MathT>>();
                 hn::Vec<decltype(d_dstlane)> dr, dg, db, da;
                 hn::LoadInterleaved4(d_dstlane,
                                      reinterpret_cast<const DstLaneT*>(r_row
@@ -1189,7 +1189,7 @@ hwy_ternary_perpixel_op_rgba_rgb_roi(ImageBuf& R, const ImageBuf& A,
                 (void)ca;
 
                 using DstLaneT = HwyLaneTypeT<Rtype>;
-                auto d_dstlane = hn::Rebind<DstLaneT, decltype(d)>();
+                auto d_dstlane = hn::Rebind<DstLaneT, hn::ScalableTag<MathT>>();
                 hn::Vec<decltype(d_dstlane)> dr, dg, db, da;
                 hn::LoadInterleaved4(d_dstlane,
                                      reinterpret_cast<const DstLaneT*>(r_row

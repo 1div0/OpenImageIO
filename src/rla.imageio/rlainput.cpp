@@ -48,6 +48,7 @@ private:
     int m_subimage;                    ///< Current subimage index
     std::vector<uint32_t> m_sot;       ///< Scanline offsets table
     int m_stride;                      ///< Number of bytes a contig pixel takes
+    int64_t m_header_offset;           ///< File offset of the current header
 
     /// Reset everything to initial state
     ///
@@ -55,6 +56,9 @@ private:
     {
         ioproxy_clear();
         m_buf.clear();
+        m_sot.clear();
+        m_subimage      = -1;
+        m_header_offset = -1;
     }
 
     /// Helper: read buf[0..nitems-1], swap endianness if necessary
@@ -165,12 +169,16 @@ RLAInput::open(const std::string& name, ImageSpec& newspec)
         return false;
     ioseek(0);
 
-    // set a bogus subimage index so that seek_subimage actually seeks
-    m_subimage = 1;
+    // no current subimage yet, so seek_subimage actually seeks
+    m_subimage = -1;
 
     bool ok = seek_subimage(0, 0);
+    if (!ok) {
+        close();
+        return false;
+    }
     newspec = spec();
-    return ok;
+    return true;
 }
 
 
@@ -181,6 +189,7 @@ RLAInput::read_header()
     // Read the image header, which should have the same exact layout as
     // the m_rla structure (except for endianness issues).
     static_assert(sizeof(m_rla) == 740, "Bad RLA struct size");
+    const int64_t header_offset = iotell();
     if (!read(&m_rla)) {
         errorfmt("RLA could not read the image header");
         return false;
@@ -221,6 +230,7 @@ RLAInput::read_header()
         errorfmt("RLA could not read the scanline offset table");
         return false;
     }
+    m_header_offset = header_offset;
     return true;
 }
 
@@ -232,34 +242,48 @@ RLAInput::seek_subimage(int subimage, int miplevel)
     if (miplevel != 0 || subimage < 0)
         return false;
 
-    if (subimage == current_subimage())
+    if (subimage == m_subimage)
         return true;  // already on the right level
 
     // RLA images allow multiple subimages; they are simply concatenated
     // together, with image N's header field NextOffset giving the
     // absolute offset of the start of image N+1.
-    int diff = subimage - current_subimage();
-    if (subimage - current_subimage() < 0) {
-        // If we are requesting an image earlier than the current one,
-        // reset to the first subimage.
+
+    // We're about to overwrite the header and the scanline offset table, so
+    // give up the current subimage first -- failing partway then leaves us
+    // with none, rather than a mismatched header, table, and spec.
+    int cur    = m_subimage;
+    m_subimage = -1;
+    if (cur < 0 || subimage < cur) {
+        // No current subimage, or we want one earlier than the current:
+        // start over from the first subimage.
         ioseek(0);
         if (!read_header())
             return false;  // read_header always calls error()
-        diff       = subimage;
-        m_subimage = 0;
+        cur = 0;
     }
     // forward scrolling -- skip subimages until we're at the right place
-    while (diff > 0 && m_subimage < subimage && m_rla.NextOffset != 0) {
+    while (cur < subimage && m_rla.NextOffset != 0) {
+        // Subimages are concatenated, so each NextOffset must point past the
+        // current header. Without this, a file whose NextOffset points at
+        // itself or backwards supplies subimages endlessly and any caller
+        // enumerating them never terminates.
+        int64_t min_next = m_header_offset + int64_t(sizeof(m_rla));
+        if (int64_t(m_rla.NextOffset) < min_next) {
+            errorfmt(
+                "Subimage offset {} does not advance past the header at {}. Corrupted file?",
+                m_rla.NextOffset, m_header_offset);
+            return false;
+        }
         if (!ioseek(m_rla.NextOffset)) {
             errorfmt("Could not seek to header offset. Corrupted file?");
             return false;
         }
         if (!read_header())
             return false;  // read_header always calls error()
-        --diff;
-        ++m_subimage;
+        ++cur;
     }
-    if (diff > 0 && m_rla.NextOffset == 0) {  // no more subimages to read
+    if (cur < subimage) {  // no more subimages to read
         errorfmt("Unknown subimage");
         return false;
     }
@@ -329,6 +353,11 @@ RLAInput::seek_subimage(int subimage, int miplevel)
     // 256 auxiliary channels.
     if (!check_open(m_spec, { 0, (1 << 16) - 1, 0, (1 << 16) - 1, 0, 1, 0,
                               3 + 3 + 256 }))
+        return false;
+
+    // Check for uncompressed size that is wildly out of proportion to
+    // file size.
+    if (!check_compression_ratio(m_spec, ioproxy()->size()))
         return false;
 
     // set channel formats and stride
@@ -502,17 +531,22 @@ RLAInput::decode_rle_span(span<unsigned char> buf, int n, int stride,
         int count = (signed char)encoded[e++];
         if (count >= 0) {
             // run count positive: value repeated count+1 times
-            if (count + 1 > n)
+            ++count;
+            if (count > n)
                 break;  // asking for a count that will overrun the buffer
-            for (int i = 0; i <= count; ++i, b += stride, --n)
+            if (e + 1 > elen)
+                break;  // asking for a count will run out of encoded bytes
+            for (int i = 0; i < count; ++i, b += stride, --n)
                 buf[b] = encoded[e];
-            ++e;
+            ++e;  // we consumed exactly one encoded byte
         } else {
             // run count negative: repeat bytes literally
             count = -count;  // make it positive
             if (count > n)
                 break;  // asking for a count that will overrun the buffer
-            for (; count && n > 0 && e < elen; --count, b += stride, --n)
+            if (e + count > elen)
+                break;  // asking for a count will run out of encoded bytes
+            for (int i = 0; i < count; ++i, b += stride, --n)
                 buf[b] = encoded[e++];
         }
     }
@@ -521,6 +555,23 @@ RLAInput::decode_rle_span(span<unsigned char> buf, int n, int stride,
         return 0;
     }
     return e;
+}
+
+
+
+// With mixed per-channel formats, channels are packed at arbitrary byte
+// offsets, so multi-byte values in the pixel buffer may be unaligned. Apply
+// f to each of n consecutive T values starting at p, via memcpy.
+template<typename T, typename FUNC>
+static void
+modify_values(unsigned char* p, int n, FUNC f)
+{
+    for (int i = 0; i < n; ++i, p += sizeof(T)) {
+        T v;
+        memcpy(&v, p, sizeof(T));
+        v = T(f(v));
+        memcpy(p, &v, sizeof(T));
+    }
 }
 
 
@@ -580,8 +631,8 @@ RLAInput::decode_channel_group(int first_channel, short num_channels,
                 return false;
             }
             for (int x = 0; x < m_spec.width; ++x)
-                *((float*)&m_buf[offset + c * chsize + x * pixelsize])
-                    = ((float*)&encoded[0])[x];
+                memcpy(&m_buf[offset + c * chsize + x * pixelsize],
+                       &encoded[x * sizeof(float)], sizeof(float));
             continue;
         }
 
@@ -617,15 +668,19 @@ RLAInput::decode_channel_group(int first_channel, short num_channels,
                 swap_endian((uint16_t*)&m_buf[0], num_channels * m_spec.width);
             else
                 for (int x = 0; x < m_spec.width; ++x)
-                    swap_endian((uint16_t*)&m_buf[offset + x * pixelsize],
-                                num_channels);
+                    modify_values<uint16_t>(&m_buf[offset + x * pixelsize],
+                                            num_channels, [](uint16_t v) {
+                                                return byteswap(v);
+                                            });
         } else if (chsize == 4 && chantype != TypeDesc::FLOAT) {
             if (num_channels == m_spec.nchannels)
                 swap_endian((uint32_t*)&m_buf[0], num_channels * m_spec.width);
             else
                 for (int x = 0; x < m_spec.width; ++x)
-                    swap_endian((uint32_t*)&m_buf[offset + x * pixelsize],
-                                num_channels);
+                    modify_values<uint32_t>(&m_buf[offset + x * pixelsize],
+                                            num_channels, [](uint32_t v) {
+                                                return byteswap(v);
+                                            });
         }
     }
 
@@ -637,11 +692,11 @@ RLAInput::decode_channel_group(int first_channel, short num_channels,
         // ok -- no rescaling needed
     } else if (num_bits == 10) {
         // fast, common case -- use templated hard-code
-        for (int x = 0; x < m_spec.width; ++x) {
-            uint16_t* b = (uint16_t*)(&m_buf[offset + x * pixelsize]);
-            for (int c = 0; c < num_channels; ++c)
-                b[c] = bit_range_convert<10, 16>(b[c]);
-        }
+        for (int x = 0; x < m_spec.width; ++x)
+            modify_values<uint16_t>(&m_buf[offset + x * pixelsize],
+                                    num_channels, [](uint16_t v) {
+                                        return bit_range_convert<10, 16>(v);
+                                    });
     } else if (num_bits < 8) {
         // rare case, use slow code to make this clause short and simple
         for (int x = 0; x < m_spec.width; ++x) {
@@ -651,18 +706,20 @@ RLAInput::decode_channel_group(int first_channel, short num_channels,
         }
     } else if (num_bits > 8 && num_bits < 16) {
         // rare case, use slow code to make this clause short and simple
-        for (int x = 0; x < m_spec.width; ++x) {
-            uint16_t* b = (uint16_t*)&m_buf[offset + x * pixelsize];
-            for (int c = 0; c < num_channels; ++c)
-                b[c] = bit_range_convert(b[c], num_bits, 16);
-        }
+        for (int x = 0; x < m_spec.width; ++x)
+            modify_values<uint16_t>(&m_buf[offset + x * pixelsize],
+                                    num_channels, [=](uint16_t v) {
+                                        return bit_range_convert(v, num_bits,
+                                                                 16);
+                                    });
     } else if (num_bits > 16 && num_bits < 32) {
         // rare case, use slow code to make this clause short and simple
-        for (int x = 0; x < m_spec.width; ++x) {
-            uint32_t* b = (uint32_t*)&m_buf[offset + x * pixelsize];
-            for (int c = 0; c < num_channels; ++c)
-                b[c] = bit_range_convert(b[c], num_bits, 32);
-        }
+        for (int x = 0; x < m_spec.width; ++x)
+            modify_values<uint32_t>(&m_buf[offset + x * pixelsize],
+                                    num_channels, [=](uint32_t v) {
+                                        return bit_range_convert(v, num_bits,
+                                                                 32);
+                                    });
     }
     return true;
 }
@@ -685,7 +742,13 @@ RLAInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
         // Invalid scanline
         return false;
     }
-    OIIO_DASSERT(m_sot.size() == size_t(m_spec.height));
+    // The table has one entry per scanline of the active window, but the
+    // spec height is halved for field-rendered images, so the two sizes
+    // legitimately differ -- bounds check rather than assume they match.
+    if (size_t(y) >= m_sot.size()) {
+        errorfmt("Scanline {} has no offset table entry. Corrupted file?", y);
+        return false;
+    }
     if (!ioseek(m_sot[y]))
         return false;
 

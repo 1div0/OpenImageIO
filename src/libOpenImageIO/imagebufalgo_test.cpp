@@ -406,6 +406,28 @@ test_channel_append()
         OIIO_CHECK_EQUAL(r[0], Acolor);
         OIIO_CHECK_EQUAL(r[1], Bcolor);
     }
+
+    // Results with more channels than limits:channels must still get
+    // one channel name per channel.
+    int oldlimit = OIIO::get_int_attribute("limits:channels");
+    OIIO::attribute("limits:channels", 4);
+    ImageSpec spec3(2, 2, 3, TypeDesc::FLOAT);
+    spec3.channelnames = { "a_rather_long_channel_name_0",
+                           "a_rather_long_channel_name_1",
+                           "a_rather_long_channel_name_2" };
+    ImageBuf C(spec3);
+    ImageBuf R6 = ImageBufAlgo::channel_append(C, C);
+    OIIO_CHECK_EQUAL(R6.nchannels(), 6);
+    ImageBuf F = ImageBufAlgo::flip(R6);
+    ImageBuf M = ImageBufAlgo::mul(R6, 2.0f);
+    ImageBuf S = ImageBufAlgo::channels(R6, 6, {});
+    for (const ImageBuf* X : { &F, &M, &S }) {
+        OIIO_CHECK_EQUAL(X->spec().channelnames.size(), 6);
+        for (int c = 0; c < 6; ++c)
+            OIIO_CHECK_EQUAL(X->spec().channel_name(c),
+                             R6.spec().channel_name(c));
+    }
+    OIIO::attribute("limits:channels", oldlimit);
 }
 
 
@@ -739,6 +761,209 @@ test_zover()
 
 
 // Test ImageBuf::resample
+// resample_hwy() ignores its `interpolate` argument and always bilerps, so
+// nearest sampling has to stay off that path. Highway is off by default, so a
+// reference image would not exercise this; compare the two settings instead.
+void
+test_resample_hwy_nearest()
+{
+    std::cout << "test resample nearest is not routed to Highway\n";
+
+    int prev_hwy = 0;
+    OIIO::getattribute("enable_hwy", prev_hwy);
+
+    // Neighbouring pixels must differ, or bilerp and nearest would agree and
+    // the test would pass on broken code.
+    ImageSpec srcspec(64, 48, 4, TypeFloat);
+    ImageBuf src(srcspec);
+    for (ImageBuf::Iterator<float> it(src); !it.done(); ++it)
+        for (int c = 0; c < 4; ++c)
+            it[c] = float(((it.x() + it.y() + c) % 7) * 0.125f);
+
+    ImageSpec dstspec(37, 29, 4, TypeFloat);
+    ImageBuf without_hwy(dstspec), with_hwy(dstspec);
+    OIIO::attribute("enable_hwy", 0);
+    OIIO_CHECK_ASSERT(ImageBufAlgo::resample(without_hwy, src, false));
+    OIIO::attribute("enable_hwy", 1);
+    OIIO_CHECK_ASSERT(ImageBufAlgo::resample(with_hwy, src, false));
+    OIIO::attribute("enable_hwy", prev_hwy);
+
+    OIIO_CHECK_EQUAL(memcmp(with_hwy.localpixels(), without_hwy.localpixels(),
+                            dstspec.image_bytes()),
+                     0);
+}
+
+// Same pixels as `src`, but with a gap between scanlines and, optionally,
+// a gap between pixels. `storage` owns the memory and must outlive the result.
+// Row padding is legal for a source the tables handle -- contiguous_scanline()
+// permits it -- so it has to be read through the real scanline stride. Pixel
+// padding is not, and selects the per-pixel fallback instead.
+static ImageBuf
+padded_copy(const ImageBuf& src, bool pad_pixels,
+            std::unique_ptr<char[]>& storage)
+{
+    const ImageSpec& spec(src.spec());
+    stride_t chansize = stride_t(spec.format.size());
+    stride_t xstride  = chansize * (spec.nchannels + (pad_pixels ? 1 : 0));
+    stride_t ystride  = xstride * (spec.width + 1);
+    storage.reset(new char[size_t(ystride) * spec.height]);
+    memset(storage.get(), 0, size_t(ystride) * spec.height);
+    ImageBuf padded(spec, storage.get(), xstride, ystride);
+    ImageBufAlgo::paste(padded, spec.x, spec.y, spec.z, 0, src);
+    return padded;
+}
+
+
+
+// The tables are a pure optimization: they must reproduce the per-pixel path
+// exactly, so this compares the two rather than checking against a tolerance,
+// which would hide the one-pixel shift a mistake in the mapping arithmetic
+// actually causes. Pixel padding is what selects the fallback -- there is no
+// runtime switch to flip, the dispatch is by capability. Highway is not
+// bit-exact with either path, so turn it off (HWY_TEST may have left it on).
+static void
+check_against_fallback(const ImageBuf& src, const ImageSpec& dstspec,
+                       bool interpolate)
+{
+    int prev_hwy = 0;
+    OIIO::getattribute("enable_hwy", prev_hwy);
+    OIIO::attribute("enable_hwy", 0);
+
+    std::unique_ptr<char[]> fast_mem, slow_mem;
+    ImageBuf fast_src = padded_copy(src, false, fast_mem);
+    ImageBuf slow_src = padded_copy(src, true, slow_mem);
+    ImageBuf fast(dstspec), slow(dstspec);
+    OIIO_CHECK_ASSERT(ImageBufAlgo::resample(fast, fast_src, interpolate));
+    OIIO_CHECK_ASSERT(ImageBufAlgo::resample(slow, slow_src, interpolate));
+    OIIO::attribute("enable_hwy", prev_hwy);
+    if (memcmp(fast.localpixels(), slow.localpixels(), dstspec.image_bytes())
+        == 0)
+        return;
+    auto cr = ImageBufAlgo::compare(fast, slow, 0.0f, 0.0f);
+    Strutil::print("    interp={} {}x{} nch={} type={}: maxerror={:g} "
+                   "({} of {} values differ)\n",
+                   int(interpolate), dstspec.width, dstspec.height,
+                   dstspec.nchannels, dstspec.format, cr.maxerror, cr.nfail,
+                   size_t(dstspec.width) * dstspec.height * dstspec.nchannels);
+    OIIO_CHECK_ASSERT(false && "resample paths disagree");
+}
+
+
+
+// resample() with channel ranges that don't fit the source: more dst channels
+// than src, a range past the last channel, and a negative chbegin.
+void
+test_resample_channel_bounds()
+{
+    std::cout << "test resample channel bounds\n";
+
+    ImageBuf src(ImageSpec(64, 48, 3, TypeFloat));
+    ImageBufAlgo::fill(src, { 0.25f, 0.5f, 0.75f });
+    const float untouched = 9.0f;
+
+    for (bool interp : { false, true }) {
+        // Extra dst channels have no source, so are left alone
+        ImageBuf wide(ImageSpec(33, 27, 5, TypeFloat));
+        ImageBufAlgo::fill(wide, { untouched, untouched, untouched, untouched,
+                                   untouched });
+        OIIO_CHECK_ASSERT(ImageBufAlgo::resample(wide, src, interp));
+        OIIO_CHECK_EQUAL(wide.getchannel(1, 1, 0, 0), 0.25f);
+        OIIO_CHECK_EQUAL(wide.getchannel(1, 1, 0, 1), 0.5f);
+        OIIO_CHECK_EQUAL(wide.getchannel(1, 1, 0, 2), 0.75f);
+        OIIO_CHECK_EQUAL(wide.getchannel(1, 1, 0, 3), untouched);
+        OIIO_CHECK_EQUAL(wide.getchannel(1, 1, 0, 4), untouched);
+
+        // A range past the last channel changes nothing
+        ImageBuf none(ImageSpec(33, 27, 3, TypeFloat));
+        ImageBufAlgo::fill(none, { untouched, untouched, untouched });
+        ROI past     = none.roi();
+        past.chbegin = 10;
+        past.chend   = 20;
+        OIIO_CHECK_ASSERT(ImageBufAlgo::resample(none, src, interp, past));
+        OIIO_CHECK_EQUAL(none.getchannel(1, 1, 0, 0), untouched);
+        OIIO_CHECK_EQUAL(none.getchannel(1, 1, 0, 2), untouched);
+
+        // A negative chbegin behaves like 0
+        ImageBuf below(ImageSpec(33, 27, 3, TypeFloat));
+        ImageBufAlgo::fill(below, { untouched, untouched, untouched });
+        ROI neg     = below.roi();
+        neg.chbegin = -5;
+        OIIO_CHECK_ASSERT(ImageBufAlgo::resample(below, src, interp, neg));
+        OIIO_CHECK_EQUAL(below.getchannel(1, 1, 0, 0), 0.25f);
+        OIIO_CHECK_EQUAL(below.getchannel(1, 1, 0, 2), 0.75f);
+    }
+}
+
+
+
+// Nearest resampling must pick the same source pixel as the mapping in the
+// OIIO docs, and must be black wherever the destination maps outside the
+// source data window. The crop case is what distinguishes a data window from
+// a full window, and is not exercised by an ordinary resize.
+void
+test_resample_correctness()
+{
+    std::cout << "test resample correctness\n";
+
+    // Source pixel (x,y) holds the value x + 10*y, so a resampled pixel
+    // identifies exactly which source pixel it came from.
+    const int srcsize = 4;
+    ImageBuf src(ImageSpec(srcsize, srcsize, 1, TypeFloat));
+    for (ImageBuf::Iterator<float> it(src); !it.done(); ++it)
+        it[0] = float(it.x() + 10 * it.y());
+
+    // Both a magnification and a reduction, checked against the mapping
+    // evaluated independently here.
+    for (int dstsize : { 8, 2 }) {
+        ImageBuf dst(ImageSpec(dstsize, dstsize, 1, TypeFloat));
+        OIIO_CHECK_ASSERT(ImageBufAlgo::resample(dst, src, false));
+        for (ImageBuf::ConstIterator<float> it(dst); !it.done(); ++it) {
+            int sx = int((it.x() + 0.5f) / dstsize * srcsize);
+            int sy = int((it.y() + 0.5f) / dstsize * srcsize);
+            OIIO_CHECK_EQUAL(it[0], float(sx + 10 * sy));
+        }
+    }
+
+    // A source whose data window is a 2x2 crop of a 4x4 full window. The
+    // destination covers the whole full window, so its outer ring must come
+    // out black rather than clamped or out of bounds.
+    ImageSpec cropspec(2, 2, 1, TypeFloat);
+    cropspec.x = cropspec.y = 1;
+    cropspec.full_x = cropspec.full_y = 0;
+    cropspec.full_width = cropspec.full_height = 4;
+    ImageBuf crop(cropspec);
+    for (ImageBuf::Iterator<float> it(crop); !it.done(); ++it)
+        it[0] = float(it.x() + 10 * it.y());
+
+    ImageBuf dst(ImageSpec(4, 4, 1, TypeFloat));
+    OIIO_CHECK_ASSERT(ImageBufAlgo::resample(dst, crop, false));
+    for (ImageBuf::ConstIterator<float> it(dst); !it.done(); ++it) {
+        bool inside = it.x() >= 1 && it.x() <= 2 && it.y() >= 1 && it.y() <= 2;
+        float expected = inside ? float(it.x() + 10 * it.y()) : 0.0f;
+        OIIO_CHECK_EQUAL(it[0], expected);
+    }
+
+    // Against the per-pixel path, for both sampling modes: uint8 because its
+    // rescaling to [0,1] is the conversion most easily got wrong, float
+    // because it is the one where a mapping error cannot hide in rounding.
+    // One reduction and one magnification is enough -- the mapping is the
+    // same arithmetic in both directions.
+    for (auto type : { TypeUInt8, TypeFloat }) {
+        float top[4]    = { 0.1f, 0.2f, 0.3f, 0.4f };
+        float bottom[4] = { 0.9f, 0.8f, 0.7f, 0.6f };
+        ImageBuf grad(ImageSpec(97, 61, 4, type));
+        ImageBufAlgo::fill(grad, cspan<float>(top), cspan<float>(bottom));
+        for (auto wh :
+             { std::pair<int, int>(53, 79), std::pair<int, int>(211, 43) })
+            for (bool interp : { false, true })
+                check_against_fallback(grad,
+                                       ImageSpec(wh.first, wh.second, 4, type),
+                                       interp);
+    }
+}
+
+
+
 void
 test_resample()
 {
@@ -748,7 +973,7 @@ test_resample()
     Benchmarker bench;
     bench.trials(ntrials);
     bench.iterations(iterations);
-    bench.units(Benchmarker::Unit::ms);
+    bench.units(Benchmarker::Unit::us);
 
     ImageSpec spec_hd_rgba_f(1920, 1080, 4, TypeFloat);
     ImageSpec spec_hd_rgba_u8(1920, 1080, 4, TypeUInt8);
@@ -771,6 +996,12 @@ test_resample()
           [&]() { ImageBufAlgo::resample(smallu8, buf_hd_rgba_f, false); });
     bench("  IBA::resample HD->1024x512 rgba u8->u8 no interp ",
           [&]() { ImageBufAlgo::resample(smallu8, buf_hd_rgba_u8, false); });
+
+    // A nearest magnification: the reductions above cannot show the case
+    // where consecutive destination pixels read the same source pixel.
+    ImageBuf bigu8(ImageSpec(3840, 2160, 4, TypeUInt8));
+    bench("  IBA::resample HD->4K      rgba u8->u8 no interp ",
+          [&]() { ImageBufAlgo::resample(bigu8, buf_hd_rgba_u8, false); });
 }
 
 
@@ -962,6 +1193,182 @@ test_computePixelStats()
         OIIO_CHECK_EQUAL(stats.infcount[c], 0);
         OIIO_CHECK_EQUAL(stats.finitecount[c], 4);
     }
+}
+
+
+
+// Return the correlation matrix of the first 3 channels of an image.
+static void
+channel_correlation(const ImageBuf& img, float corr[3][3])
+{
+    double sum[3] = { 0, 0, 0 };
+    double sum2[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            sum2[i][j] = 0.0;
+    int64_t n = 0;
+    for (ImageBuf::ConstIterator<float> p(img); !p.done(); ++p, ++n)
+        for (int i = 0; i < 3; ++i) {
+            sum[i] += p[i];
+            for (int j = 0; j < 3; ++j)
+                sum2[i][j] += double(p[i]) * double(p[j]);
+        }
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            sum2[i][j] = sum2[i][j] / n - (sum[i] / n) * (sum[j] / n);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            corr[i][j] = float(sum2[i][j] / std::sqrt(sum2[i][i] * sum2[j][j]));
+}
+
+
+
+// Tests ImageBufAlgo::decorr_stretch()
+void
+test_decorr_stretch()
+{
+    std::cout << "test decorr_stretch\n";
+    // Three nearly indistinguishable channels: a strong shared signal, plus
+    // a tiny bit of independent variation in each one.
+    const int n = 64;
+    ImageBuf img(ImageSpec(n, n, 3, TypeDesc::FLOAT));
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) {
+            float g        = float(x + y) / float(2 * n);
+            float pixel[3] = { g + 0.0005f * ((x * 7 + y * 3) % 11),
+                               0.9f * g + 0.1f + 0.0005f * ((x * 5 + y) % 7),
+                               1.1f * g - 0.05f
+                                   + 0.0005f * ((x + y * 13) % 5) };
+            img.setpixel(x, y, make_span(pixel));
+        }
+    float corr[3][3];
+    channel_correlation(img, corr);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            OIIO_CHECK_ASSERT(corr[i][j] > 0.999f);  // very correlated indeed
+
+    ImageBuf result = ImageBufAlgo::decorr_stretch(img);
+    OIIO_CHECK_ASSERT(!result.has_error());
+
+    // The stretch should leave the mean and the standard deviation of each
+    // channel as they were...
+    auto before = ImageBufAlgo::computePixelStats(img);
+    auto after  = ImageBufAlgo::computePixelStats(result);
+    for (int c = 0; c < 3; ++c) {
+        OIIO_CHECK_EQUAL_THRESH(after.avg[c], before.avg[c], 1.0e-4f);
+        OIIO_CHECK_EQUAL_THRESH(after.stddev[c], before.stddev[c],
+                                1.0e-3f * before.stddev[c]);
+    }
+    // ... but the channels should no longer be correlated with each other.
+    channel_correlation(result, corr);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            OIIO_CHECK_EQUAL_THRESH(corr[i][j], i == j ? 1.0f : 0.0f, 1.0e-3f);
+
+    // The scale option multiplies the standard deviation of every channel,
+    // and sigma and mean override them outright. Note that a lone option is
+    // spelled `{ ParamValue(name, value) }` rather than `{ { name, value } }`:
+    // the latter is also a candidate for constructing the `src` ImageBuf of
+    // the (dst, src, options) overload, which some compilers take.
+    result = ImageBufAlgo::decorr_stretch(img, { ParamValue("scale", 2.0f) });
+    after  = ImageBufAlgo::computePixelStats(result);
+    for (int c = 0; c < 3; ++c) {
+        OIIO_CHECK_EQUAL_THRESH(after.avg[c], before.avg[c], 1.0e-4f);
+        OIIO_CHECK_EQUAL_THRESH(after.stddev[c], 2.0f * before.stddev[c],
+                                1.0e-3f * before.stddev[c]);
+    }
+    result = ImageBufAlgo::decorr_stretch(img, { { "sigma", 0.25f },
+                                                 { "mean", 0.5f } });
+    after  = ImageBufAlgo::computePixelStats(result);
+    for (int c = 0; c < 3; ++c) {
+        OIIO_CHECK_EQUAL_THRESH(after.avg[c], 0.5f, 1.0e-5f);
+        OIIO_CHECK_EQUAL_THRESH(after.stddev[c], 0.25f, 1.0e-4f);
+    }
+
+    // The percentile contrast stretch should fill the [0,1] range and clip
+    // about the requested fraction of the pixels at each end. It also makes
+    // the result independent of scale, sigma, and mean.
+    const float pct = 2.0f;
+    result = ImageBufAlgo::decorr_stretch(img,
+                                          { ParamValue("percentile", pct) });
+    OIIO_CHECK_ASSERT(!result.has_error());
+    after               = ImageBufAlgo::computePixelStats(result);
+    imagesize_t npixels = imagesize_t(n) * n;
+    for (int c = 0; c < 3; ++c) {
+        OIIO_CHECK_EQUAL(after.min[c], 0.0f);
+        OIIO_CHECK_EQUAL(after.max[c], 1.0f);
+        // Within a bin's worth of the requested fraction at each end.
+        auto hist = ImageBufAlgo::histogram(result, c, 100, 0.0f, 1.0f);
+        OIIO_CHECK_ASSERT(hist[0] >= imagesize_t(0.01 * pct * npixels));
+        OIIO_CHECK_ASSERT(hist[0] <= imagesize_t(0.02 * pct * npixels));
+        OIIO_CHECK_ASSERT(hist[99] >= imagesize_t(0.01 * pct * npixels));
+        OIIO_CHECK_ASSERT(hist[99] <= imagesize_t(0.02 * pct * npixels));
+    }
+    ImageBuf other = ImageBufAlgo::decorr_stretch(img, { { "percentile", pct },
+                                                         { "scale", 3.0f },
+                                                         { "mean", 0.25f } });
+    auto cmp       = ImageBufAlgo::compare(result, other, 1.0e-4f, 1.0e-4f);
+    OIIO_CHECK_EQUAL(cmp.nfail, 0);
+
+    // Out of range percentile is an error.
+    result = ImageBufAlgo::decorr_stretch(img,
+                                          { ParamValue("percentile", 50.0f) });
+    OIIO_CHECK_ASSERT(result.has_error());
+    result.geterror();
+
+    // Correlation mode decorrelates just as thoroughly and preserves the
+    // same per-channel statistics, but mixes the channels differently,
+    // because it does not let the highest variance channel dominate.
+    result = ImageBufAlgo::decorr_stretch(img, { ParamValue("mode",
+                                                            "correlation") });
+    OIIO_CHECK_ASSERT(!result.has_error());
+    after = ImageBufAlgo::computePixelStats(result);
+    for (int c = 0; c < 3; ++c) {
+        OIIO_CHECK_EQUAL_THRESH(after.avg[c], before.avg[c], 1.0e-4f);
+        OIIO_CHECK_EQUAL_THRESH(after.stddev[c], before.stddev[c],
+                                1.0e-3f * before.stddev[c]);
+    }
+    channel_correlation(result, corr);
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            OIIO_CHECK_EQUAL_THRESH(corr[i][j], i == j ? 1.0f : 0.0f, 1.0e-3f);
+    other = ImageBufAlgo::decorr_stretch(img,
+                                         { ParamValue("mode", "covariance") });
+    cmp   = ImageBufAlgo::compare(result, other, 1.0e-4f, 1.0e-4f);
+    OIIO_CHECK_ASSERT(cmp.nfail > 0);  // the two modes really do differ
+
+    // An unknown mode is an error.
+    result = ImageBufAlgo::decorr_stretch(img, { ParamValue("mode", "bogus") });
+    OIIO_CHECK_ASSERT(result.has_error());
+    result.geterror();
+
+    // An image with no variation at all has no principal axes to stretch,
+    // and should come back unchanged rather than as NaNs.
+    ImageBuf flat(ImageSpec(4, 4, 3, TypeDesc::FLOAT));
+    float gray[3] = { 0.2f, 0.3f, 0.4f };
+    ImageBufAlgo::fill(flat, gray);
+    result = ImageBufAlgo::decorr_stretch(flat);
+    OIIO_CHECK_ASSERT(!result.has_error());
+    after = ImageBufAlgo::computePixelStats(result);
+    for (int c = 0; c < 3; ++c) {
+        OIIO_CHECK_EQUAL_THRESH(after.avg[c], gray[c], 1.0e-6f);
+        OIIO_CHECK_EQUAL(after.nancount[c], 0);
+    }
+
+    // Alpha is not part of the correlated set, and must pass through.
+    ImageBuf rgba(ImageSpec(n, n, 4, TypeDesc::FLOAT));
+    ImageBufAlgo::channel_append(
+        rgba, img, ImageBufAlgo::fill({ 0.75f }, ROI(0, n, 0, n, 0, 1, 0, 1)));
+    result = ImageBufAlgo::decorr_stretch(rgba);
+    OIIO_CHECK_ASSERT(!result.has_error());
+    after = ImageBufAlgo::computePixelStats(result);
+    OIIO_CHECK_EQUAL_THRESH(after.avg[3], 0.75f, 1.0e-6f);
+    OIIO_CHECK_EQUAL_THRESH(after.stddev[3], 0.0f, 1.0e-6f);
+
+    // Asking to stretch the alpha channel is an error.
+    result = ImageBufAlgo::decorr_stretch(rgba, { ParamValue("nchannels", 4) });
+    OIIO_CHECK_ASSERT(result.has_error());
+    std::cout << "  (expected error: " << result.geterror() << ")\n";
 }
 
 
@@ -1232,10 +1639,11 @@ test_opencv()
     // Make a gradient RGB image, convert to OpenCV cv::Mat, then convert
     // that back to ImageBuf, make sure the round trip has the same pixels
     // as the original image.
-    ImageBuf src
-        = ImageBufAlgo::fill({ 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f },
-                             { 0.0f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f },
-                             ROI(0, 64, 0, 64, 0, 1, 0, 3));
+    ImageBuf src = ImageBufAlgo::fill({ 1.0f, 0.0f, 0.0f },
+                                      { 0.0f, 1.0f, 0.0f },
+                                      { 0.0f, 0.0f, 1.0f },
+                                      { 1.0f, 1.0f, 1.0f },
+                                      ROI(0, 64, 0, 64, 0, 1, 0, 3));
     cv::Mat mat;
     ImageBufAlgo::to_OpenCV(mat, src);
     OIIO_CHECK_ASSERT(!mat.empty());
@@ -1336,7 +1744,7 @@ test_FLIP()
     ImageSpec spec(32, 32, 3, TypeDesc::FLOAT);
     ImageBuf img(spec);
     ImageBufAlgo::fill(img, { 0.3f, 0.5f, 0.7f });
-    ImageBuf result = ImageBufAlgo::experimental::FLIP_diff(img, img);
+    ImageBuf result = ImageBufAlgo::FLIP_diff(img, img);
     OIIO_CHECK_ASSERT(!result.has_error());
     OIIO_CHECK_EQUAL(result.nchannels(), 1);
     OIIO_CHECK_EQUAL_THRESH(result.spec().get_float_attribute("FLIP:maxerror"),
@@ -1346,7 +1754,7 @@ test_FLIP()
     ImageBuf black(spec), white(spec);
     ImageBufAlgo::fill(black, { 0.0f, 0.0f, 0.0f });
     ImageBufAlgo::fill(white, { 1.0f, 1.0f, 1.0f });
-    ImageBuf bw = ImageBufAlgo::experimental::FLIP_diff(black, white);
+    ImageBuf bw = ImageBufAlgo::FLIP_diff(black, white);
     OIIO_CHECK_ASSERT(!bw.has_error());
     OIIO_CHECK_EQUAL(bw.nchannels(), 1);
     // Max error should be positive and in range [0,1].
@@ -1358,7 +1766,7 @@ test_FLIP()
     OIIO_CHECK_ASSERT(maxerror <= 1.0);
 
     // Test FLIP_ppd helper.
-    float ppd = ImageBufAlgo::experimental::FLIP_ppd(0.7f, 3840.0f, 0.7f);
+    float ppd = ImageBufAlgo::FLIP_ppd(0.7f, 3840.0f, 0.7f);
     OIIO_CHECK_ASSERT(ppd > 60.0f && ppd < 80.0f);
 
     // Benchmarking
@@ -1381,14 +1789,14 @@ test_FLIP()
     ImageBufAlgo::noise(noisy, "gaussian", 0.0, 0.001f);
     ImageBuf flipresult(ImageSpec(xres, yres, 1, TypeFloat));
     bench(Strutil::format("FLIP_diff() LDR {}", xres), [&]() {
-        auto buf OIIO_MAYBE_UNUSED
-            = ImageBufAlgo::experimental::FLIP_diff(flipresult, noisy, ramp,
-                                                    { { "hdr", 0 } });
+        auto buf OIIO_MAYBE_UNUSED = ImageBufAlgo::FLIP_diff(flipresult, noisy,
+                                                             ramp,
+                                                             { { "hdr", 0 } });
     });
     bench(Strutil::format("FLIP_diff() HDR {}", xres), [&]() {
-        auto buf OIIO_MAYBE_UNUSED
-            = ImageBufAlgo::experimental::FLIP_diff(flipresult, noisy, ramp,
-                                                    { { "hdr", 1 } });
+        auto buf OIIO_MAYBE_UNUSED = ImageBufAlgo::FLIP_diff(flipresult, noisy,
+                                                             ramp,
+                                                             { { "hdr", 1 } });
     });
 }
 
@@ -1448,7 +1856,7 @@ test_simple_perpixel()
         // Test with lambda, including variable capture
         float bias = 0.0;  // Force capture of this variable
         result     = ImageBufAlgo::perpixel_op(src, [&](span<float> d,
-                                                    cspan<float> s) {
+                                                        cspan<float> s) {
             for (size_t c = 0, nc = size_t(d.size()); c < nc; ++c)
                 d[c] = s[nc - 1 - c] + bias;
             return true;
@@ -1525,10 +1933,9 @@ test_simple_perpixel()
 
 
 template<class T>
-std::string
-do_mosaic(ImageBuf& dst, const ImageBuf& src, int x_offset, int y_offset,
-          const std::string& pattern, const float (&white_balance)[4],
-          int nthreads);
+std::string do_mosaic(ImageBuf& dst, const ImageBuf& src, int x_offset,
+                      int y_offset, const std::string& pattern,
+                      const float (&white_balance)[4], int nthreads);
 
 template<>
 std::string
@@ -1603,9 +2010,10 @@ test_demosaic_algo(const ImageBuf& src_image, const ImageBuf& mosaiced_image,
     roi.xend -= inset;
     roi.yend -= inset;
 
-    ImageBufAlgo::CompareResults cr
-        = ImageBufAlgo::compare(src_image, demosaiced_image, threshold,
-                                threshold, roi);
+    ImageBufAlgo::CompareResults cr = ImageBufAlgo::compare(src_image,
+                                                            demosaiced_image,
+                                                            threshold,
+                                                            threshold, roi);
     OIIO_CHECK_FALSE(cr.error);
 
     if (write_images) {
@@ -1613,7 +2021,8 @@ test_demosaic_algo(const ImageBuf& src_image, const ImageBuf& mosaiced_image,
         std::string ext  = type.is_floating_point() ? "exr" : "png";
         std::string path = file_name + "_" + test_name + "." + ext;
         auto imageOutput = ImageOutput::create(ext);
-        imageOutput->open(path, demosaiced_image.spec());
+        bool ok          = imageOutput->open(path, demosaiced_image.spec());
+        OIIO_ASSERT(ok);
         demosaiced_image.write(imageOutput.get());
     }
 }
@@ -1650,7 +2059,8 @@ test_demosaic(const DemosaicTestConfig& config, const ImageBuf& src_image,
                 std::string path = file_name + "_src." + ext;
 
                 auto imageOutput = ImageOutput::create(ext);
-                imageOutput->open(path, mosaiced_image.spec());
+                bool ok = imageOutput->open(path, mosaiced_image.spec());
+                OIIO_ASSERT(ok);
                 mosaiced_image.write(imageOutput.get());
             }
 
@@ -1741,7 +2151,8 @@ test_demosaic()
 
     if (write_files) {
         auto imageOutput = OIIO::ImageOutput::create("exr");
-        imageOutput->open("source.exr", src_image.spec());
+        bool ok          = imageOutput->open("source.exr", src_image.spec());
+        OIIO_ASSERT(ok);
         src_image.write(imageOutput.get());
     }
 
@@ -1808,12 +2219,16 @@ main(int argc, char** argv)
     test_over(TypeFloat);
     test_over(TypeHalf);
     test_zover();
+    test_resample_hwy_nearest();
+    test_resample_correctness();
+    test_resample_channel_bounds();
     test_resample();
     test_compare();
     test_isConstantColor();
     test_isConstantChannel();
     test_isMonochrome();
     test_computePixelStats();
+    test_decorr_stretch();
     histogram_computation_test();
     test_maketx_from_imagebuf();
     test_IBAprep();
