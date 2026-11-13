@@ -47,6 +47,12 @@ window, z/depth, subimage count, mip levels, frame counts, and the
   data_length cast to int64 wraps negative and slips past a `<` guard).
 - Seen: psd thumbnail (`length - 28` underflow), psd color data, psd layer
   channel data, dpx UserSize (compared to total file size, not remaining).
+- Inside a dependency that opens the file by path (no IOProxy, no hook): if
+  the layout it reads first is simple, pre-walk it in OIIO and bound every
+  length/count by bytes remaining before calling the library. Remember
+  `valid_file()` runs during format probing of ANY input, so a fuzzer on one
+  format reaches every probing reader. Seen: openvdb `MetaMap::readMeta`
+  via `valid_file` (found by the raw fuzz job).
 
 ### A5. Default-initialized buffer published after short read
 A failed or short read leaves the tail of a buffer uninitialized, then the
@@ -190,9 +196,18 @@ Streams and rotated images can change geometry after the header.
   heif `irot` with `oiio:reorient=0` (spec swapped w/h, libheif returned the
   stored plane); raw returned channel count vs spec; tiff CMYK->RGB
   (`m_spec.nchannels`=3 while `m_inputchannels`=4: tile path unpacked 4
-  values into 3-channel buffer). Fix: compare decoder-reported dims, channel
+  values into 3-channel buffer); jpeg2000 OpenJPH path assumed every
+  component full-res, so subsampled ones hung `codestream::pull()` and read
+  `w` samples from shorter lines (now pulled per component at its own
+  size and replicated). Fix: compare decoder-reported dims, channel
   count, and stride against the spec before every copy-out; size scratch
   buffers from the decoder-reported values, not the header.
+- Colorspace tag selecting a fixed-width conversion: a file-supplied tag
+  picks a converter that touches N samples per pixel with no check that
+  nchannels >= N. Find: per-pixel `p[i+1]`/`p[i+2]` in `*_to_rgb` helpers;
+  trace what gates the call. Seen: jpeg2000 sYCC (`colr` EnumCS 18) on a
+  1-channel image, 2 samples OOB read+write past every scanline.
+  Fix: gate on channel count too (`nc >= 3`).
 - Uninitialized packet structs: `av_packet_alloc()`, not stack AVPacket,
   because `av_read_frame` does not init on failure.
 
@@ -258,6 +273,19 @@ fail later) and procedural readers that claim `supports("procedural")`.
 - Fix: `find()`; a missing required id is a hard error.
 - Seen: psd layer channel ids (#5594).
 
+### D6. Explicit-subimage read using the current `m_spec`
+`read_*(subimage, miplevel, ...)` must lock and `seek_subimage()` before
+reading any geometry from `m_spec`/`spec()`. Otherwise another thread (or an
+earlier seek) leaves `m_spec` on a different, wider level and the row stride
+overruns a buffer sized for the requested one.
+- Find: in each `read_native_*`/`read_*` overload taking `subimage`, any
+  `m_spec.`/`spec().` before `lock_guard` + `seek_subimage`, or with no seek.
+  Single-thread repro: `seek_subimage(0,0)` then read a smaller mip.
+- Fix: lock, seek, then use `m_spec`; or use `spec_dimensions()`.
+- Seen: base `ImageInput::read_native_scanlines` loop (every reader without
+  its own override: dds, ico, ...); classic openexr all-channel wrapper
+  (`m_spec.nchannels`).
+
 
 ## E. Alignment and pointer formation
 
@@ -293,6 +321,11 @@ branches in `simd.h`.
   confirm length before reading its fields.
 - Metadata thumbnails, userdata, makernotes: length fields are attacker input.
 - Headers whose count fields feed `resize` (FITS NAXIS: valid range 0-999).
+- Channel naming before `check_open`: `default_channel_names()` names only
+  up to `limits:channels`, so `channelnames[c]` for `c < nchannels` can write
+  past the list. Grep `channelnames\[` in readers; loop over
+  `channelnames.size()` or check it first. Seen: fits STOKES/BANDn, tiff
+  shadow maps.
 - Zero-valued denominators from headers: bit depth 0 (raw_bps) collapsed
   declared_bytes to 0 and disabled the bomb guard; floor it. Check every
   divisor and every "declared size" that can legitimately evaluate to 0.

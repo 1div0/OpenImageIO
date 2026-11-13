@@ -84,8 +84,20 @@ OIIO validates geometry, checks returns, bounds its own buffers.
   2^30, so `int` products wrap within the imagesize limit.
 - jpeg2000: two codepaths (OpenJPEG, OpenJPH/HTJ2K) - guard both before
   decode; HTJ2K error handling continued after failure; zero components read
-  past an array; OpenJPH global error handler needs static lifetime.
-  Open: >4 components out of step; truncated codestream decodes silently
+  past an array; OpenJPH global error handler needs static lifetime;
+  sYCC conversion ran on 1-channel images (OpenJPEG sets SYCC from the
+  `colr` box alone); subsampled components (OpenJPH path assumed
+  full-res; hung in `pull`) now decoded at per-component size. Keep
+  OpenJPH's pull order: it decodes the color transform (MCT) when
+  component 0 is pulled, so MCT files must stay interleaved (needs
+  equal subsampling; else rejected). Empty components hang `pull`;
+  rejected. A tile-component with no columns (tiles narrower than the
+  subsampling) crashes OpenJPH < 0.27 (`tile::pull` got its zero-width
+  guard in 0.27.0); rejected only when built against those. Tile rows
+  with no samples are skipped by every version. Don't fall back to
+  OpenJPEG for HTJ2K: < 2.5 can't decode HT
+  at all, and 2.5.4 mis-decodes odd-size subsampled HT.
+  Open: truncated codestream decodes silently
   (no completeness signal from OpenJPH).
 - webp: check_open + C2 moved before the decoded-image allocation; no real
   bomb reachable (libwebp caps canvas, demux cross-validates).
@@ -121,9 +133,12 @@ Glue-check only; log library internals as deferrals.
   (SDK proprietary). Open: ioproxy ignored, dead scaffolding.
 - openvdb: check_open from grid bbox; C2 deliberately NOT added (sparse
   format: extent vs file size unrelated); unguarded `gridPtrCast`, tree walk,
-  readGrid; exception text clamped; state not reset on re-open. Open:
-  OpenVDB reads declared string lengths unbounded (12 GB RSS on a truncated
-  file) and `TypedMetadata::readValue` leaves value uninitialized.
+  readGrid; exception text clamped; state not reset on re-open; header,
+  file metadata and grid descriptors pre-walked in `open_vdb_file()` with every
+  declared length/count bounded by file size (fuzz OOM in `MetaMap::readMeta`
+  via `valid_file`). Open: OpenVDB `readGrid` still reads declared string
+  lengths unbounded and `TypedMetadata::readValue` leaves value
+  uninitialized.
 
 ## Class D. Container of other readers, or no file input
 
