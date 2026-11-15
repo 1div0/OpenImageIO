@@ -69,7 +69,7 @@ static ustring s_textureformat("textureformat"), s_fileformat("fileformat");
 static ustring s_format("format"), s_cachedformat("cachedformat");
 static ustring s_channels("channels"), s_cachedpixeltype("cachedpixeltype");
 static ustring s_exists("exists"), s_broken("broken");
-static ustring s_UDIM("UDIM");
+static ustring s_UDIM("UDIM"), s_udim("udim");
 static ustring s_subimages("subimages"), s_miplevels("miplevels");
 static ustring s_datawindow("datawindow"), s_displaywindow("displaywindow");
 static ustring s_averagecolor("averagecolor"), s_averagealpha("averagealpha");
@@ -1560,18 +1560,26 @@ ImageCacheImpl::find_file(ustring filename,
 #if IMAGECACHE_TIME_STATS
         Timer timer;
 #endif
-        size_t bin                  = m_files.lock_bin(filename);
-        FilenameMap::iterator found = m_files.find(filename, false);
-        if (found) {
-            tf = found->second.get();
-        } else {
-            // No such entry in the file cache.  Add it, but don't open yet.
-            tf = new ImageCacheFile(*this, thread_info, filename, creator,
-                                    config);
-            m_files.insert(filename, tf, false);
-            newfile = true;
+        bool found = false;
+        {
+            // Unlock the bin even if the ImageCacheFile ctor throws.
+            struct BinLock {
+                FilenameMap& map;
+                size_t bin;
+                ~BinLock() { map.unlock_bin(bin); }
+            } binlock { m_files, m_files.lock_bin(filename) };
+            FilenameMap::iterator it = m_files.find(filename, false);
+            if (it) {
+                found = true;
+                tf    = it->second.get();
+            } else {
+                // No such entry in the file cache. Add it, but don't open yet.
+                tf = new ImageCacheFile(*this, thread_info, filename, creator,
+                                        config);
+                m_files.insert(filename, tf, false);
+                newfile = true;
+            }
         }
-        m_files.unlock_bin(bin);
         if (replace && found) {
             invalidate(filename, true);
             tf->reset(creator, config);
@@ -3100,7 +3108,7 @@ ImageCacheImpl::get_image_info(ImageCacheFile* file,
     }
     // No other queries below are expected to work with broken
 
-    if (dataname == s_UDIM && datatype == TypeInt) {
+    if ((dataname == s_udim || dataname == s_UDIM) && datatype == TypeInt) {
         // Just check for existence.  Need to do this before the invalid
         // file error below, since in this one case, it's not an error
         // for the file to be nonexistent or broken!
@@ -3147,6 +3155,11 @@ ImageCacheImpl::get_image_info(ImageCacheFile* file,
                         return false;
                 }
             }
+        }
+        if (first) {
+            // No tile was readable, so `common` was never written.
+            error("No readable tiles for UDIM file \"{}\"", file->filename());
+            return false;
         }
         // If we got this far, all the tiles we found had the attribute, and
         // they all had the same value. Copy to the user and return success.
@@ -4176,7 +4189,14 @@ ImageCacheFile::udim_setup()
     // 2-number kind of pattern, to populate the lookup map.
     std::vector<UdimInfo> udim_list;  // temporary -- we don't know extent
     udim_list.reserve(100);
-    std::regex decoder(pat);
+    std::regex decoder;
+    try {
+        decoder = std::regex(pat);
+    } catch (const std::exception& e) {
+        mark_broken(Strutil::format("Invalid UDIM pattern \"{}\": {}",
+                                    m_filename, e.what()));
+        return;
+    }
     for (auto udim_tile_name : filenames) {
         std::string fnpart = Filesystem::filename(udim_tile_name);
         std::match_results<std::string::const_iterator> match;
@@ -4219,8 +4239,7 @@ ImageCacheFile::udim_setup()
 std::string
 ImageCacheFile::udim_to_wildcard(string_view udimpattern)
 {
-    // dot, parens, brackets, and braces are special in regex and need to be
-    // preceded by a backslash to be matched literally.
+    // Backslash regex metacharacters so they are matched literally.
     std::string result = Filesystem::filename_to_regex(udimpattern);
     // Replace the udim specifiers with numeric wildcards, and surround the
     // number parts with regex parentheses, which will allow us later to
